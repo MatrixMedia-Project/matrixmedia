@@ -488,6 +488,9 @@ async fn enable_mm(
         BotInviteOutcome::AlreadyMember => "bot is already in the room".into(),
         BotInviteOutcome::JoinedNow => "bot invited + joined + promoted to PL=100".into(),
     };
+    // ADR-0011: the MM-room marker (best-effort; skipped when it is already
+    // recorded with the same content).
+    crate::room_marker::ensure_room_marker_for(&state, &room_id).await;
     Ok(Json(EnableMMResponse { ok: true, bot_user_id, message }))
 }
 
@@ -564,13 +567,16 @@ async fn put_mm_config(
     .await
     .map_err(|e| MMError::Database(e.to_string()))?;
 
+    // ADR-0011: the marker mirrors the switch (best-effort).
+    crate::room_marker::ensure_room_marker_for(&state, &room_id).await;
+
     Ok(Json(RoomMMConfig {
         matrix_room_id: room_id,
         mm_enabled: req.enabled,
     }))
 }
 
-async fn load_mm_config(
+pub(crate) async fn load_mm_config(
     state: &SharedState,
     matrix_room_id: &str,
 ) -> Result<RoomMMConfig, ApiError> {

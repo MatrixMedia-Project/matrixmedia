@@ -95,14 +95,16 @@ impl StateWrite {
 
 /// What a state write sends.
 #[derive(Clone, Copy)]
-pub(crate) enum StatePayload<'a> {
+pub enum StatePayload<'a> {
     Active(&'a StreamEventContent),
     Ended(&'a StreamEndedEventContent),
     Key(&'a E2eeKeyEvent),
     KeyClear(&'a str),
+    /// Any other state content (the room marker).
+    Json(&'a serde_json::Value),
 }
 
-pub(crate) async fn send_state(
+pub async fn send_state(
     ctx: &MarkerContext<'_>,
     room_id: &str,
     event_type: &str,
@@ -115,6 +117,7 @@ pub(crate) async fn send_state(
         StatePayload::KeyClear(stream_id) => {
             events::clear_e2ee_key_as(ctx.hs_client, room_id, event_type, stream_id).await
         }
+        StatePayload::Json(v) => ctx.hs_client.send_state_event(room_id, event_type, "", v).await,
     };
     if result.is_ok() {
         note_written(ctx, event_type).await;

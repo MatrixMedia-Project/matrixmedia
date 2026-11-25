@@ -25,6 +25,12 @@ pub fn routes(state: SharedState) -> Router {
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/streams", get(list_streams))
+        // ADR-0011: write the MM-room marker into every room the bot is in
+        // (dry run by default).
+        .route(
+            "/room-markers/backfill",
+            axum::routing::post(crate::room_marker::backfill_handler),
+        )
         .route("/streams/{id}", get(get_stream).delete(force_stop_stream))
         .route("/recordings", get(admin_list_recordings))
         .route("/recordings/{id}", delete(admin_delete_recording))

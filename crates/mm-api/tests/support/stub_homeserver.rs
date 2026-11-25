@@ -142,7 +142,10 @@ impl StubHomeserver {
 
 async fn handle(State(stub): State<Arc<StubHomeserver>>, req: Request<Body>) -> Response {
     let method = req.method().to_string();
-    let path = req.uri().path().to_string();
+    // Decoded, so a test can match a room id however the caller encoded it.
+    let path = urlencoding::decode(req.uri().path())
+        .map(|p| p.into_owned())
+        .unwrap_or_else(|_| req.uri().path().to_string());
     let query = req.uri().query().unwrap_or("").to_string();
     let bytes = axum::body::to_bytes(req.into_body(), 1_000_000)
         .await

@@ -347,6 +347,10 @@ async fn run_pg_migrations_locked(
             "V063_event_namespaces",
             include_str!("../migrations/V063__event_namespaces.sql"),
         ),
+        (
+            "V064_room_marker",
+            include_str!("../migrations/V064__room_marker.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -399,18 +403,16 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V063. (V063 creates the
-        // mm_event_namespace_history table in its LAST statement, so a V063 that
-        // died partway — table not yet created — is not adopted. The table
-        // definition must include the PRIMARY KEY: this table did not exist
-        // before V063, so its presence alone proves the migration ran to
+        // UPDATE THIS PROBE when adding a migration past V064. (V064 creates the
+        // mm_room_marker table, its only statement; the table did not exist
+        // before V064, so its presence alone proves the migration ran to
         // completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_event_namespace_history'",
+                AND tablename  = 'mm_room_marker'",
         )
         .fetch_optional(pool)
         .await
@@ -939,6 +941,19 @@ pub trait Database: Send + Sync + 'static {
 
     /// Every namespace the server has written, oldest first, with its profile.
     async fn list_event_namespaces(&self) -> Result<Vec<(String, String)>, MMError>;
+
+    /// `(event_id, content_hash)` of the room marker mm-core last wrote in a
+    /// room (V064), if any.
+    async fn get_room_marker(&self, matrix_room_id: &str)
+    -> Result<Option<(String, String)>, MMError>;
+
+    /// Record the room marker just written (V064).
+    async fn set_room_marker(
+        &self,
+        matrix_room_id: &str,
+        event_id: &str,
+        content_hash: &str,
+    ) -> Result<(), MMError>;
 
     /// Run pending migrations.
     async fn migrate(&self) -> Result<(), MMError>;

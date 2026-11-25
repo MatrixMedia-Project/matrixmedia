@@ -324,35 +324,34 @@ impl StreamEndedEventContent {
     }
 }
 
-/// Content for a `com.matrixmedia.room_config` state event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Content of the `dev.matrixmedia.room_config` state event, the MM-room
+/// marker (ADR-0011 section 3), version 2. State key `""`.
+///
+/// A projection mm-core writes and never reads back: the database stays the
+/// authority and the marker grants nothing. It says "this is a MatrixMedia
+/// room, run by this server", whether the owner switched MatrixMedia off, and
+/// (optionally) which event names this server uses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoomConfigContent {
-    /// Maximum participants allowed in streams.
-    #[serde(default = "default_max_participants")]
-    pub max_participants: u32,
-    /// Allowed media types in this room.
-    #[serde(default = "default_allowed_media")]
-    pub allowed_media_types: Vec<String>,
-    /// Whether streaming is enabled in this room.
-    #[serde(default = "default_true")]
+    /// Always [`ROOM_CONFIG_VERSION`].
+    pub version: u32,
+    /// Mirrors `mm_room_config.mm_enabled`: `false` when the room owner
+    /// switched MatrixMedia off.
     pub enabled: bool,
+    /// Base URL of the MatrixMedia server that runs the room.
+    pub mm_server_url: String,
+    /// Matrix server name of that MatrixMedia server.
+    pub mm_matrix_server: String,
+    /// When the marker was written (ms since the Unix epoch).
+    pub updated_at_ms: i64,
+    /// The server's `event_namespaces` block (the same one the token exchange
+    /// returns), for clients of other servers in the room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_namespaces: Option<serde_json::Value>,
 }
 
-fn default_max_participants() -> u32 {
-    50
-}
-
-fn default_allowed_media() -> Vec<String> {
-    vec![
-        "audio".to_string(),
-        "video".to_string(),
-        "screen".to_string(),
-    ]
-}
-
-fn default_true() -> bool {
-    true
-}
+/// Content version of the room marker.
+pub const ROOM_CONFIG_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Stream state event publishing
@@ -1694,12 +1693,26 @@ mod tests {
     }
 
     #[test]
-    fn test_room_config_defaults() {
-        let json = serde_json::json!({});
-        let config: RoomConfigContent = serde_json::from_value(json).unwrap();
-        assert_eq!(config.max_participants, 50);
-        assert_eq!(config.allowed_media_types, vec!["audio", "video", "screen"]);
-        assert!(config.enabled);
+    fn the_room_marker_is_version_2_with_an_optional_namespace_block() {
+        let marker = RoomConfigContent {
+            version: ROOM_CONFIG_VERSION,
+            enabled: true,
+            mm_server_url: "https://mm.example.org".into(),
+            mm_matrix_server: "example.org".into(),
+            updated_at_ms: 1_764_000_000_000,
+            event_namespaces: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&marker).unwrap(),
+            serde_json::json!({
+                "version": 2,
+                "enabled": true,
+                "mm_server_url": "https://mm.example.org",
+                "mm_matrix_server": "example.org",
+                "updated_at_ms": 1_764_000_000_000_i64
+            })
+        );
+        assert_eq!(ROOM_CONFIG_EVENT_TYPE, "dev.matrixmedia.room_config");
     }
 
     #[test]

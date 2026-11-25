@@ -133,6 +133,16 @@ impl AppserviceHandler {
         self
     }
 
+    /// Set the feed indexer's sender check (`matrix.feed_sender_check`).
+    pub fn with_feed_sender_check(mut self, mode: crate::feed_indexer::SenderCheck) -> Self {
+        if let Some(indexer) = self.feed_indexer.take() {
+            let mut indexer = (*indexer).clone();
+            indexer.set_sender_check(mode);
+            self.feed_indexer = Some(Arc::new(indexer));
+        }
+        self
+    }
+
     /// The namespaces this handler reads.
     pub fn read_namespaces(&self) -> &[String] {
         &self.read_namespaces

@@ -329,6 +329,37 @@ impl Database for PgDatabase {
         Ok(row.unwrap_or((None, None)))
     }
 
+    async fn get_room_marker(
+        &self,
+        matrix_room_id: &str,
+    ) -> Result<Option<(String, String)>, MMError> {
+        sqlx::query_as("SELECT event_id, content_hash FROM mm_room_marker WHERE matrix_room_id = $1")
+            .bind(matrix_room_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)
+    }
+
+    async fn set_room_marker(
+        &self,
+        matrix_room_id: &str,
+        event_id: &str,
+        content_hash: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "INSERT INTO mm_room_marker (matrix_room_id, event_id, content_hash, written_at) VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (matrix_room_id) DO UPDATE SET event_id = EXCLUDED.event_id, \
+             content_hash = EXCLUDED.content_hash, written_at = now()",
+        )
+        .bind(matrix_room_id)
+        .bind(event_id)
+        .bind(content_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn record_event_namespace(&self, namespace: &str, profile: &str) -> Result<(), MMError> {
         sqlx::query(
             "INSERT INTO mm_event_namespace_history (namespace, profile) VALUES ($1, $2) \

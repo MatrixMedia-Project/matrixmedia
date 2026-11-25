@@ -196,7 +196,10 @@ pub async fn run(
         db.pool().clone(),
         config.matrix.server_name.clone(),
     )
-    .with_read_namespaces(written_namespaces);
+    .with_read_namespaces(written_namespaces)
+    .with_feed_sender_check(mm_matrix::feed_indexer::SenderCheck::from_setting(
+        &config.matrix.feed_sender_check,
+    ));
 
     // ---------------------------------------------------------------
     // 7. Prometheus metrics

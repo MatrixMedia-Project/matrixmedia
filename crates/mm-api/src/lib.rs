@@ -24,6 +24,7 @@ pub mod honeypot;
 pub mod internal;
 pub mod reserved_names;
 pub mod return_pages;
+pub mod room_marker;
 pub mod rooms;
 pub mod settings_checks;
 pub mod settings_service;

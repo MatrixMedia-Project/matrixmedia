@@ -108,6 +108,49 @@ pub const MAX_FAN_OUT_MEMBERS: usize = 1000;
 pub trait MemberResolver: Send + Sync {
     /// Return the full list of joined-member MXIDs for `room_id`.
     async fn joined_members(&self, room_id: &str) -> Result<Vec<String>, mm_core::error::MMError>;
+
+    /// The room's `m.room.power_levels` content, for the sender check.
+    /// `Ok(None)` when unknown (the default, for resolvers that do not read
+    /// room state).
+    async fn power_levels(
+        &self,
+        _room_id: &str,
+    ) -> Result<Option<serde_json::Value>, mm_core::error::MMError> {
+        Ok(None)
+    }
+}
+
+/// Sender check for server-written feed events (`matrix.feed_sender_check`,
+/// ADR-0011 section 4 rule 5, brief section 3). "Authorised" means the sender
+/// is the local bot or has at least the room's `state_default` power.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderCheck {
+    /// No check.
+    Off,
+    /// Count and log an unauthorised sender; index the event anyway.
+    Log,
+    /// Drop events from an unauthorised sender.
+    Enforce,
+}
+
+impl SenderCheck {
+    /// From the setting value; anything unknown is the default, `log`.
+    pub fn from_setting(v: &str) -> Self {
+        match v {
+            "off" => SenderCheck::Off,
+            "enforce" => SenderCheck::Enforce,
+            _ => SenderCheck::Log,
+        }
+    }
+}
+
+/// Whether `sender` has at least `state_default` in `power_levels`.
+pub fn has_state_default_power(power_levels: &serde_json::Value, sender: &str) -> bool {
+    let num = |v: Option<&serde_json::Value>, d: i64| v.and_then(|x| x.as_i64()).unwrap_or(d);
+    let users_default = num(power_levels.get("users_default"), 0);
+    let state_default = num(power_levels.get("state_default"), 50);
+    let level = num(power_levels.get("users").and_then(|u| u.get(sender)), users_default);
+    level >= state_default
 }
 
 /// Membership cache entry: cached members + the moment we cached them.
@@ -140,6 +183,8 @@ pub struct FeedIndexer {
     mm_enabled_ttl: Duration,
     /// Namespaces read (built-in first). See [`Self::set_read_namespaces`].
     read_namespaces: Arc<Vec<String>>,
+    /// Sender check for server-written feed events.
+    sender_check: SenderCheck,
 }
 
 impl FeedIndexer {
@@ -162,6 +207,24 @@ impl FeedIndexer {
             read_namespaces: Arc::new(
                 BUILTIN_READ_NAMESPACES.iter().map(|s| s.to_string()).collect(),
             ),
+            sender_check: SenderCheck::Log,
+        }
+    }
+
+    /// Set the sender check mode (default [`SenderCheck::Log`]).
+    pub fn set_sender_check(&mut self, mode: SenderCheck) {
+        self.sender_check = mode;
+    }
+
+    /// Is `sender` allowed to send server-written feed events in `room_id`?
+    /// `None` when the room's power levels could not be read.
+    async fn sender_authorised(&self, room_id: &str, sender: &str) -> Option<bool> {
+        if sender == self.bot_user_id {
+            return Some(true);
+        }
+        match self.resolver.power_levels(room_id).await {
+            Ok(Some(pl)) => Some(has_state_default_power(&pl, sender)),
+            _ => None,
         }
     }
 
@@ -243,6 +306,36 @@ impl FeedIndexer {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let kind = feed_kind_for_suffix(suffix);
+
+        // Sender check for the events only the server sends (not feed.post).
+        if suffix.server_written() && self.sender_check != SenderCheck::Off {
+            let sender = event.get("sender").and_then(|s| s.as_str()).unwrap_or_default();
+            match self.sender_authorised(&room_id, sender).await {
+                Some(true) => {}
+                Some(false) => {
+                    if self.sender_check == SenderCheck::Enforce {
+                        mm_core::metrics_global::FEED_SENDER_CHECK
+                            .with_label_values(&["dropped"])
+                            .inc();
+                        warn!(room_id = %room_id, event_type, sender,
+                            "feed event from an unauthorised sender dropped");
+                        return Ok(false);
+                    }
+                    mm_core::metrics_global::FEED_SENDER_CHECK
+                        .with_label_values(&["logged"])
+                        .inc();
+                    warn!(room_id = %room_id, event_type, sender,
+                        "feed event from an unauthorised sender (indexed: sender check in log mode)");
+                }
+                None => {
+                    mm_core::metrics_global::FEED_SENDER_CHECK
+                        .with_label_values(&["unchecked"])
+                        .inc();
+                    debug!(room_id = %room_id, event_type, sender,
+                        "feed sender check: power levels unreadable; indexed");
+                }
+            }
+        }
 
         // 1. mm_enabled gate (cached).
         if !self.mm_enabled(&room_id).await {
@@ -618,6 +711,13 @@ impl MemberResolver for HomeserverMemberResolver {
     async fn joined_members(&self, room_id: &str) -> Result<Vec<String>, mm_core::error::MMError> {
         self.client.get_joined_members(room_id).await
     }
+
+    async fn power_levels(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<serde_json::Value>, mm_core::error::MMError> {
+        self.client.get_state_raw(room_id, "m.room.power_levels", "").await
+    }
 }
 
 #[cfg(test)]
@@ -759,6 +859,55 @@ mod tests {
         // A namespace not on the list at all: not a feed event.
         let ev = from("@mmbot:localhost", "org.other.feed.broadcast.started");
         assert!(!indexer.handle_event(&ev).await.unwrap());
+    }
+
+    /// A resolver that answers power levels too.
+    struct PowerResolver(serde_json::Value);
+
+    #[async_trait]
+    impl MemberResolver for PowerResolver {
+        async fn joined_members(&self, _: &str) -> Result<Vec<String>, mm_core::error::MMError> {
+            Ok(Vec::new())
+        }
+        async fn power_levels(
+            &self,
+            _: &str,
+        ) -> Result<Option<serde_json::Value>, mm_core::error::MMError> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn state_default_power_is_the_authorisation_bar() {
+        let pl = serde_json::json!({ "users": { "@mod:l": 50, "@member:l": 0 }, "state_default": 50 });
+        assert!(has_state_default_power(&pl, "@mod:l"));
+        assert!(!has_state_default_power(&pl, "@member:l"));
+        assert!(!has_state_default_power(&pl, "@stranger:l"));
+        assert!(has_state_default_power(&serde_json::json!({ "users_default": 50 }), "@x:l"));
+        assert_eq!(SenderCheck::from_setting("enforce"), SenderCheck::Enforce);
+        assert_eq!(SenderCheck::from_setting("off"), SenderCheck::Off);
+        assert_eq!(SenderCheck::from_setting("log"), SenderCheck::Log);
+        assert_eq!(SenderCheck::from_setting("bogus"), SenderCheck::Log);
+    }
+
+    /// In enforce mode a server-written feed event from a plain member is
+    /// dropped before any database access (lazy pool never connects).
+    #[tokio::test]
+    async fn enforce_drops_a_server_written_feed_event_from_an_unauthorised_sender() {
+        let pl = serde_json::json!({ "users": { "@mmbot:localhost": 100 }, "state_default": 50 });
+        let mut indexer = FeedIndexer::new(
+            lazy_pool(),
+            Arc::new(PowerResolver(pl)),
+            "localhost",
+            "@mmbot:localhost",
+        );
+        indexer.set_sender_check(SenderCheck::Enforce);
+        let before = mm_core::metrics_global::FEED_SENDER_CHECK.with_label_values(&["dropped"]).get();
+        let mut ev = make_broadcast_started_event("!r:localhost", "$e1");
+        ev["sender"] = serde_json::json!("@member:localhost");
+        assert!(!indexer.handle_event(&ev).await.unwrap());
+        let after = mm_core::metrics_global::FEED_SENDER_CHECK.with_label_values(&["dropped"]).get();
+        assert!(after > before);
     }
 
     fn make_broadcast_started_event(room_id: &str, event_id: &str) -> serde_json::Value {

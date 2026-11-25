@@ -719,6 +719,9 @@ pub(crate) async fn create_stream_record(
             "Failed to ensure bot in room (continuing; downstream Matrix sends may 403)"
         );
     }
+    // ADR-0011: write the MM-room marker if it is missing or out of date
+    // (best-effort; repairs any room the backfill missed).
+    crate::room_marker::ensure_room_marker_for(state, matrix_room_id).await;
 
     let room = state
         .db

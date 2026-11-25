@@ -206,6 +206,16 @@ CREATE TABLE IF NOT EXISTS mm_event_namespace_history (
 );
 "#;
 
+/// ADR-0011 room marker bookkeeping (V064 parity for SQLite).
+pub const V064_ROOM_MARKER: &str = r#"
+CREATE TABLE IF NOT EXISTS mm_room_marker (
+    matrix_room_id TEXT PRIMARY KEY,
+    event_id       TEXT NOT NULL,
+    content_hash   TEXT NOT NULL,
+    written_at     TEXT NOT NULL
+);
+"#;
+
 pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
     vec![
         ("V001_initial", V001_INITIAL),
@@ -218,5 +228,6 @@ pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
         ("V058_share_links", V058_SHARE_LINKS),
         ("V059_paywall", V059_PAYWALL),
         ("V063_event_namespaces", V063_EVENT_NAMESPACES),
+        ("V064_room_marker", V064_ROOM_MARKER),
     ]
 }

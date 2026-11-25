@@ -298,6 +298,38 @@ impl Database for SqliteDatabase {
         Ok(row.unwrap_or((None, None)))
     }
 
+    async fn get_room_marker(
+        &self,
+        matrix_room_id: &str,
+    ) -> Result<Option<(String, String)>, MMError> {
+        sqlx::query_as("SELECT event_id, content_hash FROM mm_room_marker WHERE matrix_room_id = ?1")
+            .bind(matrix_room_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)
+    }
+
+    async fn set_room_marker(
+        &self,
+        matrix_room_id: &str,
+        event_id: &str,
+        content_hash: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "INSERT INTO mm_room_marker (matrix_room_id, event_id, content_hash, written_at) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (matrix_room_id) DO UPDATE SET event_id = excluded.event_id, \
+             content_hash = excluded.content_hash, written_at = excluded.written_at",
+        )
+        .bind(matrix_room_id)
+        .bind(event_id)
+        .bind(content_hash)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn record_event_namespace(&self, namespace: &str, profile: &str) -> Result<(), MMError> {
         sqlx::query(
             "INSERT OR IGNORE INTO mm_event_namespace_history (namespace, profile, first_written_at) \

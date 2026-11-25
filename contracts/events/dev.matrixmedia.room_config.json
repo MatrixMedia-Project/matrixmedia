@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/dev.matrixmedia.room_config.json",
+  "title": "dev.matrixmedia.room_config",
+  "description": "The MM-room marker (ADR-0011 section 3), content version 2. State event, state key \"\". Written by the MatrixMedia server's bot when it joins a room, on enable-mm, when the room owner switches MatrixMedia on or off, and at stream start; never read back by the server, and it grants nothing. Its name is never changed by a setting. A client uses mm_server_url only if it is the server the user is signed in to, or the federation trust check for mm_matrix_server passes.",
+  "type": "object",
+  "required": [
+    "version",
+    "enabled",
+    "mm_server_url",
+    "mm_matrix_server",
+    "updated_at_ms"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 2
+    },
+    "enabled": {
+      "type": "boolean",
+      "description": "false when the room owner switched MatrixMedia off; clients hide MatrixMedia features."
+    },
+    "mm_server_url": {
+      "type": "string",
+      "pattern": "^https?://",
+      "description": "Base URL of the MatrixMedia server that runs the room."
+    },
+    "mm_matrix_server": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Matrix server name of that MatrixMedia server."
+    },
+    "updated_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "event_namespaces": {
+      "type": "object",
+      "required": [
+        "version",
+        "write",
+        "read"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "write": {
+          "type": "string",
+          "description": "\"legacy\" or a namespace listed in read."
+        },
+        "read": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "namespace",
+              "profile"
+            ],
+            "properties": {
+              "namespace": {
+                "type": "string",
+                "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+                "maxLength": 64
+              },
+              "profile": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "bot_user_id": {
+          "type": "string",
+          "pattern": "^@[^:]+:.+$",
+          "maxLength": 255
+        }
+      },
+      "description": "The server's event_namespaces block, the same one POST /auth/token returns. Clients honour it only when the marker passes the trust check and its power level is pinned (ADR-0011 section 4, rules 6 and 8)."
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "version": 2,
+      "enabled": true,
+      "mm_server_url": "https://mm.example.org",
+      "mm_matrix_server": "example.org",
+      "updated_at_ms": 1764000000000,
+      "event_namespaces": {
+        "version": 1,
+        "write": "legacy",
+        "read": [
+          {
+            "namespace": "dev.matrixmedia",
+            "profile": "v1"
+          },
+          {
+            "namespace": "com.matrixmedia",
+            "profile": "v1"
+          },
+          {
+            "namespace": "com.steegler.matrixmedia",
+            "profile": "v1"
+          }
+        ],
+        "bot_user_id": "@mmbot:example.org"
+      }
+    }
+  ]
+}

@@ -644,6 +644,77 @@ impl HomeserverClient {
         Ok(bot_pl >= pls.state_default)
     }
 
+    /// Read a room state event's raw content as the bot.
+    ///
+    /// `GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}`
+    ///
+    /// `None` on 404. Used where the whole content must be written back
+    /// unchanged apart from one field (power-level pinning, ADR-0011).
+    pub async fn get_state_raw(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<serde_json::Value>, mm_core::error::MMError> {
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/{}/{}",
+            self.homeserver_url, room_id, event_type, state_key
+        );
+        debug!("GET {url}");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .send_timed(mm_core::http::DEP_SYNAPSE)
+            .await
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("get state failed: {e}")))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "get state returned {status}"
+            )));
+        }
+        resp.json()
+            .await
+            .map(Some)
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("get state parse failed: {e}")))
+    }
+
+    /// Rooms the bot is joined to.
+    ///
+    /// `GET /_matrix/client/v3/joined_rooms`
+    pub async fn joined_rooms(&self) -> Result<Vec<String>, mm_core::error::MMError> {
+        let url = format!("{}/_matrix/client/v3/joined_rooms", self.homeserver_url);
+        debug!("GET {url}");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .send_timed(mm_core::http::DEP_SYNAPSE)
+            .await
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("joined_rooms failed: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "joined_rooms returned {status}"
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("joined_rooms parse failed: {e}")))?;
+        Ok(body
+            .get("joined_rooms")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default())
+    }
+
     // ---------------------------------------------------------------
     // check_room_encrypted
     // ---------------------------------------------------------------

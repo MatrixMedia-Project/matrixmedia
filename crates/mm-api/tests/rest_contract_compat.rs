@@ -50,7 +50,12 @@ fn repo_root() -> PathBuf {
 }
 
 fn load_yaml(rel: &str) -> Value {
-    let path = repo_root().join(rel);
+    // MM_REST_CONTRACTS_ROOT: read the contracts from another tree (used to
+    // write the baseline from the development commit it describes).
+    let root = std::env::var("MM_REST_CONTRACTS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root());
+    let path = root.join(rel);
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
@@ -70,6 +75,26 @@ fn resolve<'a>(root: &'a Value, mut v: &'a Value) -> &'a Value {
         }
     }
     v
+}
+
+/// `type=… required=…[ enum=<JSON array>]` — `enum` last, so it may hold spaces.
+fn describe(s: &Value, required: bool) -> String {
+    let mut d = format!("type={} required={required}", type_of(s));
+    let values = match (s.get("enum"), s.get("const")) {
+        (Some(Value::Array(a)), _) => Some(a.clone()),
+        (_, Some(c)) => Some(vec![c.clone()]),
+        _ => None,
+    };
+    if let Some(mut v) = values {
+        v.sort_by_key(|x| x.to_string());
+        d.push_str(&format!(" enum={}", Value::Array(v)));
+    }
+    d
+}
+
+fn enum_part(desc: &str) -> Option<Vec<Value>> {
+    let (_, e) = desc.split_once(" enum=")?;
+    serde_json::from_str::<Vec<Value>>(e).ok()
 }
 
 fn type_of(s: &Value) -> String {
@@ -108,12 +133,8 @@ fn walk(
         return;
     }
     let s = resolve(root, schema);
-    let desc = if request {
-        format!("type={} required={required}", type_of(s))
-    } else {
-        format!("type={}", type_of(s))
-    };
-    out.insert(key.to_string(), desc);
+    let _ = request;
+    out.insert(key.to_string(), describe(s, required));
     walk_children(root, s, key, request, out, depth);
 }
 
@@ -225,10 +246,9 @@ fn surface(doc: &Value) -> Surface {
                     .and_then(Value::as_bool)
                     .unwrap_or(loc == "path");
                 let schema = p.get("schema").cloned().unwrap_or(Value::Null);
-                let t = type_of(resolve(doc, &schema));
                 out.insert(
                     format!("param {op_id} {loc}:{name}"),
-                    format!("type={t} required={required}"),
+                    describe(resolve(doc, &schema), required),
                 );
             }
 
@@ -289,6 +309,35 @@ fn surface(doc: &Value) -> Surface {
     out
 }
 
+/// An enum change that breaks a shipped client: a request (or parameter)
+/// loses an accepted value or gains a restriction; a response may now carry a
+/// value the client was never built for.
+fn enum_break(key: &str, old: &str, new: &str) -> Option<String> {
+    let (o, n) = (enum_part(old), enum_part(new));
+    let request = key.starts_with("param ") || key.starts_with("request ");
+    match (o, n) {
+        (None, None) => None,
+        (Some(o), Some(n)) => {
+            let lost: Vec<&Value> = o.iter().filter(|v| !n.contains(v)).collect();
+            let gained: Vec<&Value> = n.iter().filter(|v| !o.contains(v)).collect();
+            if request && !lost.is_empty() {
+                Some(format!("request enum lost values {lost:?}: {key}"))
+            } else if !request && !gained.is_empty() {
+                Some(format!("response enum gained values {gained:?}: {key}"))
+            } else {
+                None
+            }
+        }
+        (None, Some(_)) if request => {
+            Some(format!("request enum added (values restricted): {key}"))
+        }
+        (Some(_), None) if !request => {
+            Some(format!("response enum removed (any value now): {key}"))
+        }
+        _ => None,
+    }
+}
+
 fn is_required(desc: &str) -> bool {
     desc.contains("required=true")
 }
@@ -330,7 +379,14 @@ fn breaking_changes(baseline: &Surface, current: &Surface) -> Vec<String> {
             {
                 problems.push(format!("request field became required: {key}"))
             }
-            Some(_) => {}
+            Some(new) if key.starts_with("response ") && is_required(old) && !is_required(new) => {
+                problems.push(format!("response field became optional: {key}"))
+            }
+            Some(new) => {
+                if let Some(p) = enum_break(key, old, new) {
+                    problems.push(p);
+                }
+            }
         }
     }
     for (key, new) in current {
@@ -505,6 +561,49 @@ fn the_comparator_catches_each_kind_of_break() {
             .any(|x| x.starts_with("request field became required") && x.contains("query:dry")),
         "{p:?}"
     );
+
+    // A response field that every client could rely on becomes optional.
+    let mut with_required = base_doc.clone();
+    with_required["components"]["schemas"]["Resp"]["required"] = serde_json::json!(["stream_id"]);
+    let base_req = surface(&with_required);
+    let p = breaking_changes(&base_req, &surface(&base_doc));
+    assert!(
+        p.iter()
+            .any(|x| x.starts_with("response field became optional") && x.contains("stream_id")),
+        "{p:?}"
+    );
+
+    // Enums: a response gains a value; a request loses one.
+    let mut enums = base_doc.clone();
+    enums["components"]["schemas"]["Resp"]["properties"]["status"] =
+        serde_json::json!({ "type": "string", "enum": ["active", "ended"] });
+    enums["components"]["schemas"]["Req"]["properties"]["media"] =
+        serde_json::json!({ "type": "string", "enum": ["audio", "video"] });
+    let base_enum = surface(&enums);
+    let mut gained = enums.clone();
+    gained["components"]["schemas"]["Resp"]["properties"]["status"]["enum"] =
+        serde_json::json!(["active", "ended", "paused"]);
+    let p = breaking_changes(&base_enum, &surface(&gained));
+    assert!(
+        p.iter()
+            .any(|x| x.starts_with("response enum gained values")),
+        "{p:?}"
+    );
+    let mut lost = enums.clone();
+    lost["components"]["schemas"]["Req"]["properties"]["media"]["enum"] =
+        serde_json::json!(["audio"]);
+    let p = breaking_changes(&base_enum, &surface(&lost));
+    assert!(
+        p.iter().any(|x| x.starts_with("request enum lost values")),
+        "{p:?}"
+    );
+    // The other directions are additive.
+    let mut fine = enums.clone();
+    fine["components"]["schemas"]["Resp"]["properties"]["status"]["enum"] =
+        serde_json::json!(["active"]);
+    fine["components"]["schemas"]["Req"]["properties"]["media"]["enum"] =
+        serde_json::json!(["audio", "video", "screen"]);
+    assert!(breaking_changes(&base_enum, &surface(&fine)).is_empty());
 
     // Additive changes pass.
     let p = mutate(&|d| {

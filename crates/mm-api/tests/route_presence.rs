@@ -1,13 +1,14 @@
-//! Route presence (ADR-0011 section 5.1, audit item 6b).
+//! Route presence (ADR-0011 section 5.1).
 //!
 //! The REST compatibility check only sees the routes documented in the
-//! OpenAPI files; the routers register many more. This test sends one request
-//! for every route in `tests/client_routes.txt` (the routes the shipped apps
-//! and the web packages call) through the real routers, assembled exactly as
-//! `mm-server` does, and fails when the router itself answers "no such route"
-//! (404) or "no such method" (405) with axum's empty body. A handler that
-//! answers 401, 400, 404 with a JSON error, 500 or 501 proves the route is
-//! still registered.
+//! OpenAPI files; the routers register many more. For every route template in
+//! `tests/client_routes.txt` (the routes the shipped apps and the web packages
+//! call) this test sends one request, with each `{param}` filled by a sample
+//! value, through the client-port routes exactly as mm-server mounts them
+//! (`mm_api::client_port_router`, which mm-server's startup calls), and
+//! asserts the router matched **that template** (axum's `MatchedPath`). So a
+//! removed `GET /streams/active-mine` fails even though the request would
+//! still match `GET /streams/{id}`, and a wrong method or unknown path fails.
 //!
 //! No external service: the database is an in-memory SQLite, the Postgres
 //! pool is lazy and never reaches a server (127.0.0.1:9), and the homeserver
@@ -16,7 +17,8 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::extract::MatchedPath;
+use axum::http::{HeaderValue, Method, Request, StatusCode};
 use tower::ServiceExt;
 
 use mm_api::middleware::AuthConfig;
@@ -97,11 +99,56 @@ async fn routers() -> axum::Router {
         hs_token: String::new(),
         matrix_homeserver_url: DEAD.into(),
     };
-    // As mm-server builds the client port (startup.rs, "Build routers").
-    let app = mm_api::client_router(state.clone())
-        .merge(mm_api::wellknown::routes(state.clone()))
-        .merge(mm_api::readyz::routes(state.clone()));
-    mm_api::middleware::apply_middleware(app, state.config_handle.clone(), auth)
+    // The same function mm-server's startup mounts on the client port.
+    let app = mm_api::client_port_router(state.clone(), None);
+    record_matched_path(mm_api::middleware::apply_middleware(
+        app,
+        state.config_handle.clone(),
+        auth,
+    ))
+}
+
+const MATCHED: &str = "x-test-matched-path";
+
+/// Echo the route template axum matched in a response header (a layer added
+/// with `Router::layer` runs after routing and sees `MatchedPath`).
+fn record_matched_path(app: axum::Router) -> axum::Router {
+    app.layer(axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let matched = req
+                .extensions()
+                .get::<MatchedPath>()
+                .map(|m| m.as_str().to_owned());
+            let mut resp = next.run(req).await;
+            if let Some(m) = matched.and_then(|m| HeaderValue::from_str(&m).ok()) {
+                resp.headers_mut().insert(MATCHED, m);
+            }
+            resp
+        },
+    ))
+}
+
+/// A sample value for a path parameter.
+fn sample(param: &str) -> &'static str {
+    match param {
+        "room_id" | "matrix_room_id" => "%21r%3Aexample.org",
+        "creator_id" | "user_id" => "%40alice%3Aexample.org",
+        _ => "x1",
+    }
+}
+
+/// Fill every `{param}` of `template` with a sample value.
+fn concrete(template: &str) -> String {
+    template
+        .split('/')
+        .map(
+            |seg| match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                Some(param) => sample(param).to_string(),
+                None => seg.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn listed_routes() -> Vec<(Method, String)> {
@@ -116,11 +163,13 @@ fn listed_routes() -> Vec<(Method, String)> {
         .collect()
 }
 
-/// axum's own "no route" / "wrong method" answers: 404 or 405 with no body.
-async fn router_refused(app: &axum::Router, method: Method, path: &str) -> Option<StatusCode> {
-    let uri = path.replace('!', "%21").replace('@', "%40");
+/// Send one request for `template` and say how the router handled it: `Ok`
+/// when it matched that very template with that method, `Err` otherwise.
+async fn check_route(app: &axum::Router, method: Method, template: &str) -> Result<(), String> {
     let has_body = matches!(method, Method::POST | Method::PUT);
-    let mut req = Request::builder().method(method).uri(uri);
+    let mut req = Request::builder()
+        .method(method.clone())
+        .uri(concrete(template));
     if has_body {
         req = req.header("content-type", "application/json");
     }
@@ -136,42 +185,74 @@ async fn router_refused(app: &axum::Router, method: Method, path: &str) -> Optio
         .expect("answered in time")
         .unwrap();
     let status = resp.status();
-    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
-        .await
-        .unwrap();
-    ((status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED)
-        && body.is_empty())
-    .then_some(status)
+    let matched = resp
+        .headers()
+        .get(MATCHED)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    match matched {
+        _ if status == StatusCode::METHOD_NOT_ALLOWED => Err(format!(
+            "{method} {template}: method not allowed ({status})"
+        )),
+        Some(m) if m == template => Ok(()),
+        Some(m) => Err(format!(
+            "{method} {template}: routed to {m} instead ({status})"
+        )),
+        None => Err(format!("{method} {template}: no route matched ({status})")),
+    }
 }
 
 #[tokio::test]
 async fn every_route_the_clients_call_is_still_registered() {
     let app = routers().await;
     let routes = listed_routes();
-    assert!(routes.len() > 80, "the list has {} routes", routes.len());
-    let mut missing = Vec::new();
-    for (method, path) in routes {
-        if let Some(status) = router_refused(&app, method.clone(), &path).await {
-            missing.push(format!("{method} {path} -> {status}"));
+    assert!(routes.len() >= 90, "the list has {} routes", routes.len());
+    let mut problems = Vec::new();
+    for (method, template) in routes {
+        if let Err(e) = check_route(&app, method, &template).await {
+            problems.push(e);
         }
     }
     assert!(
-        missing.is_empty(),
-        "routes no longer registered:\n  {}",
-        missing.join("\n  ")
+        problems.is_empty(),
+        "routes the clients call are gone or shadowed:\n  {}",
+        problems.join("\n  ")
     );
 }
 
-/// The check can fail: an unregistered route and a wrong method are caught.
+/// The check fails for an unknown path, a wrong method, and a route that is
+/// gone but whose request would still be taken by a broader template (the
+/// shadowed case: without `/streams/active-mine`, `/streams/{id}` answers).
 #[tokio::test]
-async fn the_check_detects_a_missing_route_and_a_wrong_method() {
+async fn the_check_detects_a_missing_route_a_wrong_method_and_a_shadowed_route() {
     let app = routers().await;
-    assert_eq!(
-        router_refused(&app, Method::GET, "/_mm/client/v1/no-such-route").await,
-        Some(StatusCode::NOT_FOUND)
+    assert!(
+        check_route(&app, Method::GET, "/_mm/client/v1/no-such-route")
+            .await
+            .is_err()
     );
-    assert_eq!(
-        router_refused(&app, Method::DELETE, "/_mm/client/v1/feed").await,
-        Some(StatusCode::METHOD_NOT_ALLOWED)
+    assert!(
+        check_route(&app, Method::DELETE, "/_mm/client/v1/feed")
+            .await
+            .is_err()
+    );
+
+    // A router that registers only the broader template.
+    let shadowed = record_matched_path(axum::Router::new().route(
+        "/_mm/client/v1/streams/{id}",
+        axum::routing::get(|| async { "s" }),
+    ));
+    let err = check_route(&shadowed, Method::GET, "/_mm/client/v1/streams/active-mine")
+        .await
+        .expect_err("a shadowed route must fail");
+    assert!(
+        err.contains("routed to /_mm/client/v1/streams/{id}"),
+        "{err}"
+    );
+    // ...and the broader template itself still passes there.
+    assert!(
+        check_route(&shadowed, Method::GET, "/_mm/client/v1/streams/{id}")
+            .await
+            .is_ok()
     );
 }

@@ -4,67 +4,69 @@
 # each must still be registered. Removing a line is a reviewed decision that
 # no supported client calls it any more.
 #
-# METHOD PATH   (path parameters filled with sample values)
+# METHOD TEMPLATE   (the route template exactly as the router registers it;
+# the test fills `{param}` with a sample value and checks the request is
+# routed to this very template)
 
 # Auth
 POST /_mm/client/v1/auth/token
 POST /_mm/client/v1/auth/refresh
 # Streams
 POST /_mm/client/v1/streams
-GET /_mm/client/v1/streams/s1
-POST /_mm/client/v1/streams/s1/join
-POST /_mm/client/v1/streams/s1/leave
-POST /_mm/client/v1/streams/s1/end
-POST /_mm/client/v1/streams/s1/resume
-POST /_mm/client/v1/streams/s1/rotate-key
-GET /_mm/client/v1/streams/s1/participants
-POST /_mm/client/v1/streams/s1/record
-DELETE /_mm/client/v1/streams/s1/record
-POST /_mm/client/v1/streams/s1/public-join
-POST /_mm/client/v1/streams/s1/public-view
-GET /_mm/client/v1/streams/s1/captions
-PUT /_mm/client/v1/streams/s1/captions
-GET /_mm/client/v1/streams/s1/transcode
-PUT /_mm/client/v1/streams/s1/transcode
-POST /_mm/client/v1/streams/s1/paywall/invoice
-POST /_mm/client/v1/streams/s1/paywall/proof
-POST /_mm/client/v1/streams/s1/paywall/status
+GET /_mm/client/v1/streams/{id}
+POST /_mm/client/v1/streams/{id}/join
+POST /_mm/client/v1/streams/{id}/leave
+POST /_mm/client/v1/streams/{id}/end
+POST /_mm/client/v1/streams/{id}/resume
+POST /_mm/client/v1/streams/{id}/rotate-key
+GET /_mm/client/v1/streams/{id}/participants
+POST /_mm/client/v1/streams/{id}/record
+DELETE /_mm/client/v1/streams/{id}/record
+POST /_mm/client/v1/streams/{id}/public-join
+POST /_mm/client/v1/streams/{id}/public-view
+GET /_mm/client/v1/streams/{id}/captions
+PUT /_mm/client/v1/streams/{id}/captions
+GET /_mm/client/v1/streams/{id}/transcode
+PUT /_mm/client/v1/streams/{id}/transcode
+POST /_mm/client/v1/streams/{id}/paywall/invoice
+POST /_mm/client/v1/streams/{id}/paywall/proof
+POST /_mm/client/v1/streams/{id}/paywall/status
 GET /_mm/client/v1/streams/active-mine
-GET /_mm/client/v1/rooms/!r:example.org/streams
+GET /_mm/client/v1/rooms/{room_id}/streams
 GET /_mm/client/v1/turn-credentials
 # Recordings
-GET /_mm/client/v1/rooms/!r:example.org/recordings
-GET /_mm/client/v1/recordings/r1
-DELETE /_mm/client/v1/recordings/r1
-POST /_mm/client/v1/recordings/r1/public-view
-POST /_mm/client/v1/recordings/r1/paywall/invoice
-POST /_mm/client/v1/recordings/r1/paywall/proof
-POST /_mm/client/v1/recordings/r1/paywall/status
-POST /_mm/client/v1/recordings/r1/captions/rerun
+GET /_mm/client/v1/rooms/{room_id}/recordings
+GET /_mm/client/v1/recordings/{recording_id}
+DELETE /_mm/client/v1/recordings/{recording_id}
+POST /_mm/client/v1/recordings/{recording_id}/public-view
+POST /_mm/client/v1/recordings/{recording_id}/paywall/invoice
+POST /_mm/client/v1/recordings/{recording_id}/paywall/proof
+POST /_mm/client/v1/recordings/{recording_id}/paywall/status
+POST /_mm/client/v1/recordings/{id}/captions/rerun
 # Rooms
-POST /_mm/client/v1/rooms/!r:example.org/enable-mm
-GET /_mm/client/v1/rooms/!r:example.org/mm-config
-PUT /_mm/client/v1/rooms/!r:example.org/mm-config
-GET /_mm/client/v1/rooms/!r:example.org/stream-permissions
-PUT /_mm/client/v1/rooms/!r:example.org/stream-permissions
-POST /_mm/client/v1/rooms/!r:example.org/stream-permissions/claim
+POST /_mm/client/v1/rooms/{room_id}/enable-mm
+GET /_mm/client/v1/rooms/{room_id}/mm-config
+PUT /_mm/client/v1/rooms/{room_id}/mm-config
+GET /_mm/client/v1/rooms/{room_id}/stream-permissions
+PUT /_mm/client/v1/rooms/{room_id}/stream-permissions
+POST /_mm/client/v1/rooms/{room_id}/stream-permissions/claim
 # Feed
 GET /_mm/client/v1/feed
 POST /_mm/client/v1/feed/seen
 # Monetization
 POST /_mm/client/v1/donations
-GET /_mm/client/v1/streams/s1/donations
+GET /_mm/client/v1/streams/{stream_id}/donations
 POST /_mm/client/v1/creator/onboard
 GET /_mm/client/v1/creator/profile
 PUT /_mm/client/v1/creator/profile
 POST /_mm/client/v1/creator/tiers
-PUT /_mm/client/v1/creator/tiers/t1
-DELETE /_mm/client/v1/creator/tiers/t1
-GET /_mm/client/v1/creators/@alice:example.org/tiers
+PUT /_mm/client/v1/creator/tiers/{tier_id}
+DELETE /_mm/client/v1/creator/tiers/{tier_id}
+GET /_mm/client/v1/creators/{creator_id}/tiers
 POST /_mm/client/v1/subscriptions
 GET /_mm/client/v1/subscriptions
 GET /_mm/client/v1/subscriptions/check
-DELETE /_mm/client/v1/subscriptions/sub1
+DELETE /_mm/client/v1/subscriptions/{id}
 # Creator self-service (dashboard)
 GET /_mm/client/v1/creator/me
 GET /_mm/client/v1/creator/me/defaults
@@ -74,7 +76,7 @@ PUT /_mm/client/v1/creator/me/transcode
 GET /_mm/client/v1/creator/me/captions
 PUT /_mm/client/v1/creator/me/captions
 GET /_mm/client/v1/creator/me/tiers
-POST /_mm/client/v1/creator/me/tiers/adopt/pt1
+POST /_mm/client/v1/creator/me/tiers/adopt/{platform_tier_id}
 GET /_mm/client/v1/creator/me/earnings
 GET /_mm/client/v1/creator/me/subscribers
 GET /_mm/client/v1/creator/me/ingest-key
@@ -83,14 +85,25 @@ POST /_mm/client/v1/creator/me/ingest-key/rotate
 POST /_mm/client/v1/creator/me/ingest-key/revoke
 PUT /_mm/client/v1/creator/me/ingest-key/default-room
 GET /_mm/client/v1/creator/me/analytics/rooms
+# Share links, discovery, moderation (store apps)
+POST /_mm/client/v1/streams/{id}/share-grants
+DELETE /_mm/client/v1/streams/{id}/share-grants/{grant_id}
+GET /_mm/client/v1/streams/{id}/interactions
+POST /_mm/client/v1/discover/interactions
+POST /_mm/client/v1/donations/{id}/lightning-proof
+POST /_mm/client/v1/moderation/report
+GET /_mm/client/v1/creators/{user_id}/profile
+GET /_mm/client/v1/creator/me/analytics/rooms/{matrix_room_id}/summary
+GET /_mm/client/v1/creator/me/analytics/rooms/{matrix_room_id}/timeseries
+GET /_mm/client/v1/creator/me/analytics/rooms/{matrix_room_id}/top-donors
 # Ads
 GET /_mm/client/v1/ads
 POST /_mm/client/v1/ads
-GET /_mm/client/v1/ads/a1/stats
+GET /_mm/client/v1/ads/{id}/stats
 POST /_mm/client/v1/ads/events
-GET /_mm/client/v1/streams/s1/ad-decision
-POST /_mm/client/v1/streams/s1/ad-complete
-POST /_mm/client/v1/streams/s1/ad-break
+GET /_mm/client/v1/streams/{id}/ad-decision
+POST /_mm/client/v1/streams/{id}/ad-complete
+POST /_mm/client/v1/streams/{id}/ad-break
 # Signup and announcements
 GET /mm/v1/register/available
 POST /mm/v1/register

@@ -172,6 +172,23 @@ pub fn admin_router(state: SharedState) -> Router {
 ///
 /// The files are served at `/_mm/widget/` with `index.html` appended
 /// automatically for directory requests.
+/// Every route the client port serves, as mm-server mounts it (before the
+/// shared middleware): the client API, the operator manifest
+/// (`.well-known`), the readiness probe and, when `widget_dir` is set, the
+/// built widget files.
+pub fn client_port_router(state: SharedState, widget_dir: Option<&str>) -> Router {
+    let mut app = client_router(state.clone())
+        .merge(wellknown::routes(state.clone()))
+        // Unauthenticated K8s readiness probe (DB-backed). Liveness should
+        // use a static route instead — see readyz.
+        .merge(readyz::routes(state));
+    // Optionally serve the built widget static files at /_mm/widget/.
+    if let Some(dir) = widget_dir.filter(|d| !d.is_empty()) {
+        app = app.merge(widget_static_router(dir));
+    }
+    app
+}
+
 pub fn widget_static_router(widget_dir: &str) -> Router {
     Router::new().nest_service(
         "/_mm/widget",

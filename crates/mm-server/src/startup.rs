@@ -500,17 +500,12 @@ pub async fn run(
     // ---------------------------------------------------------------
     // 10. Build routers
     // ---------------------------------------------------------------
-    let mut client_app = mm_api::client_router(shared_state.clone())
-        .merge(mm_api::wellknown::routes(shared_state.clone()))
-        // Unauthenticated K8s readiness probe (DB-backed). Liveness should
-        // use a static route instead — see mm_api::readyz.
-        .merge(mm_api::readyz::routes(shared_state.clone()));
-
-    // Optionally serve the built widget static files at /_mm/widget/.
+    // The client port's routes, assembled in mm_api so the route-presence
+    // test (crates/mm-api/tests/route_presence.rs) checks exactly these.
     if let Some(dir) = widget_dir.as_deref().filter(|d| !d.is_empty()) {
         info!("Serving widget static files from {dir} at /_mm/widget/");
-        client_app = client_app.merge(mm_api::widget_static_router(dir));
     }
+    let client_app = mm_api::client_port_router(shared_state.clone(), widget_dir.as_deref());
 
     let client_router = mm_api::middleware::apply_middleware(
         client_app,

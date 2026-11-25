@@ -611,6 +611,26 @@ mod tests {
         .expect("upsert mm_room_config");
     }
 
+    /// Legacy wire contract (ADR-0011 section 5): the four legacy feed names
+    /// are indexed, and each maps to the short kind `GET /feed` returns. The
+    /// apps in the stores read those kinds; they must never change.
+    #[test]
+    fn legacy_feed_names_are_indexed_under_the_frozen_short_kinds() {
+        let pinned = [
+            ("com.steegler.matrixmedia.feed.broadcast.started", "broadcast.started"),
+            ("com.steegler.matrixmedia.feed.broadcast.ended", "broadcast.ended"),
+            ("com.steegler.matrixmedia.feed.recording.available", "recording.available"),
+            ("com.steegler.matrixmedia.feed.post", "post"),
+        ];
+        for (event_type, kind) in pinned {
+            assert!(is_feed_event_type(event_type), "{event_type} must be indexed");
+            assert_eq!(feed_kind_for_type(event_type), kind, "{event_type}");
+        }
+        assert!(!is_feed_event_type("com.steegler.matrixmedia.feed"));
+        assert!(!is_feed_event_type("com.steegler.matrixmedia.feed.unknown"));
+        assert!(!is_feed_event_type("m.room.message"));
+    }
+
     fn make_broadcast_started_event(room_id: &str, event_id: &str) -> serde_json::Value {
         serde_json::json!({
             "type": FEED_BROADCAST_STARTED_EVENT_TYPE,

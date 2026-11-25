@@ -65,3 +65,8 @@ jsonwebtoken = { workspace = true }
 hmac = { workspace = true }
 # A throwaway media_dir for the ad intake tests.
 tempfile = { workspace = true }
+# The event-contract tests check `pattern` rules of contracts/events/*.json, and the
+# REST compatibility check reads contracts/api/*.yaml. Both crates are already in
+# Cargo.lock (regex through the dependency tree, serde_yaml through mm-server).
+regex = "1"
+serde_yaml = "0.9"

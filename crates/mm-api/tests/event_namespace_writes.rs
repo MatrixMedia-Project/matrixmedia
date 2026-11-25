@@ -202,7 +202,7 @@ async fn start_writes_the_stream_state_under_both_names_legacy_first() {
     let dev = &h.stub.state_puts(DEV_STREAM)[0];
     assert_eq!(legacy.body, dev.body, "one payload, profile v1");
     assert_eq!(dev.state_target().unwrap().1, "");
-    assert_valid(LEGACY_STREAM, &dev.body);
+    assert_valid(DEV_STREAM, &dev.body);
 
     let (row, cur_state, _) = h.row(&stream).await;
     assert_eq!(Some(returned), legacy.event_id, "the legacy id is returned");
@@ -440,4 +440,34 @@ async fn feed_muted_reads_legacy_first_while_active_and_current_first_after() {
         mm_api::feed::fetch_muted_rooms_from(&url, "as", "@carol:example.org").await,
         vec!["!old:example.org".to_string()]
     );
+}
+
+/// Every legacy schema has a `dev.matrixmedia` twin that accepts exactly the
+/// same payload shape (profile v1), and the legacy one is marked deprecated.
+#[test]
+fn every_legacy_schema_has_a_dev_twin_with_the_same_payload() {
+    let pairs = [
+        ("com.matrixmedia.stream", "dev.matrixmedia.stream"),
+        ("com.matrixmedia.stream.e2ee_key", "dev.matrixmedia.stream.e2ee_key"),
+        ("com.matrixmedia.donation", "dev.matrixmedia.donation"),
+        ("com.steegler.matrixmedia.feed.broadcast.started", "dev.matrixmedia.feed.broadcast.started"),
+        ("com.steegler.matrixmedia.feed.broadcast.ended", "dev.matrixmedia.feed.broadcast.ended"),
+        ("com.steegler.matrixmedia.feed.recording.available", "dev.matrixmedia.feed.recording.available"),
+        ("com.steegler.matrixmedia.feed.post", "dev.matrixmedia.feed.post"),
+        ("com.steegler.matrixmedia.feed_muted", "dev.matrixmedia.feed_muted"),
+    ];
+    let strip = |mut v: serde_json::Value| {
+        for k in ["$id", "title", "description", "deprecated", "$comment"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        v
+    };
+    for (legacy, dev) in pairs {
+        let l = json_schema::load_event_schema(legacy);
+        let d = json_schema::load_event_schema(dev);
+        assert_eq!(l["deprecated"], true, "{legacy} is marked deprecated");
+        assert!(d.get("deprecated").is_none(), "{dev} is current");
+        assert_eq!(d["$id"], format!("https://matrixmedia.dev/schemas/events/{dev}.json"));
+        assert_eq!(strip(l), strip(d), "{legacy} and {dev} differ in payload rules");
+    }
 }

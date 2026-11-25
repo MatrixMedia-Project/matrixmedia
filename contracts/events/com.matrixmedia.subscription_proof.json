@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.subscription_proof.json",
   "title": "com.matrixmedia.subscription_proof",
+  "deprecated": true,
+  "$comment": "Legacy name (ADR-0011). New name: dev.matrixmedia.subscription_proof (dev.matrixmedia.subscription_proof.json), same payload. Kept, frozen, as the schema the legacy wire-contract tests validate against; servers keep sending this name while the legacy contract is active and every reader keeps reading it.",
   "description": "State event proving a user's active subscription to a creator's tier. State key is the subscriber's fully-qualified Matrix user ID (e.g. '@bob:example.org'). When a subscription expires or is cancelled, the bot sets content to {} to clear the state.",
   "type": "object",
   "oneOf": [

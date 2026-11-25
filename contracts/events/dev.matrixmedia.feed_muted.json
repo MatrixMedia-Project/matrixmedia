@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/dev.matrixmedia.feed_muted.json",
+  "title": "dev.matrixmedia.feed_muted",
+  "description": "Global account data (GET/PUT /_matrix/client/v3/user/{userId}/account_data/{type}): the rooms a user muted in the newsfeed; GET /feed leaves them out. Clients write it under both this name and the legacy com.steegler.matrixmedia.feed_muted, legacy first. While the server's legacy contract is active the legacy copy is the truth: the server reads it first and falls back to this name only when the legacy one does not exist (brief 7.7); after it is retired the order flips. The server also accepts a bare JSON array of room ids.",
+  "type": "object",
+  "required": [
+    "rooms"
+  ],
+  "properties": {
+    "rooms": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^!.+:.+$"
+      },
+      "uniqueItems": true,
+      "description": "Muted Matrix room ids."
+    }
+  },
+  "examples": [
+    {
+      "rooms": [
+        "!abc:example.org"
+      ]
+    },
+    {
+      "rooms": []
+    }
+  ]
+}

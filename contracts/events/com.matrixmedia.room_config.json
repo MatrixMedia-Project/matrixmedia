@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.room_config.json",
   "title": "com.matrixmedia.room_config",
+  "deprecated": true,
+  "$comment": "Never sent by any server. Replaced by dev.matrixmedia.room_config.json, the MM-room marker with content version 2 (ADR-0011 section 3); kept for reference only.",
   "description": "State event defining per-room MatrixMedia configuration. State key is the empty string. Sent by the bot or an admin with sufficient power level. Controls stream limits and behavior for the room.",
   "type": "object",
   "required": [

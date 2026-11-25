@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.subscription_tiers.json",
   "title": "com.matrixmedia.subscription_tiers",
+  "deprecated": true,
+  "$comment": "Legacy name (ADR-0011). New name: dev.matrixmedia.subscription_tiers (dev.matrixmedia.subscription_tiers.json), same payload. Kept, frozen, as the schema the legacy wire-contract tests validate against; servers keep sending this name while the legacy contract is active and every reader keeps reading it.",
   "description": "State event defining the subscription tiers offered by a creator in a Matrix room. State key is the empty string (one tier configuration per room). When tiers are removed, the bot sets content to {} to clear the state.",
   "type": "object",
   "oneOf": [

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/dev.matrixmedia.stream.e2ee_key.json",
+  "title": "dev.matrixmedia.stream.e2ee_key",
+  "description": "State event carrying the media key of an end-to-end encrypted stream. State key is the stream id. Written at stream start and on every key rotation; cleared to {} when the stream ends. Payload profile v1, identical to the legacy com.matrixmedia.stream.e2ee_key (ADR-0011); readers accept both names.",
+  "type": "object",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "stream_id",
+        "algorithm",
+        "key_id",
+        "key_generation",
+        "key_b64",
+        "rotated_at_ms"
+      ],
+      "properties": {
+        "stream_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "algorithm": {
+          "type": "string",
+          "minLength": 1
+        },
+        "key_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "key_generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "key_b64": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rotated_at_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rotates_next_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Cleared key (stream ended).",
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false,
+      "maxProperties": 0
+    }
+  ],
+  "examples": [
+    {
+      "stream_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "algorithm": "aes-gcm-256",
+      "key_id": "0011223344556677",
+      "key_generation": 1,
+      "key_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "rotated_at_ms": 1765000000000
+    },
+    {}
+  ]
+}

@@ -145,8 +145,10 @@ pub struct StreamResponse {
     pub participant_count: i32,
     pub started_at: String,
     pub ended_at: Option<String>,
-    /// STARTED `com.matrixmedia.stream` state-event id; clients anchor
-    /// the stream-comments thread on this. None for legacy streams.
+    /// STARTED stream state-event id; clients anchor the stream-comments
+    /// thread on this. The legacy `com.matrixmedia.stream` event while the
+    /// legacy contract is active, `dev.matrixmedia.stream` after (ADR-0011).
+    /// None for legacy streams.
     pub state_event_id: Option<String>,
     /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
     /// an active subscription at level >= n. Clients use this to show a
@@ -4098,7 +4100,8 @@ async fn end_stream(
 /// 1. Verifies the stream exists, is E2EE-enabled, and the caller is the host.
 /// 2. Generates a new key with `generation = prev_generation + 1`.
 /// 3. Persists the new key (DB + history).
-/// 4. Publishes an updated `com.matrixmedia.stream.e2ee_key` state event.
+/// 4. Publishes the updated stream E2EE key state event (legacy
+///    `com.matrixmedia.stream.e2ee_key` and `dev.matrixmedia.stream.e2ee_key`, ADR-0011).
 /// 5. Returns the new key so the caller can immediately re-key.
 #[utoipa::path(
     post,

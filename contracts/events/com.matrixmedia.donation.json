@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.donation.json",
   "title": "com.matrixmedia.donation",
+  "deprecated": true,
+  "$comment": "Legacy name (ADR-0011). New name: dev.matrixmedia.donation (dev.matrixmedia.donation.json), same payload. Kept, frozen, as the schema the legacy wire-contract tests validate against; servers keep sending this name while the legacy contract is active and every reader keeps reading it.",
   "description": "Timeline event representing a viewer donation (Super Chat) during a MatrixMedia stream. Sent as a regular room message event (not state). The tier and color determine how the donation is rendered in the stream overlay.",
   "type": "object",
   "required": [

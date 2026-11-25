@@ -130,6 +130,14 @@ void main() {
     test('rejects m.*', () {
       expect(isValidMMNamespace('m.room'), isFalse);
     });
+    test('rejects the bare reserved names (brief 7.1)', () {
+      expect(isValidMMNamespace('org.matrix'), isFalse);
+      expect(isValidMMNamespace('im.vector'), isFalse);
+      expect(isValidMMNamespace('io.element'), isFalse);
+      // Only whole labels are reserved.
+      expect(isValidMMNamespace('org.matrixmedia'), isTrue);
+      expect(isValidMMNamespace('im.vectorx'), isTrue);
+    });
     test('rejects org.matrix.*', () {
       expect(isValidMMNamespace('org.matrix.msc1234'), isFalse);
     });
@@ -169,8 +177,8 @@ void main() {
     test('a non-list read gives an empty read list, not an error', () {
       final a = MMEventNamespaceAnnouncement.tryParse({
         'version': 1,
-        'write': 'dev.matrixmedia',
-        'read': 'dev.matrixmedia',
+        'write': 'org.example.media',
+        'read': 'org.example.media',
       })!;
       expect(a.read, isEmpty);
       expect(a.writesLegacy, isTrue);
@@ -206,12 +214,24 @@ void main() {
       expect(a.read.map((e) => e.namespace), ['org.example.ok']);
     });
 
-    test('at most eight entries are kept', () {
+    test('at most eight non-built-in entries are kept; built-ins do not '
+        'count (brief 7.2)', () {
       final a = MMEventNamespaceAnnouncement.tryParse(
-        _block(read: [for (var i = 0; i < 12; i++) _entry('org.example.n$i')]),
+        _block(
+          read: [
+            for (final ns in kMMBuiltInNamespaces) _entry(ns),
+            for (var i = 0; i < 12; i++) _entry('org.example.n$i'),
+          ],
+        ),
       )!;
-      expect(a.read, hasLength(kMMMaxAnnouncedNamespaces));
-      expect(a.read.last.namespace, 'org.example.n7');
+      expect(a.read, hasLength(3 + kMMMaxAnnouncedNamespaces));
+      expect(
+        a.read
+            .where((e) => !MMEventNamespaces.isBuiltIn(e.namespace))
+            .last
+            .namespace,
+        'org.example.n7',
+      );
     });
 
     test('write is honoured when it is a valid read entry', () {
@@ -224,11 +244,18 @@ void main() {
       expect(a.writeNamespace, 'org.example.media');
     });
 
-    test('write falls back to legacy when not in read', () {
+    test('write falls back to legacy when not on the read list', () {
+      final a = MMEventNamespaceAnnouncement.tryParse(
+        _block(write: 'org.unlisted.media', read: [_entry('com.matrixmedia')]),
+      )!;
+      expect(a.writesLegacy, isTrue);
+    });
+
+    test('a built-in write is always on the read list', () {
       final a = MMEventNamespaceAnnouncement.tryParse(
         _block(write: 'dev.matrixmedia', read: [_entry('com.matrixmedia')]),
       )!;
-      expect(a.writesLegacy, isTrue);
+      expect(a.writeNamespace, 'dev.matrixmedia');
     });
 
     test('write falls back to legacy when its read entry was invalid', () {
@@ -285,13 +312,49 @@ void main() {
         'com.steegler.matrixmedia.feed.post',
       );
       expect(
-        mmEventTypeToWrite(MMEventSuffix.feedMuted),
-        'com.steegler.matrixmedia.feed_muted',
+        MMEventNamespaces.builtIn.writeTypeFor(MMEventSuffix.feedPost),
+        'com.steegler.matrixmedia.feed.post',
       );
+    });
+
+    test('account data is written under both names, whatever the write '
+        'choice (brief 2.4)', () {
+      for (final w in [null, 'dev.matrixmedia', 'org.example.media']) {
+        expect(
+          mmEventTypesToWrite(MMEventSuffix.feedMuted, writeNamespace: w),
+          ['dev.matrixmedia.feed_muted', 'com.steegler.matrixmedia.feed_muted'],
+        );
+        expect(
+          mmEventTypesToWrite(MMEventSuffix.reactionRecents, writeNamespace: w),
+          [
+            'dev.matrixmedia.reaction_recents',
+            'com.steegler.matrixmedia.reaction_recents',
+          ],
+        );
+      }
       expect(
-        mmEventTypeToWrite(MMEventSuffix.reactionRecents),
-        'com.steegler.matrixmedia.reaction_recents',
+        () => mmEventTypeToWrite(MMEventSuffix.feedMuted),
+        throwsArgumentError,
       );
+      expect(MMEventNamespaces.builtIn.writeTypesFor(MMEventSuffix.feedPost), [
+        'com.steegler.matrixmedia.feed.post',
+      ]);
+    });
+
+    test('account data is read under dev.matrixmedia first, then legacy', () {
+      final ns = MMEventNamespaces.builtIn.merge(
+        MMEventNamespaceAnnouncement.tryParse(
+          _block(read: [_entry('org.example.media')]),
+        ),
+      );
+      expect(ns.typesFor(MMEventSuffix.feedMuted), [
+        'dev.matrixmedia.feed_muted',
+        'com.steegler.matrixmedia.feed_muted',
+      ]);
+      expect(ns.typesFor(MMEventSuffix.reactionRecents), [
+        'dev.matrixmedia.reaction_recents',
+        'com.steegler.matrixmedia.reaction_recents',
+      ]);
     });
 
     test('"legacy" writes the legacy names', () {
@@ -314,7 +377,7 @@ void main() {
         _block(write: 'org.example.media', read: [_entry('org.example.media')]),
       )!;
       expect(
-        mmEventTypeToWrite(MMEventSuffix.feedPost, announcement: b),
+        b.writeTypeFor(MMEventSuffix.feedPost),
         'org.example.media.feed.post',
       );
     });
@@ -331,9 +394,11 @@ void main() {
     MMEventNamespaceAnnouncement announce(
       List<String> extra, {
       String bot = '@mmbot:example.org',
+      String write = 'legacy',
     }) => MMEventNamespaceAnnouncement.tryParse(
       _block(
         bot: bot,
+        write: write,
         read: [
           _entry('dev.matrixmedia'),
           _entry('com.matrixmedia'),
@@ -370,31 +435,82 @@ void main() {
           .merge(announce(['org.example.c']))
           .merge(announce(const []));
       expect(ns.announcedExtras, [
+        'org.example.c',
         'org.example.a',
         'org.example.b',
-        'org.example.c',
       ]);
     });
 
-    test('a null announcement changes nothing', () {
-      final ns = MMEventNamespaces.builtIn.merge(announce(['org.example.a']));
-      expect(identical(ns.merge(null), ns), isTrue);
+    test('no usable block keeps the read list and writes legacy (7.3)', () {
+      final ns = MMEventNamespaces.builtIn.merge(
+        announce(['org.example.a'], write: 'org.example.a'),
+      );
+      expect(ns.writeNamespace, 'org.example.a');
+      final after = ns.merge(null);
+      expect(after.readNamespaces, ns.readNamespaces);
+      expect(after.writeNamespace, isNull);
+      expect(
+        after.writeTypeFor(MMEventSuffix.feedPost),
+        'com.steegler.matrixmedia.feed.post',
+      );
     });
 
-    test('the union keeps at most eight announced entries', () {
+    test('built-in names do not count against the cap (7.2)', () {
+      final ns = MMEventNamespaces.builtIn.merge(
+        announce([for (var i = 0; i < 8; i++) 'org.example.n$i']),
+      );
+      expect(ns.announcedExtras, hasLength(8));
+    });
+
+    test('the latest announcement is always kept, earlier entries fill '
+        'the rest, most recent first (7.2)', () {
       var ns = MMEventNamespaces.builtIn;
       ns = ns.merge(announce(['org.example.a', 'org.example.b']));
-      ns = ns.merge(
-        announce([
-          'org.example.c',
-          'org.example.d',
-          'org.example.e',
-          'org.example.f',
-        ]),
+      ns = ns.merge(announce(['org.example.c', 'org.example.d']));
+      ns = ns.merge(announce([for (var i = 0; i < 5; i++) 'org.example.n$i']));
+      expect(ns.announcedExtras, [
+        for (var i = 0; i < 5; i++) 'org.example.n$i',
+        'org.example.c',
+        'org.example.d',
+        'org.example.a',
+      ]);
+    });
+
+    test('auditor scenario: a new write name after five mistaken names is '
+        'read and written (7.2)', () {
+      var ns = MMEventNamespaces.builtIn.merge(
+        announce([for (var i = 0; i < 5; i++) 'org.mistake.n$i']),
       );
-      // 3 built-in + 6 extra announced = 9 > 8: the last one is not kept.
-      expect(ns.announcedExtras, hasLength(5));
-      expect(ns.announcedExtras, isNot(contains('org.example.f')));
+      ns = ns.merge(announce(['org.example.new'], write: 'org.example.new'));
+      expect(ns.readNamespaces, contains('org.example.new'));
+      expect(ns.writeNamespace, 'org.example.new');
+      expect(
+        ns.writeTypeFor(MMEventSuffix.feedPost),
+        'org.example.new.feed.post',
+      );
+      // Even with the union full, the latest entries win the room.
+      ns = MMEventNamespaces.builtIn
+          .merge(announce([for (var i = 0; i < 8; i++) 'org.mistake.n$i']))
+          .merge(announce(['org.example.new'], write: 'org.example.new'));
+      expect(ns.announcedExtras.first, 'org.example.new');
+      expect(ns.announcedExtras, hasLength(8));
+      expect(ns.writeNamespace, 'org.example.new');
+    });
+
+    test('write is honoured only when on the effective read list', () {
+      final unlisted = MMEventNamespaces.builtIn.merge(
+        announce(['org.example.a'], write: 'org.example.zzz'),
+      );
+      expect(unlisted.writeNamespace, isNull);
+      // An earlier entry still in the union counts.
+      final earlier = MMEventNamespaces.builtIn
+          .merge(announce(['org.example.a']))
+          .merge(announce(['org.example.b'], write: 'org.example.a'));
+      expect(earlier.writeNamespace, 'org.example.a');
+      final builtInWrite = MMEventNamespaces.builtIn.merge(
+        announce(const [], write: 'dev.matrixmedia'),
+      );
+      expect(builtInWrite.writeNamespace, 'dev.matrixmedia');
     });
 
     test('bots of every announcement are kept', () {
@@ -408,13 +524,16 @@ void main() {
       expect(ns.botsFor('dev.matrixmedia'), isEmpty);
     });
 
-    test('persists and restores', () {
-      final ns = MMEventNamespaces.builtIn.merge(announce(['org.example.a']));
+    test('persists and restores, write choice included (7.3)', () {
+      final ns = MMEventNamespaces.builtIn.merge(
+        announce(['org.example.a'], write: 'org.example.a'),
+      );
       final restored = MMEventNamespaces.fromJson(
         jsonDecode(jsonEncode(ns.toJson())),
       );
       expect(restored.readNamespaces, ns.readNamespaces);
       expect(restored.botsFor('org.example.a'), {'@mmbot:example.org'});
+      expect(restored.writeNamespace, 'org.example.a');
     });
 
     test('a malformed stored value restores to the built-in list', () {
@@ -431,9 +550,11 @@ void main() {
         );
       }
       final partial = MMEventNamespaces.fromJson({
-        'version': 1,
-        'announced': ['m.room', 'org.example.ok', 5],
+        'version': 2,
+        'write': 'org.not.stored',
         'extras': [
+          5,
+          {'namespace': 'org.matrix', 'profile': 'v1', 'bots': []},
           {'namespace': 'm.room', 'profile': 'v1', 'bots': []},
           {
             'namespace': 'org.example.ok',
@@ -444,6 +565,7 @@ void main() {
       });
       expect(partial.announcedExtras, ['org.example.ok']);
       expect(partial.botsFor('org.example.ok'), {'@b:x'});
+      expect(partial.writeNamespace, isNull);
     });
   });
 
@@ -491,13 +613,24 @@ void main() {
       );
     });
 
-    test('room names are never persisted with the account', () {
+    test('room names and room bots are never persisted with the account', () {
       final view = account.withRoomBlock(room);
       final restored = MMEventNamespaces.fromJson(
         jsonDecode(jsonEncode(view.toJson())),
       );
       expect(restored.readNamespaces, isNot(contains('org.other.media')));
       expect(account.readNamespaces, isNot(contains('org.other.media')));
+      // org.example.n0 is on both lists: only the account's bot is kept.
+      expect(restored.botsFor('org.example.n0'), {'@mmbot:example.org'});
+      expect(account.botsFor('org.example.n0'), {'@mmbot:example.org'});
+      expect(view.toJson(), account.toJson());
+    });
+
+    test('a room block does not change the write choice', () {
+      final writing = MMEventNamespaces.builtIn.merge(
+        MMEventNamespaceAnnouncement.tryParse(_block(write: 'dev.matrixmedia')),
+      );
+      expect(writing.withRoomBlock(room).writeNamespace, 'dev.matrixmedia');
     });
 
     test('no block changes nothing', () {

@@ -160,7 +160,7 @@ async fn handle(State(stub): State<Arc<StubHomeserver>>, req: Request<Body>) -> 
         event_id: None,
     };
 
-    let response = if stub.should_fail(&path) && method == "PUT" {
+    let response = if method == "PUT" && stub.should_fail(&path) {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({ "errcode": "M_UNKNOWN", "error": "stub failure" })),

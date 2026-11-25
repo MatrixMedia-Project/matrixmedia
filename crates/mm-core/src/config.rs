@@ -249,7 +249,8 @@ pub struct MatrixConfig {
 
     /// When the server writes the room marker, also pin the current-name state
     /// types in the room's power levels at 100 (ADR-0011 section 4, rule 8).
-    #[serde(default = "default_true_matrix")]
+    /// Off by default (brief 8.2); the backfill never pins.
+    #[serde(default)]
     pub pin_event_power_levels: bool,
 
     /// Sender check for server-written feed events in the feed indexer:
@@ -265,10 +266,6 @@ fn default_event_namespace() -> String {
 
 fn default_event_legacy_contract() -> String {
     crate::event_namespace::LEGACY_CONTRACT_ACTIVE.to_string()
-}
-
-fn default_true_matrix() -> bool {
-    true
 }
 
 fn default_feed_sender_check() -> String {
@@ -316,7 +313,7 @@ impl Default for MatrixConfig {
             alert_matrix_room: None,
             event_namespace: default_event_namespace(),
             event_legacy_contract: default_event_legacy_contract(),
-            pin_event_power_levels: true,
+            pin_event_power_levels: false,
             feed_sender_check: default_feed_sender_check(),
         }
     }

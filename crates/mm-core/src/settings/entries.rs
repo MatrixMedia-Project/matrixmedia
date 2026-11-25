@@ -155,7 +155,7 @@ pub(super) fn all() -> Vec<SettingDef> {
             secret: false, env: None,
             "active (default): keep writing the legacy event names the apps in the stores read. retired: write the current namespace only."),
         setting!(matrix.pin_event_power_levels; General, Bool, LIVE, secret: false, env: None,
-            "When the room marker is written, require power level 100 for the current-name MatrixMedia state events in that room (skipped where the bot lacks the power)."),
+            "Off (default): leave room power levels alone. On: when the room marker is checked at enable-mm, a switch change or a stream start, require power level 100 for the current-name MatrixMedia state events in that room (skipped, and tried again at the next check, where the bot lacks the power). The backfill never pins."),
         setting!(matrix.feed_sender_check; General, ValueKind::Choice { options: &["off", "log", "enforce"] }, RESTART,
             secret: false, env: None,
             "Who may send server-written feed events into the feed index. log (default): count and log a sender that is neither the bot nor at the room's state_default power, index anyway. enforce: drop it. off: no check."),

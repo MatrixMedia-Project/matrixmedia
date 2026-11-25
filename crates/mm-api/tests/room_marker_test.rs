@@ -13,7 +13,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use mm_api::room_marker::{MarkerOutcome, backfill, ensure_room_marker};
+use mm_api::room_marker::{MarkerOutcome, Pinning, backfill, ensure_room_marker};
 use mm_api::stream_lifecycle::MarkerContext;
 use mm_core::config::Config;
 use mm_core::metrics::Metrics;
@@ -79,7 +79,15 @@ impl Harness {
     }
 
     async fn ensure(&self, room: &str, enabled: bool) -> MarkerOutcome {
-        ensure_room_marker(&self.ctx(), &self.config, &self.namespaces(), room, enabled).await
+        ensure_room_marker(
+            &self.ctx(),
+            &self.config,
+            &self.namespaces(),
+            room,
+            enabled,
+            Pinning::Allowed,
+        )
+        .await
     }
 }
 
@@ -124,9 +132,22 @@ async fn the_marker_is_written_once_with_version_2_content_and_rewritten_on_chan
     assert_eq!(h.stub.state_puts(MARKER)[1].body["enabled"], false);
 }
 
+/// Brief 8.2: pinning ships off.
 #[tokio::test]
-async fn the_first_write_pins_the_current_state_types_at_100() {
+async fn pinning_is_off_by_default() {
     let h = Harness::new().await;
+    assert!(!h.config.matrix.pin_event_power_levels);
+    let room = "!m0:example.org";
+    h.power(room, 100);
+    h.ensure(room, true).await;
+    assert!(h.stub.state_puts("m.room.power_levels").is_empty());
+    assert_eq!(h.stub.state_puts(MARKER).len(), 1);
+}
+
+#[tokio::test]
+async fn with_pinning_on_the_current_state_types_are_pinned_at_100_once() {
+    let mut h = Harness::new().await;
+    h.config.matrix.pin_event_power_levels = true;
     let room = "!m2:example.org";
     h.power(room, 100);
     h.ensure(room, true).await;
@@ -144,19 +165,17 @@ async fn the_first_write_pins_the_current_state_types_at_100() {
     }
     assert_eq!(events["m.room.name"], 50, "other entries kept");
     assert_eq!(pl[0].body["users"]["@alice:example.org"], 100, "users kept");
-    // Pinned before the marker went out.
-    let writes = h.stub.writes();
-    let pin_at = writes
-        .iter()
-        .position(|w| w.path.contains("m.room.power_levels"))
-        .unwrap();
-    let marker_at = writes.iter().position(|w| w.path.contains(MARKER)).unwrap();
-    assert!(pin_at < marker_at);
+    // A recorded pin is not repeated at the next check.
+    h.ensure(room, true).await;
+    assert_eq!(h.stub.state_puts("m.room.power_levels").len(), 1);
 }
 
+/// Brief 8.2: a skipped pin is not recorded as done; the next check tries
+/// again even though the marker itself is unchanged.
 #[tokio::test]
-async fn without_the_power_to_pin_the_pinning_is_skipped_and_the_marker_still_written() {
-    let h = Harness::new().await;
+async fn a_skipped_pin_is_tried_again_at_the_next_check() {
+    let mut h = Harness::new().await;
+    h.config.matrix.pin_event_power_levels = true;
     let room = "!m3:example.org";
     h.power(room, 50);
     assert!(matches!(
@@ -164,17 +183,27 @@ async fn without_the_power_to_pin_the_pinning_is_skipped_and_the_marker_still_wr
         MarkerOutcome::Written(_)
     ));
     assert!(h.stub.state_puts("m.room.power_levels").is_empty());
+
+    // The bot is promoted; the marker is unchanged, the pin now lands.
+    h.power(room, 100);
+    assert_eq!(h.ensure(room, true).await, MarkerOutcome::Unchanged);
+    assert_eq!(h.stub.state_puts("m.room.power_levels").len(), 1);
+    assert_eq!(h.stub.state_puts(MARKER).len(), 1);
 }
 
+/// A failed pin write is retried too.
 #[tokio::test]
-async fn pinning_can_be_switched_off() {
+async fn a_failed_pin_is_tried_again_at_the_next_check() {
     let mut h = Harness::new().await;
-    h.config.matrix.pin_event_power_levels = false;
+    h.config.matrix.pin_event_power_levels = true;
     let room = "!m4:example.org";
     h.power(room, 100);
+    h.stub.fail_times("/state/m.room.power_levels", 1);
     h.ensure(room, true).await;
-    assert!(h.stub.state_puts("m.room.power_levels").is_empty());
-    assert_eq!(h.stub.state_puts(MARKER).len(), 1);
+    h.ensure(room, true).await;
+    let pins = h.stub.state_puts("m.room.power_levels");
+    assert_eq!(pins.len(), 2, "one failed, one retried");
+    assert!(pins[1].event_id.is_some());
 }
 
 #[tokio::test]
@@ -200,6 +229,8 @@ async fn the_backfill_counts_on_a_dry_run_writes_on_a_real_one_and_is_idempotent
     h.power("!weak:example.org", 0);
     h.power("!off:example.org", 100);
     let enabled = |room: String| async move { room != "!off:example.org" };
+    let mut h = h;
+    h.config.matrix.pin_event_power_levels = true; // the backfill never pins anyway
     let ctx = h.ctx();
     let ns = h.namespaces();
     let run = |dry| backfill(&ctx, &h.config, &ns, dry, Duration::ZERO, enabled);
@@ -238,4 +269,34 @@ async fn the_backfill_counts_on_a_dry_run_writes_on_a_real_one_and_is_idempotent
         2,
         "running twice changes nothing"
     );
+    assert!(
+        h.stub.state_puts("m.room.power_levels").is_empty(),
+        "the backfill never pins"
+    );
+}
+
+/// A homeserver error on the power-levels read is reported apart from "no
+/// power".
+#[tokio::test]
+async fn the_backfill_reports_unreadable_power_levels_separately() {
+    let h = Harness::new().await;
+    h.stub.answer_get(
+        "/joined_rooms",
+        StatusCode::OK,
+        json!({ "joined_rooms": ["!broken:example.org"] }),
+    );
+    h.stub.answer_get(
+        "!broken:example.org/state/m.room.power_levels/",
+        StatusCode::BAD_GATEWAY,
+        json!({ "errcode": "M_UNKNOWN" }),
+    );
+    let ctx = h.ctx();
+    let ns = h.namespaces();
+    let r = backfill(&ctx, &h.config, &ns, true, Duration::ZERO, |_| async {
+        true
+    })
+    .await
+    .unwrap();
+    assert_eq!((r.no_power, r.unreadable), (0, 1));
+    assert_eq!(r.unreadable_rooms, vec!["!broken:example.org".to_string()]);
 }

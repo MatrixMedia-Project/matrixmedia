@@ -330,6 +330,30 @@ impl Database for SqliteDatabase {
         Ok(())
     }
 
+    async fn get_room_marker_pin(&self, matrix_room_id: &str) -> Result<Option<String>, MMError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT pin_hash FROM mm_room_marker WHERE matrix_room_id = ?1")
+                .bind(matrix_room_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    async fn set_room_marker_pin(
+        &self,
+        matrix_room_id: &str,
+        pin_hash: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query("UPDATE mm_room_marker SET pin_hash = ?2 WHERE matrix_room_id = ?1")
+            .bind(matrix_room_id)
+            .bind(pin_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn record_event_namespace(&self, namespace: &str, profile: &str) -> Result<(), MMError> {
         sqlx::query(
             "INSERT OR IGNORE INTO mm_event_namespace_history (namespace, profile, first_written_at) \

@@ -11,11 +11,12 @@
 //! and stream start (which repairs any room the backfill missed). Each write
 //! is skipped when [`content_hash`] matches what `mm_room_marker` recorded.
 //!
-//! When `matrix.pin_event_power_levels` is on, the first write in a room also
-//! requires power level 100 for this server's current-name state types in the
-//! room's `m.room.power_levels` (section 4, rule 8). Where the bot cannot do
-//! that, the pinning is skipped with a log line and the marker is still
-//! written.
+//! When `matrix.pin_event_power_levels` is on (off by default, brief 8.2), a
+//! marker check at a write point also requires power level 100 for this
+//! server's current-name state types in the room's `m.room.power_levels`
+//! (section 4, rule 8). Where the bot cannot, the pin is skipped with a log
+//! line, the marker is still written, and the pin is tried again at the next
+//! check. The backfill never pins.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -196,13 +197,32 @@ pub async fn pin_power_levels(ctx: &MarkerContext<'_>, room_id: &str) -> PinOutc
     }
 }
 
-/// Write the marker in `room_id` unless the recorded one already says the same.
+/// Hash of a pinned-types list, recorded once the pin succeeded.
+pub fn pin_hash(types: &[String]) -> String {
+    let mut sorted = types.to_vec();
+    sorted.sort();
+    hex::encode(Sha256::digest(sorted.join("\n").as_bytes()))
+}
+
+/// Whether a marker write may also pin power levels. The backfill never does
+/// (brief 8.2); the write points do when `matrix.pin_event_power_levels` is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pinning {
+    Allowed,
+    Never,
+}
+
+/// Write the marker in `room_id` unless the recorded one already says the
+/// same; then, with [`Pinning::Allowed`] and the setting on, pin the power
+/// levels unless a pin of the same types is already recorded. A skipped or
+/// failed pin is not recorded, so the next marker check tries again.
 pub async fn ensure_room_marker(
     ctx: &MarkerContext<'_>,
     cfg: &Config,
     namespaces: &EventNamespaces,
     room_id: &str,
     enabled: bool,
+    pinning: Pinning,
 ) -> MarkerOutcome {
     let Some(content) = marker_content(cfg, enabled, namespaces) else {
         if !LOGGED_NOT_CONFIGURED.swap(true, Ordering::Relaxed) {
@@ -213,13 +233,44 @@ pub async fn ensure_room_marker(
         return MarkerOutcome::NotConfigured;
     };
     let hash = content_hash(&content);
-    if let Ok(Some((_, recorded))) = ctx.db.get_room_marker(room_id).await
-        && recorded == hash
+    let outcome = match ctx.db.get_room_marker(room_id).await {
+        Ok(Some((_, recorded))) if recorded == hash => MarkerOutcome::Unchanged,
+        _ => write_marker(ctx, room_id, &content, &hash).await,
+    };
+    if pinning == Pinning::Allowed
+        && ctx.matrix.pin_event_power_levels
+        && matches!(
+            outcome,
+            MarkerOutcome::Written(_) | MarkerOutcome::Unchanged
+        )
     {
-        return MarkerOutcome::Unchanged;
+        let wanted = pin_hash(&pinned_types(&WriteNames::from_config(ctx.matrix)));
+        let recorded = ctx.db.get_room_marker_pin(room_id).await.ok().flatten();
+        if recorded.as_deref() != Some(wanted.as_str()) {
+            match pin_power_levels(ctx, room_id).await {
+                PinOutcome::Pinned | PinOutcome::AlreadyPinned => {
+                    if let Err(e) = ctx.db.set_room_marker_pin(room_id, &wanted).await {
+                        tracing::warn!(room_id, error = %e, "power-level pin not recorded");
+                    }
+                }
+                PinOutcome::Failed(e) => {
+                    tracing::warn!(room_id, error = %e,
+                        "power-level pin failed; tried again at the next marker check")
+                }
+                PinOutcome::NoPower | PinOutcome::Disabled => {}
+            }
+        }
     }
-    let _ = pin_power_levels(ctx, room_id).await;
-    let json = match serde_json::to_value(&content) {
+    outcome
+}
+
+async fn write_marker(
+    ctx: &MarkerContext<'_>,
+    room_id: &str,
+    content: &RoomConfigContent,
+    hash: &str,
+) -> MarkerOutcome {
+    let json = match serde_json::to_value(content) {
         Ok(v) => v,
         Err(e) => return MarkerOutcome::Failed(e.to_string()),
     };
@@ -232,7 +283,7 @@ pub async fn ensure_room_marker(
     .await
     {
         Ok(event_id) => {
-            if let Err(e) = ctx.db.set_room_marker(room_id, &event_id, &hash).await {
+            if let Err(e) = ctx.db.set_room_marker(room_id, &event_id, hash).await {
                 tracing::warn!(room_id, error = %e, "room marker written but not recorded");
             }
             MarkerOutcome::Written(event_id)
@@ -257,7 +308,7 @@ pub async fn ensure_room_marker_for(state: &SharedState, room_id: &str) -> Marke
     };
     let namespaces = crate::event_namespaces::load(&cfg.matrix, state.db.as_ref()).await;
     let ctx = MarkerContext::from_state(state, &cfg);
-    ensure_room_marker(&ctx, &cfg, &namespaces, room_id, enabled).await
+    ensure_room_marker(&ctx, &cfg, &namespaces, room_id, enabled, Pinning::Allowed).await
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +322,8 @@ pub struct BackfillRequest {
     /// explicitly.
     #[serde(default = "default_true")]
     pub dry_run: bool,
-    /// Pause between writes, milliseconds (default 100).
+    /// Pause between writes, milliseconds (default 100, at least
+    /// [`MIN_THROTTLE_MS`], at most 10000).
     #[serde(default)]
     pub throttle_ms: Option<u64>,
 }
@@ -279,6 +331,9 @@ pub struct BackfillRequest {
 fn default_true() -> bool {
     true
 }
+
+/// Smallest pause between backfill writes, milliseconds.
+pub const MIN_THROTTLE_MS: u64 = 20;
 
 /// What a backfill found (and, on a real run, did).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
@@ -295,6 +350,10 @@ pub struct BackfillReport {
     pub written: usize,
     pub failed: usize,
     pub no_power_rooms: Vec<String>,
+    /// Rooms whose power levels the homeserver did not return (an error, not
+    /// a lack of power); skipped and listed in `unreadable_rooms`.
+    pub unreadable: usize,
+    pub unreadable_rooms: Vec<String>,
     /// Set when the server cannot write markers at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_configured: Option<String>,
@@ -334,21 +393,26 @@ where
             report.already_marked += 1;
             continue;
         }
-        if !ctx
-            .hs_client
-            .bot_has_state_power(&room)
-            .await
-            .unwrap_or(false)
-        {
-            report.no_power += 1;
-            report.no_power_rooms.push(room);
-            continue;
+        match ctx.hs_client.bot_has_state_power(&room).await {
+            Ok(true) => {}
+            Ok(false) => {
+                report.no_power += 1;
+                report.no_power_rooms.push(room);
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(room_id = %room, error = %e, "backfill: power levels unreadable");
+                report.unreadable += 1;
+                report.unreadable_rooms.push(room);
+                continue;
+            }
         }
         report.to_write += 1;
         if dry_run {
             continue;
         }
-        match ensure_room_marker(ctx, cfg, namespaces, &room, enabled).await {
+        // The backfill never pins (brief 8.2).
+        match ensure_room_marker(ctx, cfg, namespaces, &room, enabled, Pinning::Never).await {
             MarkerOutcome::Written(_) | MarkerOutcome::Unchanged => report.written += 1,
             _ => report.failed += 1,
         }
@@ -372,7 +436,11 @@ pub async fn backfill_handler(
     let cfg = state.config();
     let namespaces = crate::event_namespaces::load(&cfg.matrix, state.db.as_ref()).await;
     let ctx = MarkerContext::from_state(&state, &cfg);
-    let throttle = std::time::Duration::from_millis(req.throttle_ms.unwrap_or(100).min(10_000));
+    let throttle = std::time::Duration::from_millis(
+        req.throttle_ms
+            .unwrap_or(100)
+            .clamp(MIN_THROTTLE_MS, 10_000),
+    );
     let report = backfill(&ctx, &cfg, &namespaces, req.dry_run, throttle, |room| {
         let state = state.clone();
         async move {

@@ -955,6 +955,14 @@ pub trait Database: Send + Sync + 'static {
         content_hash: &str,
     ) -> Result<(), MMError>;
 
+    /// Hash of the state types last pinned in the room (V064), if any.
+    async fn get_room_marker_pin(&self, matrix_room_id: &str) -> Result<Option<String>, MMError>;
+
+    /// Record a successful power-level pin on the room's marker row (V064).
+    /// No-op when no marker is recorded for the room.
+    async fn set_room_marker_pin(&self, matrix_room_id: &str, pin_hash: &str)
+    -> Result<(), MMError>;
+
     /// Run pending migrations.
     async fn migrate(&self) -> Result<(), MMError>;
 

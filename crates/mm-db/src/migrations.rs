@@ -212,7 +212,8 @@ CREATE TABLE IF NOT EXISTS mm_room_marker (
     matrix_room_id TEXT PRIMARY KEY,
     event_id       TEXT NOT NULL,
     content_hash   TEXT NOT NULL,
-    written_at     TEXT NOT NULL
+    written_at     TEXT NOT NULL,
+    pin_hash       TEXT
 );
 "#;
 

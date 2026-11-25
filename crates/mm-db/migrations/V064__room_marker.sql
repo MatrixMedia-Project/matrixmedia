@@ -16,5 +16,9 @@ CREATE TABLE IF NOT EXISTS mm_room_marker (
     matrix_room_id TEXT        PRIMARY KEY,
     event_id       TEXT        NOT NULL,
     content_hash   TEXT        NOT NULL,
-    written_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    written_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Hash of the state types last pinned at power level 100 in this room
+    -- (matrix.pin_event_power_levels); NULL until a pin succeeded, so a
+    -- skipped or failed pin is tried again at the next marker check.
+    pin_hash       TEXT
 );

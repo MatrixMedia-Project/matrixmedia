@@ -26,6 +26,12 @@ pub struct Metrics {
     /// failed after retries. Non-zero means rooms may carry stale "active"
     /// markers until clients reconcile via REST.
     pub stream_terminal_event_failures_total: IntCounter,
+    /// Matrix events written by the server, by event type (ADR-0011). Each
+    /// legacy and current name is its own series, so a dashboard can tell
+    /// legacy writes stopping while the legacy contract is active. The label
+    /// takes values from the protocol's suffix table under the configured and
+    /// legacy namespaces only: bounded.
+    pub matrix_events_written_total: IntCounterVec,
 
     // -- Participants ----------------------------------------------------------
     /// Current number of connected participants across all streams.
@@ -158,6 +164,16 @@ impl Metrics {
             registry
         )
         .expect("mm_stream_terminal_event_failures_total registration");
+
+        let matrix_events_written_total = register_int_counter_vec_with_registry!(
+            opts!(
+                "mm_matrix_events_written_total",
+                "Matrix events (state and timeline) written by the server, by event type"
+            ),
+            &["event_type"],
+            registry
+        )
+        .expect("mm_matrix_events_written_total registration");
 
         let participant_count = register_int_gauge_with_registry!(
             opts!(
@@ -440,6 +456,7 @@ impl Metrics {
             streams_ended_total,
             stream_terminal_events_total,
             stream_terminal_event_failures_total,
+            matrix_events_written_total,
             participant_count,
             participant_joins_total,
             participant_leaves_total,

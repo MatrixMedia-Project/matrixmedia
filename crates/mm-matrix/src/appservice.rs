@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::bot::{self, BotExecutor};
 use crate::client::HomeserverClient;
-use crate::feed_indexer::{is_feed_event_type, FeedIndexer, HomeserverMemberResolver};
+use crate::feed_indexer::{is_feed_event_type_in, FeedIndexer, HomeserverMemberResolver};
 
 /// Appservice registration configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,11 +46,13 @@ pub struct Transaction {
 /// The handler dispatches events to the appropriate sub-handlers:
 /// - `m.room.member` -- auto-join on invite, check power levels and encryption
 /// - `m.room.message` -- parse and execute bot commands (`!mm ...`)
-/// - `com.steegler.matrixmedia.feed.*` -- newsfeed events fan-out
-///   into `mm_feed_items` via the [`FeedIndexer`].
+/// - the four `feed.*` types under any read namespace (ADR-0011: built-in
+///   `dev.matrixmedia`, `com.matrixmedia`, `com.steegler.matrixmedia`, plus
+///   any namespace this server has written) -- newsfeed events fan-out into
+///   `mm_feed_items` via the [`FeedIndexer`].
 /// - `m.room.redaction` -- routed to [`FeedIndexer`] to flip `hidden`
 ///   on any indexed row pointing at the redacted event.
-/// - `com.matrixmedia.*` -- legacy MatrixMedia custom events (debug-logged).
+/// - any other MatrixMedia event type under a read namespace (debug-logged).
 #[derive(Clone)]
 pub struct AppserviceHandler {
     hs_client: HomeserverClient,
@@ -59,6 +61,9 @@ pub struct AppserviceHandler {
     /// without a Postgres pool — preserves backward-compat for callers
     /// that don't need the feed index (e.g. unit tests).
     feed_indexer: Option<Arc<FeedIndexer>>,
+    /// Namespaces this handler reads: the built-in ones, then any the server
+    /// has written (ADR-0011 section 4, rule 7).
+    read_namespaces: Arc<Vec<String>>,
 }
 
 impl AppserviceHandler {
@@ -73,6 +78,7 @@ impl AppserviceHandler {
             hs_client,
             bot_executor,
             feed_indexer: None,
+            read_namespaces: Arc::new(builtin_namespaces()),
         }
     }
 
@@ -97,7 +103,47 @@ impl AppserviceHandler {
             hs_client,
             bot_executor,
             feed_indexer,
+            read_namespaces: Arc::new(builtin_namespaces()),
         }
+    }
+
+    /// Also read the namespaces in `extra` (namespaces this server has written
+    /// besides the built-in ones; invalid entries are dropped). The feed
+    /// indexer gets the same list. Events under a namespace that is not built
+    /// in count only when the bot sent them (rule 5), which the indexer
+    /// enforces.
+    pub fn with_read_namespaces<I, S>(mut self, extra: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut list = builtin_namespaces();
+        for ns in extra {
+            let ns = ns.into();
+            if mm_core::event_namespace::validate_namespace(&ns).is_ok() && !list.contains(&ns) {
+                list.push(ns);
+            }
+        }
+        self.read_namespaces = Arc::new(list);
+        if let Some(indexer) = self.feed_indexer.take() {
+            let mut indexer = (*indexer).clone();
+            indexer.set_read_namespaces(self.read_namespaces.clone());
+            self.feed_indexer = Some(Arc::new(indexer));
+        }
+        self
+    }
+
+    /// The namespaces this handler reads.
+    pub fn read_namespaces(&self) -> &[String] {
+        &self.read_namespaces
+    }
+
+    fn is_feed_type(&self, t: &str) -> bool {
+        is_feed_event_type_in(t, self.read_namespaces.iter())
+    }
+
+    fn is_mm_type(&self, t: &str) -> bool {
+        mm_core::event_namespace::match_event_type(t, self.read_namespaces.iter()).is_some()
     }
 
     /// Process a batch of events from the homeserver.
@@ -117,8 +163,8 @@ impl AppserviceHandler {
                 Some("m.room.member") => self.handle_member_event(event).await,
                 Some("m.room.message") => self.handle_message_event(event).await,
                 Some("m.room.redaction") => self.handle_feed_dispatch(event).await,
-                Some(t) if is_feed_event_type(t) => self.handle_feed_dispatch(event).await,
-                Some(t) if t.starts_with("com.matrixmedia.") => self.handle_mm_event(event).await,
+                Some(t) if self.is_feed_type(t) => self.handle_feed_dispatch(event).await,
+                Some(t) if self.is_mm_type(t) => self.handle_mm_event(event).await,
                 _ => Ok(()), // ignore unknown events
             };
 
@@ -275,7 +321,7 @@ impl AppserviceHandler {
         }
     }
 
-    /// Handle a `com.matrixmedia.*` custom event.
+    /// Handle a MatrixMedia custom event that is not a feed event.
     ///
     /// For now this just logs the event. Future versions will track stream
     /// state changes, participant updates, etc.
@@ -295,6 +341,13 @@ impl AppserviceHandler {
         debug!(event_type, room_id, "Received MatrixMedia custom event");
         Ok(())
     }
+}
+
+fn builtin_namespaces() -> Vec<String> {
+    mm_core::event_namespace::BUILTIN_READ_NAMESPACES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Generate a default appservice registration for MatrixMedia.

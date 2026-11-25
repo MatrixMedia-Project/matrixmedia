@@ -118,6 +118,10 @@ fn check_turn_uris(v: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn check_event_namespace(v: &Value) -> Result<(), String> {
+    crate::event_namespace::validate_namespace(v.as_str().unwrap_or_default())
+}
+
 fn check_redis_url(v: &Value) -> Result<(), String> {
     match v.as_str() {
         None | Some("") => Ok(()),
@@ -141,6 +145,20 @@ pub(super) fn all() -> Vec<SettingDef> {
             "Webhook notified when someone requests a server (chat webhook URLs contain a token)."),
         setting!(matrix.alert_matrix_room; General, OptText, LIVE, secret: false, env: Some("MM_ALERT_MATRIX_ROOM"),
             "Matrix room that receives operator alerts."),
+        // ── Matrix event names (ADR-0011) ─────────────────────────────────
+        setting!(matrix.event_namespace; General, Text, RESTART, secret: false, env: None,
+            "Namespace of the custom Matrix event types this server writes (default dev.matrixmedia). \
+             Lower-case reverse-DNS. Every namespace ever written stays announced to clients, so a \
+             change never hides events already in rooms.", check: check_event_namespace),
+        setting!(matrix.event_legacy_contract; General, ValueKind::Choice { options: &["active", "retired"] },
+            bootstrap("retiring the legacy event names cuts off apps already in the stores; it is a deliberate release step (ADR-0011), set in the config file"),
+            secret: false, env: None,
+            "active (default): keep writing the legacy event names the apps in the stores read. retired: write the current namespace only."),
+        setting!(matrix.pin_event_power_levels; General, Bool, LIVE, secret: false, env: None,
+            "When the room marker is written, require power level 100 for the current-name MatrixMedia state events in that room (skipped where the bot lacks the power)."),
+        setting!(matrix.feed_sender_check; General, ValueKind::Choice { options: &["off", "log", "enforce"] }, RESTART,
+            secret: false, env: None,
+            "Who may send server-written feed events into the feed index. log (default): count and log a sender that is neither the bot nor at the room's state_default power, index anyway. enforce: drop it. off: no check."),
         setting!(monetization.redis_url; General, Text, RESTART, secret: true, env: Some("MM_REDIS_URL"),
             "Shared cache across instances (redis://…). Empty = in-process cache only.", check: check_redis_url),
         // ── Network ───────────────────────────────────────────────────────

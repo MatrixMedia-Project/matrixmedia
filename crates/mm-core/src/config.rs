@@ -233,13 +233,70 @@ pub struct MatrixConfig {
     /// **Set via `MM_ALERT_MATRIX_ROOM` env var** (a `!roomid:server`).
     #[serde(default)]
     pub alert_matrix_room: Option<String>,
+
+    /// Namespace of the custom Matrix event types this server writes
+    /// (ADR-0011), e.g. `dev.matrixmedia` → `dev.matrixmedia.stream`. Every
+    /// namespace ever written stays announced to clients.
+    #[serde(default = "default_event_namespace")]
+    pub event_namespace: String,
+
+    /// Legacy wire contract (ADR-0011 section 5): `active` keeps writing the
+    /// legacy names the apps in the stores read (state events under both
+    /// names, timeline events under the legacy name); `retired` writes the
+    /// current namespace only.
+    #[serde(default = "default_event_legacy_contract")]
+    pub event_legacy_contract: String,
+
+    /// When the server writes the room marker, also pin the current-name state
+    /// types in the room's power levels at 100 (ADR-0011 section 4, rule 8).
+    #[serde(default = "default_true_matrix")]
+    pub pin_event_power_levels: bool,
+
+    /// Sender check for server-written feed events in the feed indexer:
+    /// `off`, `log` (count and log an unauthorised sender, index anyway) or
+    /// `enforce` (drop it).
+    #[serde(default = "default_feed_sender_check")]
+    pub feed_sender_check: String,
+}
+
+fn default_event_namespace() -> String {
+    crate::event_namespace::CURRENT_NAMESPACE.to_string()
+}
+
+fn default_event_legacy_contract() -> String {
+    crate::event_namespace::LEGACY_CONTRACT_ACTIVE.to_string()
+}
+
+fn default_true_matrix() -> bool {
+    true
+}
+
+fn default_feed_sender_check() -> String {
+    "log".to_string()
+}
+
+impl MatrixConfig {
+    /// Whether the legacy wire contract is in force (anything but `retired`).
+    pub fn legacy_contract_active(&self) -> bool {
+        self.event_legacy_contract != crate::event_namespace::LEGACY_CONTRACT_RETIRED
+    }
+
+    /// The bot's fully-qualified user id, as `ensure_bot_in_room` builds it.
+    pub fn bot_user_id(&self) -> String {
+        if self.server_name.is_empty() {
+            format!("@{}:localhost", self.bot_localpart)
+        } else {
+            format!("@{}:{}", self.bot_localpart, self.server_name)
+        }
+    }
 }
 
 redacting_debug!(MatrixConfig {
     homeserver_url, public_homeserver_url, server_name, bot_localpart, #[secret] as_token,
     #[secret] hs_token, #[secret] synapse_admin_token, #[secret] synapse_registration_secret,
     signup_rate_limit_per_ip_per_hour, signup_tos_current_version, #[secret] signup_ip_hash_pepper,
-    alert_matrix_room,
+    alert_matrix_room, event_namespace, event_legacy_contract, pin_event_power_levels,
+    feed_sender_check,
 });
 
 impl Default for MatrixConfig {
@@ -257,6 +314,10 @@ impl Default for MatrixConfig {
             signup_tos_current_version: default_signup_tos_version(),
             signup_ip_hash_pepper: String::new(),
             alert_matrix_room: None,
+            event_namespace: default_event_namespace(),
+            event_legacy_contract: default_event_legacy_contract(),
+            pin_event_power_levels: true,
+            feed_sender_check: default_feed_sender_check(),
         }
     }
 }

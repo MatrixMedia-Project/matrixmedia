@@ -194,6 +194,18 @@ ALTER TABLE mm_recordings ADD COLUMN paywall_price_sats INTEGER;
 "#;
 
 /// Return all migrations in order.
+/// ADR-0011 event names (V063 parity for the SQLite dev/test backend): the
+/// current-name event ids on the stream row and the namespace history.
+pub const V063_EVENT_NAMESPACES: &str = r#"
+ALTER TABLE mm_streams ADD COLUMN current_state_event_id TEXT;
+ALTER TABLE mm_streams ADD COLUMN current_ended_event_id TEXT;
+CREATE TABLE IF NOT EXISTS mm_event_namespace_history (
+    namespace        TEXT PRIMARY KEY,
+    profile          TEXT NOT NULL DEFAULT 'v1',
+    first_written_at TEXT NOT NULL
+);
+"#;
+
 pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
     vec![
         ("V001_initial", V001_INITIAL),
@@ -205,5 +217,6 @@ pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
         ("V031_stream_marker_lifecycle", V031_STREAM_MARKER_LIFECYCLE),
         ("V058_share_links", V058_SHARE_LINKS),
         ("V059_paywall", V059_PAYWALL),
+        ("V063_event_namespaces", V063_EVENT_NAMESPACES),
     ]
 }

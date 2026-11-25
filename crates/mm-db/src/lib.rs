@@ -343,6 +343,10 @@ async fn run_pg_migrations_locked(
             "V062_captions_target_langs",
             include_str!("../migrations/V062__captions_target_langs.sql"),
         ),
+        (
+            "V063_event_namespaces",
+            include_str!("../migrations/V063__event_namespaces.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -395,18 +399,18 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V062. (V062 creates the
-        // mm_captions_target_langs_migrated marker table in its LAST statement, so a
-        // V062 that died partway — marker table not yet created — is not adopted. The
-        // table definition must include the PRIMARY KEY: this table did not exist
-        // before V062, so its presence alone proves the migration ran to
+        // UPDATE THIS PROBE when adding a migration past V063. (V063 creates the
+        // mm_event_namespace_history table in its LAST statement, so a V063 that
+        // died partway — table not yet created — is not adopted. The table
+        // definition must include the PRIMARY KEY: this table did not exist
+        // before V063, so its presence alone proves the migration ran to
         // completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_captions_target_langs_migrated'",
+                AND tablename  = 'mm_event_namespace_history'",
         )
         .fetch_optional(pool)
         .await
@@ -903,6 +907,38 @@ pub trait Database: Send + Sync + 'static {
     // ===================================================================
     // Core: Lifecycle
     // ===================================================================
+
+    // ===================================================================
+    // Core: Matrix event names (ADR-0011)
+    // ===================================================================
+
+    /// Persist the id of the CURRENT-name stream state event written at start
+    /// or resume (V063). `state_event_id` keeps the legacy event's id while the
+    /// legacy contract is active.
+    async fn set_stream_current_state_event_id(
+        &self,
+        stream_id: &StreamId,
+        event_id: &str,
+    ) -> Result<(), MMError>;
+
+    /// Persist the id of the CURRENT-name terminal stream state event (V063).
+    async fn set_stream_current_ended_event_id(
+        &self,
+        stream_id: &StreamId,
+        event_id: &str,
+    ) -> Result<(), MMError>;
+
+    /// `(current_state_event_id, current_ended_event_id)` of a stream (V063).
+    async fn get_stream_current_event_ids(
+        &self,
+        stream_id: &StreamId,
+    ) -> Result<(Option<String>, Option<String>), MMError>;
+
+    /// Record that the server wrote under `namespace` (idempotent).
+    async fn record_event_namespace(&self, namespace: &str, profile: &str) -> Result<(), MMError>;
+
+    /// Every namespace the server has written, oldest first, with its profile.
+    async fn list_event_namespaces(&self) -> Result<Vec<(String, String)>, MMError>;
 
     /// Run pending migrations.
     async fn migrate(&self) -> Result<(), MMError>;

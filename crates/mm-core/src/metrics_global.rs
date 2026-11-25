@@ -511,7 +511,106 @@ pub static RELAY_VIEWERS_CURRENT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 ///
 /// Called by [`crate::metrics::Metrics::new`] so the `/metrics` endpoint exposes these
 /// alongside the state-owned metrics.
+/// Client requests by app and version (ADR-0011 section 5.4, brief 2.5), from
+/// the `X-MM-Client` header. `client` is one of the four known app ids,
+/// `other` for a well-formed unknown id, or `unknown` for a missing or
+/// malformed header; `version` is bounded by [`client_label`].
+pub static CLIENT_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_client_requests_total",
+            "Client API requests by X-MM-Client app id and version (unknown = no or malformed header)"
+        ),
+        &["client", "version"],
+    )
+    .expect("mm_client_requests_total definition")
+});
+
+/// Feed events the indexer saw from a sender that is neither the bot nor at
+/// the room's `state_default` power (ADR-0011 section 4, rule 5), by outcome:
+/// `logged` (mode `log`, indexed anyway), `dropped` (mode `enforce`) or
+/// `unchecked` (the power levels could not be read).
+pub static FEED_SENDER_CHECK: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    IntCounterVec::new(
+        opts!(
+            "mm_feed_sender_check_total",
+            "Server-written feed events from unauthorised senders, by outcome"
+        ),
+        &["outcome"],
+    )
+    .expect("mm_feed_sender_check_total definition")
+});
+
+/// App ids `X-MM-Client` may carry (brief 2.5).
+pub const KNOWN_CLIENT_IDS: [&str; 4] = [
+    "matrixmedia-ios",
+    "matrixmedia-android",
+    "matrixmedia-fluffychat",
+    "matrixmedia-web",
+];
+
+/// Most distinct `(client, version)` pairs ever labelled; later new pairs are
+/// counted under version `other`, so a stream of made-up versions cannot grow
+/// the series without bound.
+pub const MAX_CLIENT_VERSION_SERIES: usize = 200;
+
+static CLIENT_SERIES_SEEN: LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+    LazyLock::new(Default::default);
+
+/// Parse `X-MM-Client: <client-id>/<version> (<platform>; build <build>)` into
+/// bounded `(client, version)` labels. Only the part before the first space is
+/// used. A version is 1 to 4 dot-separated numbers of up to 6 digits, with an
+/// optional `-suffix` of up to 16 `[0-9A-Za-z.]` characters.
+pub fn parse_client_header(header: Option<&str>) -> (String, String) {
+    let unknown = || ("unknown".to_string(), "unknown".to_string());
+    let Some(h) = header else { return unknown() };
+    let head = h.trim().split_whitespace().next().unwrap_or("");
+    let Some((id, version)) = head.split_once('/') else { return unknown() };
+    let id_ok = !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !id_ok || !version_ok(version) {
+        return unknown();
+    }
+    let client = if KNOWN_CLIENT_IDS.contains(&id) { id } else { "other" };
+    let version = if client == "other" { "other" } else { version };
+    (client.to_string(), version.to_string())
+}
+
+fn version_ok(v: &str) -> bool {
+    let (core, suffix) = match v.split_once('-') {
+        Some((c, s)) => (c, Some(s)),
+        None => (v, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    let core_ok = (1..=4).contains(&parts.len())
+        && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()));
+    let suffix_ok = suffix.is_none_or(|s| {
+        !s.is_empty() && s.len() <= 16 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+    });
+    core_ok && suffix_ok
+}
+
+/// Count one client request from its `X-MM-Client` header value.
+pub fn count_client_request(header: Option<&str>) {
+    let (client, mut version) = parse_client_header(header);
+    {
+        let mut seen = CLIENT_SERIES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (client.clone(), version.clone());
+        if !seen.contains(&key) {
+            if seen.len() >= MAX_CLIENT_VERSION_SERIES {
+                version = "other".to_string();
+            } else {
+                seen.insert(key);
+            }
+        }
+    }
+    CLIENT_REQUESTS.with_label_values(&[&client, &version]).inc();
+}
+
 pub fn register_all(registry: &Registry) -> prometheus::Result<()> {
+    registry.register(Box::new(CLIENT_REQUESTS.clone()))?;
+    registry.register(Box::new(FEED_SENDER_CHECK.clone()))?;
     registry.register(Box::new(HTTP_REQUEST_DURATION.clone()))?;
     registry.register(Box::new(OUTBOUND_REQUEST_DURATION.clone()))?;
     registry.register(Box::new(AUTH_STAGE_TOTAL.clone()))?;
@@ -959,6 +1058,21 @@ mod fleet_metric_tests {
                 vec!["tier"],
                 "unexpected labels {labels:?} — a stream id here is a cardinality bomb"
             );
+        }
+    }
+
+    #[test]
+    fn the_client_header_is_parsed_into_bounded_labels() {
+        let p = |h: Option<&str>| super::parse_client_header(h);
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(p(Some("matrixmedia-ios/1.0.1 (ios; build 12)")), pair("matrixmedia-ios", "1.0.1"));
+        assert_eq!(p(Some("matrixmedia-web/0.11.0-beta.2")), pair("matrixmedia-web", "0.11.0-beta.2"));
+        assert_eq!(p(Some("someone-else/2.0 (x)")), pair("other", "other"));
+        // Missing or malformed: unknown (brief 7.5: an app that has not updated).
+        for bad in [None, Some(""), Some("matrixmedia-ios"), Some("matrixmedia-ios/"),
+            Some("matrixmedia-ios/abc"), Some("MatrixMedia-iOS/1.0"), Some("matrixmedia-ios/1.2.3.4.5"),
+            Some("matrixmedia-ios/1.0-x_y"), Some("matrixmedia-ios/1234567.0")] {
+            assert_eq!(p(bad), pair("unknown", "unknown"), "{bad:?}");
         }
     }
 }

@@ -287,6 +287,71 @@ impl Database for PgDatabase {
         Ok(())
     }
 
+    async fn set_stream_current_state_event_id(
+        &self,
+        stream_id: &StreamId,
+        event_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query("UPDATE mm_streams SET current_state_event_id = $1 WHERE id = $2")
+            .bind(event_id)
+            .bind(&stream_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn set_stream_current_ended_event_id(
+        &self,
+        stream_id: &StreamId,
+        event_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query("UPDATE mm_streams SET current_ended_event_id = $1 WHERE id = $2")
+            .bind(event_id)
+            .bind(&stream_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_stream_current_event_ids(
+        &self,
+        stream_id: &StreamId,
+    ) -> Result<(Option<String>, Option<String>), MMError> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT current_state_event_id, current_ended_event_id FROM mm_streams WHERE id = $1",
+        )
+        .bind(&stream_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    async fn record_event_namespace(&self, namespace: &str, profile: &str) -> Result<(), MMError> {
+        sqlx::query(
+            "INSERT INTO mm_event_namespace_history (namespace, profile) VALUES ($1, $2) \
+             ON CONFLICT (namespace) DO NOTHING",
+        )
+        .bind(namespace)
+        .bind(profile)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn list_event_namespaces(&self) -> Result<Vec<(String, String)>, MMError> {
+        sqlx::query_as(
+            "SELECT namespace, profile FROM mm_event_namespace_history \
+             ORDER BY first_written_at, namespace",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
     async fn bump_stream_marker_generation(
         &self,
         stream_id: &StreamId,

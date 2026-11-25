@@ -580,7 +580,7 @@ impl HomeserverClient {
         })
     }
 
-    /// Fetch the current `com.matrixmedia.stream` state event for a room.
+    /// Fetch the current legacy `com.matrixmedia.stream` state event for a room.
     ///
     /// `GET /_matrix/client/v3/rooms/{room_id}/state/com.matrixmedia.stream/`
     ///
@@ -591,11 +591,19 @@ impl HomeserverClient {
         &self,
         room_id: &str,
     ) -> Result<Option<crate::events::StreamEventContent>, mm_core::error::MMError> {
+        self.get_stream_state_of(room_id, crate::events::LEGACY_STREAM_EVENT_TYPE)
+            .await
+    }
+
+    /// [`Self::get_stream_state`] for the stream marker under `event_type`.
+    pub async fn get_stream_state_of(
+        &self,
+        room_id: &str,
+        event_type: &str,
+    ) -> Result<Option<crate::events::StreamEventContent>, mm_core::error::MMError> {
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/state/{}/",
-            self.homeserver_url,
-            room_id,
-            crate::events::STREAM_EVENT_TYPE
+            self.homeserver_url, room_id, event_type
         );
         debug!("GET {url}");
 

@@ -44,23 +44,58 @@ use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use mm_core::event_namespace::{BUILTIN_READ_NAMESPACES, EventSuffix, is_builtin, match_event_type};
+
 use crate::events::{
-    FEED_BROADCAST_ENDED_EVENT_TYPE, FEED_BROADCAST_STARTED_EVENT_TYPE,
-    FEED_POST_EVENT_TYPE, FEED_RECORDING_AVAILABLE_EVENT_TYPE,
+    FEED_BROADCAST_ENDED_EVENT_TYPE, FEED_BROADCAST_STARTED_EVENT_TYPE, FEED_POST_EVENT_TYPE,
+    FEED_RECORDING_AVAILABLE_EVENT_TYPE, LEGACY_FEED_BROADCAST_ENDED_EVENT_TYPE,
+    LEGACY_FEED_BROADCAST_STARTED_EVENT_TYPE, LEGACY_FEED_POST_EVENT_TYPE,
+    LEGACY_FEED_RECORDING_AVAILABLE_EVENT_TYPE,
 };
 
-/// The four feed event types the AS indexer recognises. Iterated in
-/// `is_feed_event_type` for the per-event dispatch arm.
+/// The four feed suffixes the AS indexer recognises, under any read namespace.
+pub const FEED_SUFFIXES: [EventSuffix; 4] = [
+    EventSuffix::FeedBroadcastStarted,
+    EventSuffix::FeedBroadcastEnded,
+    EventSuffix::FeedRecordingAvailable,
+    EventSuffix::FeedPost,
+];
+
+/// The feed event types under the two names every server reads (current and
+/// legacy). `dev.matrixmedia.*` and `com.steegler.matrixmedia.*` both index.
 pub const FEED_EVENT_TYPES: &[&str] = &[
     FEED_BROADCAST_STARTED_EVENT_TYPE,
     FEED_BROADCAST_ENDED_EVENT_TYPE,
     FEED_RECORDING_AVAILABLE_EVENT_TYPE,
     FEED_POST_EVENT_TYPE,
+    LEGACY_FEED_BROADCAST_STARTED_EVENT_TYPE,
+    LEGACY_FEED_BROADCAST_ENDED_EVENT_TYPE,
+    LEGACY_FEED_RECORDING_AVAILABLE_EVENT_TYPE,
+    LEGACY_FEED_POST_EVENT_TYPE,
 ];
 
-/// Returns `true` when the event type matches one of [`FEED_EVENT_TYPES`].
+/// Returns `true` when the event type is a feed event under one of the
+/// built-in namespaces.
 pub fn is_feed_event_type(event_type: &str) -> bool {
-    FEED_EVENT_TYPES.iter().any(|t| *t == event_type)
+    is_feed_event_type_in(event_type, BUILTIN_READ_NAMESPACES)
+}
+
+/// [`is_feed_event_type`] over an explicit namespace list.
+pub fn is_feed_event_type_in<I, S>(event_type: &str, namespaces: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    feed_suffix_in(event_type, namespaces).is_some()
+}
+
+/// The feed suffix of `event_type` and the namespace it came under.
+fn feed_suffix_in<I, S>(event_type: &str, namespaces: I) -> Option<(EventSuffix, String)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    match_event_type(event_type, namespaces).filter(|(suffix, _)| FEED_SUFFIXES.contains(suffix))
 }
 
 /// Member-count cap: skip indexing rooms with more joined members than
@@ -103,6 +138,8 @@ pub struct FeedIndexer {
     mm_enabled_cache: Arc<Mutex<HashMap<String, MmEnabledCacheEntry>>>,
     members_ttl: Duration,
     mm_enabled_ttl: Duration,
+    /// Namespaces read (built-in first). See [`Self::set_read_namespaces`].
+    read_namespaces: Arc<Vec<String>>,
 }
 
 impl FeedIndexer {
@@ -122,7 +159,19 @@ impl FeedIndexer {
             mm_enabled_cache: Arc::new(Mutex::new(HashMap::new())),
             members_ttl: Duration::from_secs(60),
             mm_enabled_ttl: Duration::from_secs(300),
+            read_namespaces: Arc::new(
+                BUILTIN_READ_NAMESPACES.iter().map(|s| s.to_string()).collect(),
+            ),
         }
+    }
+
+    /// Read feed events under these namespaces too (the appservice handler
+    /// passes the built-in list plus every namespace the server has written).
+    /// An event under a namespace that is not built in is indexed only when
+    /// the bot sent it and its suffix is one the server writes (ADR-0011
+    /// section 4, rule 5).
+    pub fn set_read_namespaces(&mut self, namespaces: Arc<Vec<String>>) {
+        self.read_namespaces = namespaces;
     }
 
     /// Process one timeline event. Returns:
@@ -157,8 +206,18 @@ impl FeedIndexer {
             return Ok(false);
         }
 
-        if !is_feed_event_type(event_type) {
+        let Some((suffix, namespace)) = feed_suffix_in(event_type, self.read_namespaces.iter())
+        else {
             return Ok(false);
+        };
+        // Rule 5: a name that is not built in is trusted only from the bot, and
+        // only for the suffixes the server writes (never a client's feed.post).
+        if !is_builtin(&namespace) {
+            let sender = event.get("sender").and_then(|s| s.as_str()).unwrap_or_default();
+            if !suffix.server_written() || sender != self.bot_user_id {
+                debug!(event_type, sender, "feed event under an announced namespace not from the bot; skipped");
+                return Ok(false);
+            }
         }
 
         let room_id = match event.get("room_id").and_then(|r| r.as_str()) {
@@ -183,7 +242,7 @@ impl FeedIndexer {
             .get("content")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let kind = feed_kind_for_type(event_type);
+        let kind = feed_kind_for_suffix(suffix);
 
         // 1. mm_enabled gate (cached).
         if !self.mm_enabled(&room_id).await {
@@ -521,13 +580,23 @@ fn extract_thread_root(event: &serde_json::Value) -> Option<(String, String)> {
     Some((root.to_string(), room_id.to_string()))
 }
 
-/// Map an event type to the short `kind` stored in `mm_feed_items.kind`.
+/// Map an event type (under a built-in namespace) to the short `kind` stored
+/// in `mm_feed_items.kind`. Old and new names map to the same kind.
+#[cfg(test)]
 fn feed_kind_for_type(t: &str) -> &'static str {
-    match t {
-        FEED_BROADCAST_STARTED_EVENT_TYPE => "broadcast.started",
-        FEED_BROADCAST_ENDED_EVENT_TYPE => "broadcast.ended",
-        FEED_RECORDING_AVAILABLE_EVENT_TYPE => "recording.available",
-        FEED_POST_EVENT_TYPE => "post",
+    match feed_suffix_in(t, BUILTIN_READ_NAMESPACES) {
+        Some((suffix, _)) => feed_kind_for_suffix(suffix),
+        None => "unknown",
+    }
+}
+
+/// The short kind for a feed suffix — the values `GET /feed` returns.
+fn feed_kind_for_suffix(suffix: EventSuffix) -> &'static str {
+    match suffix {
+        EventSuffix::FeedBroadcastStarted => "broadcast.started",
+        EventSuffix::FeedBroadcastEnded => "broadcast.ended",
+        EventSuffix::FeedRecordingAvailable => "recording.available",
+        EventSuffix::FeedPost => "post",
         _ => "unknown",
     }
 }
@@ -631,9 +700,74 @@ mod tests {
         assert!(!is_feed_event_type("m.room.message"));
     }
 
+    /// ADR-0011: every feed name under every built-in namespace maps to the
+    /// same kind; old and new names of one suffix index identically.
+    #[test]
+    fn every_builtin_name_of_a_feed_suffix_maps_to_one_kind() {
+        for suffix in FEED_SUFFIXES {
+            let kinds: Vec<&str> = BUILTIN_READ_NAMESPACES
+                .iter()
+                .map(|ns| feed_kind_for_type(&mm_core::event_namespace::event_type(ns, suffix)))
+                .collect();
+            assert!(kinds.iter().all(|k| *k == kinds[0] && *k != "unknown"), "{suffix:?}: {kinds:?}");
+        }
+        assert_eq!(feed_kind_for_type(FEED_POST_EVENT_TYPE), "post");
+        assert_eq!(feed_kind_for_type(LEGACY_FEED_POST_EVENT_TYPE), "post");
+        assert!(is_feed_event_type("dev.matrixmedia.feed.broadcast.started"));
+        assert!(!is_feed_event_type("dev.matrixmedia.stream"), "not a feed type");
+        assert!(!is_feed_event_type("org.example.feed.post"), "not on the list");
+        assert!(is_feed_event_type_in("org.example.feed.post", ["org.example"]));
+    }
+
+    fn lazy_pool() -> PgPool {
+        // Never connects: the paths under test return before touching the database.
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:9/unused")
+            .expect("lazy pool")
+    }
+
+    fn indexer_reading(extra: &[&str]) -> FeedIndexer {
+        let mut indexer = FeedIndexer::new(
+            lazy_pool(),
+            Arc::new(StaticResolver(Vec::new())),
+            "localhost",
+            "@mmbot:localhost",
+        );
+        let mut list: Vec<String> = BUILTIN_READ_NAMESPACES.iter().map(|s| s.to_string()).collect();
+        list.extend(extra.iter().map(|s| s.to_string()));
+        indexer.set_read_namespaces(Arc::new(list));
+        indexer
+    }
+
+    /// Rule 5: under a namespace that is not built in, only the bot's
+    /// server-written feed events count. Returns before any database access.
+    #[tokio::test]
+    async fn an_announced_namespace_is_honoured_only_from_the_bot() {
+        let indexer = indexer_reading(&["org.example.media"]);
+        let from = |sender: &str, t: &str| {
+            serde_json::json!({
+                "type": t, "room_id": "!r:localhost", "event_id": "$e", "sender": sender,
+                "content": { "version": 1, "body": "x", "msgtype": "m.notice" }
+            })
+        };
+        // A member posing as the bot under the announced name: skipped.
+        let ev = from("@mallory:localhost", "org.example.media.feed.broadcast.started");
+        assert!(!indexer.handle_event(&ev).await.unwrap());
+        // A client-written type is never taken from a non-built-in name, even from the bot.
+        let ev = from("@mmbot:localhost", "org.example.media.feed.post");
+        assert!(!indexer.handle_event(&ev).await.unwrap());
+        // A namespace not on the list at all: not a feed event.
+        let ev = from("@mmbot:localhost", "org.other.feed.broadcast.started");
+        assert!(!indexer.handle_event(&ev).await.unwrap());
+    }
+
     fn make_broadcast_started_event(room_id: &str, event_id: &str) -> serde_json::Value {
+        make_feed_event(LEGACY_FEED_BROADCAST_STARTED_EVENT_TYPE, room_id, event_id)
+    }
+
+    fn make_feed_event(event_type: &str, room_id: &str, event_id: &str) -> serde_json::Value {
         serde_json::json!({
-            "type": FEED_BROADCAST_STARTED_EVENT_TYPE,
+            "type": event_type,
             "room_id": room_id,
             "event_id": event_id,
             "sender": "@mmbot:localhost",
@@ -689,6 +823,50 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(count.0, 2, "expected one row per LOCAL non-bot member");
+    }
+
+    /// ADR-0011 2.11: a new-name event is indexed, a legacy event is still
+    /// indexed, both under the same kind, and redelivery indexes neither twice.
+    #[tokio::test]
+    async fn new_and_legacy_feed_names_both_index_once() {
+        let Some(pool) = try_pool().await else {
+            eprintln!("MM_DATABASE_URL not set — skipping new_and_legacy_feed_names_both_index_once");
+            return;
+        };
+        ensure_migrations(&pool).await;
+        let _guard = appservice_lock().lock().await;
+        truncate(&pool).await;
+
+        let room_id = "!feed-both-names:localhost";
+        set_mm_enabled(&pool, room_id, true).await;
+        let indexer = FeedIndexer::new(
+            pool.clone(),
+            Arc::new(StaticResolver(vec!["@alice:localhost".to_string()])),
+            "localhost",
+            "@mmbot:localhost",
+        );
+        let new_name = make_feed_event(FEED_BROADCAST_STARTED_EVENT_TYPE, room_id, "$new-1");
+        let legacy = make_feed_event(LEGACY_FEED_BROADCAST_STARTED_EVENT_TYPE, room_id, "$legacy-1");
+        assert!(indexer.handle_event(&new_name).await.unwrap());
+        assert!(indexer.handle_event(&legacy).await.unwrap());
+        // Synapse redelivers a transaction: nothing new.
+        indexer.handle_event(&new_name).await.unwrap();
+        indexer.handle_event(&legacy).await.unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT event_id, kind FROM mm_feed_items WHERE room_id = $1 ORDER BY event_id",
+        )
+        .bind(room_id)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("$legacy-1".to_string(), "broadcast.started".to_string()),
+                ("$new-1".to_string(), "broadcast.started".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

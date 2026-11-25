@@ -2,33 +2,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::HomeserverClient;
 
-/// Namespace for all MatrixMedia custom events.
-pub const EVENT_NAMESPACE: &str = "com.matrixmedia";
+pub use mm_core::event_namespace::{
+    BUILTIN_READ_NAMESPACES, EventSuffix, LEGACY_COM_NAMESPACE, LEGACY_STEEGLER_NAMESPACE,
+    is_builtin, match_event_type,
+};
+
+/// Namespace for all MatrixMedia custom events (ADR-0011). The legacy names
+/// (`com.matrixmedia.*`, `com.steegler.matrixmedia.*`) are the `LEGACY_*`
+/// constants below; which names the server writes is decided by
+/// [`WriteNames`], from the `matrix.event_namespace` and
+/// `matrix.event_legacy_contract` settings.
+pub const EVENT_NAMESPACE: &str = mm_core::event_namespace::CURRENT_NAMESPACE;
 
 /// State event type: stream status.
 ///
 /// State key: `""` (single-stream-per-room in v1).
-pub const STREAM_EVENT_TYPE: &str = "com.matrixmedia.stream";
+pub const STREAM_EVENT_TYPE: &str = "dev.matrixmedia.stream";
+/// Legacy name of [`STREAM_EVENT_TYPE`]; the apps in the stores read it.
+pub const LEGACY_STREAM_EVENT_TYPE: &str = "com.matrixmedia.stream";
 
-/// State event type: room configuration.
-pub const ROOM_CONFIG_EVENT_TYPE: &str = "com.matrixmedia.room_config";
+/// State event type: the MM-room marker (ADR-0011 section 3). Never renamed by
+/// a setting (it is how a client finds a room's names) and never had a legacy
+/// name on the wire.
+pub const ROOM_CONFIG_EVENT_TYPE: &str = "dev.matrixmedia.room_config";
 
 /// Timeline event type: donation (Super Chat).
-pub const DONATION_EVENT_TYPE: &str = "com.matrixmedia.donation";
+pub const DONATION_EVENT_TYPE: &str = "dev.matrixmedia.donation";
+/// Legacy name of [`DONATION_EVENT_TYPE`].
+pub const LEGACY_DONATION_EVENT_TYPE: &str = "com.matrixmedia.donation";
 
-/// State event type: subscription tiers (state_key "").
-pub const SUBSCRIPTION_TIERS_EVENT_TYPE: &str = "com.matrixmedia.subscription_tiers";
+/// State event type: subscription tiers (state_key ""). Never sent, so renamed
+/// outright with no legacy twin.
+pub const SUBSCRIPTION_TIERS_EVENT_TYPE: &str = "dev.matrixmedia.subscription_tiers";
 
 /// State event type: subscription proof (state_key "@subscriber:server").
-pub const SUBSCRIPTION_PROOF_EVENT_TYPE: &str = "com.matrixmedia.subscription_proof";
+/// Never sent; no legacy twin.
+pub const SUBSCRIPTION_PROOF_EVENT_TYPE: &str = "dev.matrixmedia.subscription_proof";
 
-/// State event type: content gate (state_key "").
-pub const CONTENT_GATE_EVENT_TYPE: &str = "com.matrixmedia.content_gate";
+/// State event type: content gate (state_key ""). Never sent; no legacy twin.
+pub const CONTENT_GATE_EVENT_TYPE: &str = "dev.matrixmedia.content_gate";
 
 /// State event type: per-stream E2EE key distribution.
 ///
 /// State key: the `stream_id` (so multiple streams never collide).
-pub const E2EE_KEY_EVENT_TYPE: &str = "com.matrixmedia.stream.e2ee_key";
+pub const E2EE_KEY_EVENT_TYPE: &str = "dev.matrixmedia.stream.e2ee_key";
+/// Legacy name of [`E2EE_KEY_EVENT_TYPE`].
+pub const LEGACY_E2EE_KEY_EVENT_TYPE: &str = "com.matrixmedia.stream.e2ee_key";
+
+/// Room account data: rooms a user muted in the feed. Clients write both
+/// names; the server reads this one first, then the legacy one.
+pub const FEED_MUTED_ACCOUNT_DATA_TYPE: &str = "dev.matrixmedia.feed_muted";
+/// Legacy name of [`FEED_MUTED_ACCOUNT_DATA_TYPE`].
+pub const LEGACY_FEED_MUTED_ACCOUNT_DATA_TYPE: &str = "com.steegler.matrixmedia.feed_muted";
+
+/// Global account data: recently used reactions (client-only).
+pub const REACTION_RECENTS_ACCOUNT_DATA_TYPE: &str = "dev.matrixmedia.reaction_recents";
+/// Legacy name of [`REACTION_RECENTS_ACCOUNT_DATA_TYPE`].
+pub const LEGACY_REACTION_RECENTS_ACCOUNT_DATA_TYPE: &str =
+    "com.steegler.matrixmedia.reaction_recents";
 
 // ---------------------------------------------------------------------------
 // Newsfeed event types (Phase 1)
@@ -41,21 +72,105 @@ pub const E2EE_KEY_EVENT_TYPE: &str = "com.matrixmedia.stream.e2ee_key";
 // ---------------------------------------------------------------------------
 
 /// Timeline event type: a host began a live broadcast.
-pub const FEED_BROADCAST_STARTED_EVENT_TYPE: &str =
+pub const FEED_BROADCAST_STARTED_EVENT_TYPE: &str = "dev.matrixmedia.feed.broadcast.started";
+/// Legacy name of [`FEED_BROADCAST_STARTED_EVENT_TYPE`].
+pub const LEGACY_FEED_BROADCAST_STARTED_EVENT_TYPE: &str =
     "com.steegler.matrixmedia.feed.broadcast.started";
 
 /// Timeline event type: a live broadcast finished.
 ///
 /// References the `broadcast.started` event via `m.relates_to: m.reference`.
-pub const FEED_BROADCAST_ENDED_EVENT_TYPE: &str =
+pub const FEED_BROADCAST_ENDED_EVENT_TYPE: &str = "dev.matrixmedia.feed.broadcast.ended";
+/// Legacy name of [`FEED_BROADCAST_ENDED_EVENT_TYPE`].
+pub const LEGACY_FEED_BROADCAST_ENDED_EVENT_TYPE: &str =
     "com.steegler.matrixmedia.feed.broadcast.ended";
 
 /// Timeline event type: a recording finalised and is ready for VOD playback.
-pub const FEED_RECORDING_AVAILABLE_EVENT_TYPE: &str =
+pub const FEED_RECORDING_AVAILABLE_EVENT_TYPE: &str = "dev.matrixmedia.feed.recording.available";
+/// Legacy name of [`FEED_RECORDING_AVAILABLE_EVENT_TYPE`].
+pub const LEGACY_FEED_RECORDING_AVAILABLE_EVENT_TYPE: &str =
     "com.steegler.matrixmedia.feed.recording.available";
 
 /// Timeline event type: a creator published a feed post (text + optional media).
-pub const FEED_POST_EVENT_TYPE: &str = "com.steegler.matrixmedia.feed.post";
+pub const FEED_POST_EVENT_TYPE: &str = "dev.matrixmedia.feed.post";
+/// Legacy name of [`FEED_POST_EVENT_TYPE`].
+pub const LEGACY_FEED_POST_EVENT_TYPE: &str = "com.steegler.matrixmedia.feed.post";
+
+/// Whether `event_type` is a MatrixMedia event under one of the built-in
+/// namespaces (replaces the old `starts_with("com.matrixmedia.")` test).
+pub fn is_mm_event_type(event_type: &str) -> bool {
+    match_event_type(event_type, BUILTIN_READ_NAMESPACES).is_some()
+}
+
+/// Which names the server writes (ADR-0011 section 2.2, brief 2.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteNames {
+    current: String,
+    legacy_active: bool,
+}
+
+impl WriteNames {
+    pub fn new(current_namespace: impl Into<String>, legacy_active: bool) -> Self {
+        Self { current: current_namespace.into(), legacy_active }
+    }
+
+    /// From the two settings. An invalid namespace (the settings check
+    /// rejects one, so only a hand-edited config file can carry it) falls
+    /// back to the default rather than writing names no client reads.
+    pub fn from_config(cfg: &mm_core::config::MatrixConfig) -> Self {
+        let current = if mm_core::event_namespace::validate_namespace(&cfg.event_namespace).is_ok() {
+            cfg.event_namespace.clone()
+        } else {
+            tracing::warn!("matrix.event_namespace is not a valid namespace; using the default");
+            EVENT_NAMESPACE.to_string()
+        };
+        Self::new(current, cfg.legacy_contract_active())
+    }
+
+    pub fn current_namespace(&self) -> &str {
+        &self.current
+    }
+
+    pub fn legacy_active(&self) -> bool {
+        self.legacy_active
+    }
+
+    /// `<current>.<suffix>`.
+    pub fn current(&self, suffix: EventSuffix) -> String {
+        mm_core::event_namespace::event_type(&self.current, suffix)
+    }
+
+    /// State event names to write, in order: the legacy name first (when
+    /// `with_legacy` and the suffix has one), then the current name. A current
+    /// name equal to the legacy name is written once.
+    pub fn state_names(&self, suffix: EventSuffix, with_legacy: bool) -> Vec<NamedType> {
+        let current = self.current(suffix);
+        let mut out = Vec::with_capacity(2);
+        if with_legacy && let Some(legacy) = suffix.legacy_name() {
+            out.push(NamedType { event_type: legacy.to_string(), legacy: true });
+        }
+        if !out.iter().any(|n| n.event_type == current) {
+            out.push(NamedType { event_type: current, legacy: false });
+        }
+        out
+    }
+
+    /// The one name a timeline event goes out under: the legacy name while
+    /// the legacy contract is active, the current name after.
+    pub fn timeline_name(&self, suffix: EventSuffix) -> String {
+        match suffix.legacy_name() {
+            Some(legacy) if self.legacy_active => legacy.to_string(),
+            _ => self.current(suffix),
+        }
+    }
+}
+
+/// One event name to write and whether it is the legacy name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedType {
+    pub event_type: String,
+    pub legacy: bool,
+}
 
 /// Content for a `com.matrixmedia.stream` state event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -243,21 +358,30 @@ fn default_true() -> bool {
 // Stream state event publishing
 // ---------------------------------------------------------------------------
 
-/// Publish a `com.matrixmedia.stream` state event with `status: "active"`.
+/// Publish a legacy `com.matrixmedia.stream` state event with `status: "active"`.
 ///
 /// This sets the room state so that Matrix clients (and the MatrixMedia widget)
 /// can discover the active stream. Returns the event ID of the published state
-/// event.
+/// event. The server's write paths use [`publish_stream_active_as`] with the
+/// names [`WriteNames`] picks.
 pub async fn publish_stream_active(
     client: &HomeserverClient,
     room_id: &str,
     content: &StreamEventContent,
 ) -> Result<String, mm_core::error::MMError> {
+    publish_stream_active_as(client, room_id, LEGACY_STREAM_EVENT_TYPE, content).await
+}
+
+/// [`publish_stream_active`] under `event_type`.
+pub async fn publish_stream_active_as(
+    client: &HomeserverClient,
+    room_id: &str,
+    event_type: &str,
+    content: &StreamEventContent,
+) -> Result<String, mm_core::error::MMError> {
     let json = serde_json::to_value(content)
         .map_err(|e| mm_core::error::MMError::Internal(format!("serialize stream event: {e}")))?;
-    client
-        .send_state_event(room_id, STREAM_EVENT_TYPE, "", &json)
-        .await
+    client.send_state_event(room_id, event_type, "", &json).await
 }
 
 /// Publish an explicit terminal `com.matrixmedia.stream` state event
@@ -271,12 +395,20 @@ pub async fn publish_stream_ended(
     room_id: &str,
     content: &StreamEndedEventContent,
 ) -> Result<String, mm_core::error::MMError> {
+    publish_stream_ended_as(client, room_id, LEGACY_STREAM_EVENT_TYPE, content).await
+}
+
+/// [`publish_stream_ended`] under `event_type`.
+pub async fn publish_stream_ended_as(
+    client: &HomeserverClient,
+    room_id: &str,
+    event_type: &str,
+    content: &StreamEndedEventContent,
+) -> Result<String, mm_core::error::MMError> {
     let json = serde_json::to_value(content).map_err(|e| {
         mm_core::error::MMError::Internal(format!("serialize stream ended event: {e}"))
     })?;
-    client
-        .send_state_event(room_id, STREAM_EVENT_TYPE, "", &json)
-        .await
+    client.send_state_event(room_id, event_type, "", &json).await
 }
 
 /// Clear the `com.matrixmedia.stream` state event by sending empty content.
@@ -293,7 +425,7 @@ pub async fn clear_stream_active(
     room_id: &str,
 ) -> Result<String, mm_core::error::MMError> {
     client
-        .send_state_event(room_id, STREAM_EVENT_TYPE, "", &serde_json::json!({}))
+        .send_state_event(room_id, LEGACY_STREAM_EVENT_TYPE, "", &serde_json::json!({}))
         .await
 }
 
@@ -317,32 +449,47 @@ pub struct E2eeKeyEvent {
     pub rotates_next_ms: Option<i64>,
 }
 
-/// Publish a `com.matrixmedia.stream.e2ee_key` state event.
+/// Publish a legacy `com.matrixmedia.stream.e2ee_key` state event.
 pub async fn publish_e2ee_key(
     client: &HomeserverClient,
     room_id: &str,
     event: &E2eeKeyEvent,
 ) -> Result<String, mm_core::error::MMError> {
+    publish_e2ee_key_as(client, room_id, LEGACY_E2EE_KEY_EVENT_TYPE, event).await
+}
+
+/// [`publish_e2ee_key`] under `event_type`.
+pub async fn publish_e2ee_key_as(
+    client: &HomeserverClient,
+    room_id: &str,
+    event_type: &str,
+    event: &E2eeKeyEvent,
+) -> Result<String, mm_core::error::MMError> {
     let content = serde_json::to_value(event)
         .map_err(|e| mm_core::error::MMError::Internal(format!("serialize e2ee key event: {e}")))?;
     client
-        .send_state_event(room_id, E2EE_KEY_EVENT_TYPE, &event.stream_id, &content)
+        .send_state_event(room_id, event_type, &event.stream_id, &content)
         .await
 }
 
-/// Clear the E2EE key state event for a stream by sending empty content.
+/// Clear the legacy E2EE key state event for a stream by sending empty content.
 pub async fn clear_e2ee_key(
     client: &HomeserverClient,
     room_id: &str,
     stream_id: &str,
 ) -> Result<String, mm_core::error::MMError> {
+    clear_e2ee_key_as(client, room_id, LEGACY_E2EE_KEY_EVENT_TYPE, stream_id).await
+}
+
+/// [`clear_e2ee_key`] under `event_type`.
+pub async fn clear_e2ee_key_as(
+    client: &HomeserverClient,
+    room_id: &str,
+    event_type: &str,
+    stream_id: &str,
+) -> Result<String, mm_core::error::MMError> {
     client
-        .send_state_event(
-            room_id,
-            E2EE_KEY_EVENT_TYPE,
-            stream_id,
-            &serde_json::json!({}),
-        )
+        .send_state_event(room_id, event_type, stream_id, &serde_json::json!({}))
         .await
 }
 
@@ -485,6 +632,17 @@ pub async fn emit_donation_event(
     room_id: &str,
     content: &DonationEventContent,
 ) -> Result<(String, String), mm_core::error::MMError> {
+    emit_donation_event_as(client, room_id, LEGACY_DONATION_EVENT_TYPE, content).await
+}
+
+/// [`emit_donation_event`] with the donation event under `event_type` (the
+/// notice is an ordinary `m.room.message` either way).
+pub async fn emit_donation_event_as(
+    client: &HomeserverClient,
+    room_id: &str,
+    event_type: &str,
+    content: &DonationEventContent,
+) -> Result<(String, String), mm_core::error::MMError> {
     // Ensure the bot is in the room before trying to send events.
     // If the bot is already joined this is a no-op (Synapse returns 200).
     if let Err(e) = client.join_room(room_id).await {
@@ -495,7 +653,7 @@ pub async fn emit_donation_event(
     let json = serde_json::to_value(content)
         .map_err(|e| mm_core::error::MMError::Internal(format!("serialize donation event: {e}")))?;
     let donation_event_id = client
-        .send_custom_event(room_id, DONATION_EVENT_TYPE, &json)
+        .send_custom_event(room_id, event_type, &json)
         .await?;
 
     // 2. Send a human-readable notice.
@@ -789,20 +947,20 @@ pub struct RecordingTimelineEvent {
     /// Media info (mimetype, duration, size).
     pub info: RecordingInfo,
     /// MatrixMedia recording ID.
-    #[serde(rename = "com.matrixmedia.recording_id")]
+    #[serde(rename = "dev.matrixmedia.recording_id")]
     pub mm_recording_id: String,
     /// MatrixMedia stream ID that produced this recording.
-    #[serde(rename = "com.matrixmedia.stream_id")]
+    #[serde(rename = "dev.matrixmedia.stream_id")]
     pub mm_stream_id: String,
     /// Host user MXID.
-    #[serde(rename = "com.matrixmedia.host_user_id")]
+    #[serde(rename = "dev.matrixmedia.host_user_id")]
     pub mm_host_user_id: String,
     /// Duration in milliseconds (duplicated at top level for easy access).
-    #[serde(rename = "com.matrixmedia.duration_ms")]
+    #[serde(rename = "dev.matrixmedia.duration_ms")]
     pub mm_duration_ms: i64,
     /// Signed CDN URL for direct playback.
     #[serde(
-        rename = "com.matrixmedia.cdn_url",
+        rename = "dev.matrixmedia.cdn_url",
         skip_serializing_if = "Option::is_none"
     )]
     pub mm_cdn_url: Option<String>,
@@ -1238,14 +1396,20 @@ pub async fn emit_feed_broadcast_started(
     room_id: &str,
     content: &FeedBroadcastStartedContent,
 ) -> Result<String, mm_core::error::MMError> {
+    emit_feed_broadcast_started_as(client, room_id, LEGACY_FEED_BROADCAST_STARTED_EVENT_TYPE, content).await
+}
+
+/// [`emit_feed_broadcast_started`] under `event_type`.
+pub async fn emit_feed_broadcast_started_as(
+    client: &HomeserverClient,
+    room_id: &str,
+    event_type: &str,
+    content: &FeedBroadcastStartedContent,
+) -> Result<String, mm_core::error::MMError> {
     let json = serde_json::to_value(content).map_err(|e| {
-        mm_core::error::MMError::Internal(format!(
-            "serialize feed broadcast.started event: {e}"
-        ))
+        mm_core::error::MMError::Internal(format!("serialize feed broadcast.started event: {e}"))
     })?;
-    client
-        .send_custom_event(room_id, FEED_BROADCAST_STARTED_EVENT_TYPE, &json)
-        .await
+    client.send_custom_event(room_id, event_type, &json).await
 }
 
 /// Emit a `com.steegler.matrixmedia.feed.broadcast.ended` timeline event.
@@ -1259,14 +1423,20 @@ pub async fn emit_feed_broadcast_ended(
     room_id: &str,
     content: &FeedBroadcastEndedContent,
 ) -> Result<String, mm_core::error::MMError> {
+    emit_feed_broadcast_ended_as(client, room_id, LEGACY_FEED_BROADCAST_ENDED_EVENT_TYPE, content).await
+}
+
+/// [`emit_feed_broadcast_ended`] under `event_type`.
+pub async fn emit_feed_broadcast_ended_as(
+    client: &HomeserverClient,
+    room_id: &str,
+    event_type: &str,
+    content: &FeedBroadcastEndedContent,
+) -> Result<String, mm_core::error::MMError> {
     let json = serde_json::to_value(content).map_err(|e| {
-        mm_core::error::MMError::Internal(format!(
-            "serialize feed broadcast.ended event: {e}"
-        ))
+        mm_core::error::MMError::Internal(format!("serialize feed broadcast.ended event: {e}"))
     })?;
-    client
-        .send_custom_event(room_id, FEED_BROADCAST_ENDED_EVENT_TYPE, &json)
-        .await
+    client.send_custom_event(room_id, event_type, &json).await
 }
 
 /// Emit a `com.steegler.matrixmedia.feed.recording.available` timeline event.
@@ -1275,14 +1445,20 @@ pub async fn emit_feed_recording_available(
     room_id: &str,
     content: &FeedRecordingAvailableContent,
 ) -> Result<String, mm_core::error::MMError> {
+    emit_feed_recording_available_as(client, room_id, LEGACY_FEED_RECORDING_AVAILABLE_EVENT_TYPE, content).await
+}
+
+/// [`emit_feed_recording_available`] under `event_type`.
+pub async fn emit_feed_recording_available_as(
+    client: &HomeserverClient,
+    room_id: &str,
+    event_type: &str,
+    content: &FeedRecordingAvailableContent,
+) -> Result<String, mm_core::error::MMError> {
     let json = serde_json::to_value(content).map_err(|e| {
-        mm_core::error::MMError::Internal(format!(
-            "serialize feed recording.available event: {e}"
-        ))
+        mm_core::error::MMError::Internal(format!("serialize feed recording.available event: {e}"))
     })?;
-    client
-        .send_custom_event(room_id, FEED_RECORDING_AVAILABLE_EVENT_TYPE, &json)
-        .await
+    client.send_custom_event(room_id, event_type, &json).await
 }
 
 #[cfg(test)]
@@ -1875,7 +2051,8 @@ mod tests {
 
     #[test]
     fn test_donation_event_type_constant() {
-        assert_eq!(DONATION_EVENT_TYPE, "com.matrixmedia.donation");
+        assert_eq!(LEGACY_DONATION_EVENT_TYPE, "com.matrixmedia.donation");
+        assert_eq!(DONATION_EVENT_TYPE, "dev.matrixmedia.donation");
     }
 
     #[test]
@@ -2016,7 +2193,7 @@ mod tests {
     fn test_subscription_tiers_event_type_constant() {
         assert_eq!(
             SUBSCRIPTION_TIERS_EVENT_TYPE,
-            "com.matrixmedia.subscription_tiers"
+            "dev.matrixmedia.subscription_tiers"
         );
     }
 
@@ -2101,7 +2278,7 @@ mod tests {
     fn test_subscription_proof_event_type_constant() {
         assert_eq!(
             SUBSCRIPTION_PROOF_EVENT_TYPE,
-            "com.matrixmedia.subscription_proof"
+            "dev.matrixmedia.subscription_proof"
         );
     }
 
@@ -2190,7 +2367,7 @@ mod tests {
 
     #[test]
     fn test_content_gate_event_type_constant() {
-        assert_eq!(CONTENT_GATE_EVENT_TYPE, "com.matrixmedia.content_gate");
+        assert_eq!(CONTENT_GATE_EVENT_TYPE, "dev.matrixmedia.content_gate");
     }
 
     #[test]
@@ -2346,7 +2523,7 @@ mod tests {
 
         // Type constant
         assert_eq!(
-            FEED_BROADCAST_STARTED_EVENT_TYPE,
+            LEGACY_FEED_BROADCAST_STARTED_EVENT_TYPE,
             "com.steegler.matrixmedia.feed.broadcast.started"
         );
     }
@@ -2377,7 +2554,7 @@ mod tests {
 
         // Type constant
         assert_eq!(
-            FEED_BROADCAST_ENDED_EVENT_TYPE,
+            LEGACY_FEED_BROADCAST_ENDED_EVENT_TYPE,
             "com.steegler.matrixmedia.feed.broadcast.ended"
         );
     }
@@ -2402,7 +2579,7 @@ mod tests {
 
         // Type constant
         assert_eq!(
-            FEED_RECORDING_AVAILABLE_EVENT_TYPE,
+            LEGACY_FEED_RECORDING_AVAILABLE_EVENT_TYPE,
             "com.steegler.matrixmedia.feed.recording.available"
         );
     }
@@ -2436,7 +2613,8 @@ mod tests {
         assert_eq!(json_empty["media"].as_array().unwrap().len(), 0);
 
         // Type constant
-        assert_eq!(FEED_POST_EVENT_TYPE, "com.steegler.matrixmedia.feed.post");
+        assert_eq!(LEGACY_FEED_POST_EVENT_TYPE, "com.steegler.matrixmedia.feed.post");
+        assert_eq!(FEED_POST_EVENT_TYPE, "dev.matrixmedia.feed.post");
     }
 
     #[test]
@@ -2485,7 +2663,7 @@ mod tests {
         );
         // Routed through emit_feed_broadcast_started with this exact type.
         assert_eq!(
-            FEED_BROADCAST_STARTED_EVENT_TYPE,
+            LEGACY_FEED_BROADCAST_STARTED_EVENT_TYPE,
             "com.steegler.matrixmedia.feed.broadcast.started"
         );
         assert_eq!(content.version, 1);
@@ -2527,7 +2705,7 @@ mod tests {
         );
         // Routed through emit_feed_broadcast_ended with this exact type.
         assert_eq!(
-            FEED_BROADCAST_ENDED_EVENT_TYPE,
+            LEGACY_FEED_BROADCAST_ENDED_EVENT_TYPE,
             "com.steegler.matrixmedia.feed.broadcast.ended"
         );
         assert_eq!(content.version, 1);
@@ -2577,7 +2755,7 @@ mod tests {
         );
         // Routed through emit_feed_recording_available with this exact type.
         assert_eq!(
-            FEED_RECORDING_AVAILABLE_EVENT_TYPE,
+            LEGACY_FEED_RECORDING_AVAILABLE_EVENT_TYPE,
             "com.steegler.matrixmedia.feed.recording.available"
         );
         assert_eq!(content.version, 1);

@@ -198,10 +198,11 @@ pub async fn fetch_muted_rooms_from(
 /// ADR-0011 with brief 7.7: clients write the mute list under both the
 /// legacy `com.steegler.matrixmedia.feed_muted` and the current name. While
 /// the legacy contract is active the LEGACY copy is the truth (an app that has
-/// not updated writes only that one), so it is read first and the current
-/// name is a fallback only when the legacy one is absent or unreadable. After
-/// the contract is retired, `<current>.feed_muted` is read first and the
-/// legacy name is the fallback.
+/// not updated writes only that one), so it is read first; after the contract
+/// is retired `<current>.feed_muted` is read first. The second name is read
+/// only when the first one does not exist (404). Any other failure of the
+/// first read (network error, other status, unreadable body) yields "no muted
+/// rooms", exactly as before this change.
 pub async fn fetch_muted_rooms_with(
     homeserver_url: &str,
     as_token: &str,
@@ -210,22 +211,37 @@ pub async fn fetch_muted_rooms_with(
 ) -> Vec<String> {
     let legacy = mm_matrix::events::LEGACY_FEED_MUTED_ACCOUNT_DATA_TYPE.to_string();
     let current = names.current(mm_core::event_namespace::EventSuffix::FeedMuted);
-    let order = if names.legacy_active() { [legacy, current] } else { [current, legacy] };
-    for data_type in &order {
-        if let Some(rooms) = fetch_muted_rooms_of(homeserver_url, as_token, user_id, data_type).await {
-            return rooms;
-        }
+    let (first, second) = if names.legacy_active() {
+        (legacy, current)
+    } else {
+        (current, legacy)
+    };
+    match fetch_muted_rooms_of(homeserver_url, as_token, user_id, &first).await {
+        MutedRead::Found(rooms) => rooms,
+        MutedRead::Failed => Vec::new(),
+        MutedRead::Absent => match fetch_muted_rooms_of(homeserver_url, as_token, user_id, &second).await {
+            MutedRead::Found(rooms) => rooms,
+            MutedRead::Absent | MutedRead::Failed => Vec::new(),
+        },
     }
-    Vec::new()
 }
 
-/// Read one account-data type; `None` when it is absent or unreadable.
+/// What one account-data read found.
+enum MutedRead {
+    Found(Vec<String>),
+    /// 404: the type was never set.
+    Absent,
+    /// Anything else: network error, other status, unreadable body.
+    Failed,
+}
+
+/// Read one account-data type.
 async fn fetch_muted_rooms_of(
     homeserver_url: &str,
     as_token: &str,
     user_id: &str,
     data_type: &str,
-) -> Option<Vec<String>> {
+) -> MutedRead {
     // `GET /_matrix/client/v3/user/{user_id}/account_data/{type}` returns
     // either the stored JSON object (200) or 404 if the account_data
     // type was never set.
@@ -246,28 +262,30 @@ async fn fetch_muted_rooms_of(
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "feed_muted account_data fetch failed");
-            return None;
+            return MutedRead::Failed;
         }
     };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return MutedRead::Absent;
+    }
     if !resp.status().is_success() {
-        return None;
+        return MutedRead::Failed;
     }
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => return None,
+        Err(_) => return MutedRead::Failed,
     };
     // Two shapes supported: `{"rooms": ["!a:hs", "!b:hs"]}` or a flat array.
-    if let Some(arr) = body.get("rooms").and_then(|v| v.as_array()) {
-        return Some(arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect());
+    let list = body
+        .get("rooms")
+        .and_then(|v| v.as_array())
+        .or_else(|| body.as_array());
+    match list {
+        Some(arr) => MutedRead::Found(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        None => MutedRead::Failed,
     }
-    if let Some(arr) = body.as_array() {
-        return Some(arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect());
-    }
-    None
 }

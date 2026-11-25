@@ -686,3 +686,60 @@ fn every_legacy_schema_has_a_dev_twin_with_the_same_payload() {
         );
     }
 }
+
+/// Brief 7.7 / audit: the second name is read only when the first one does
+/// not exist (404). Any other failure of the first read is "no muted rooms",
+/// as before ADR-0011, and never surfaces the other copy.
+#[tokio::test]
+async fn feed_muted_falls_back_only_when_the_first_copy_does_not_exist() {
+    let (stub, url) = stub_homeserver::spawn().await;
+    let active = mm_matrix::events::WriteNames::new("dev.matrixmedia", true);
+    let retired = mm_matrix::events::WriteNames::new("dev.matrixmedia", false);
+    stub.answer_get(
+        "/account_data/dev.matrixmedia.feed_muted",
+        StatusCode::OK,
+        json!({ "rooms": ["!x:example.org"] }),
+    );
+
+    // The auditor's case: the legacy read answers 502 → nothing, not room X.
+    stub.answer_get(
+        "/account_data/com.steegler.matrixmedia.feed_muted",
+        StatusCode::BAD_GATEWAY,
+        json!({ "errcode": "M_UNKNOWN" }),
+    );
+    let read = |names: mm_matrix::events::WriteNames| {
+        let url = url.clone();
+        async move {
+            mm_api::feed::fetch_muted_rooms_with(&url, "as", "@carol:example.org", &names).await
+        }
+    };
+    assert!(read(active.clone()).await.is_empty());
+
+    // An unexpected shape is a failure too, not an absence.
+    stub.answer_get(
+        "/account_data/com.steegler.matrixmedia.feed_muted",
+        StatusCode::OK,
+        json!({ "unexpected": true }),
+    );
+    assert!(read(active.clone()).await.is_empty());
+
+    // Retired: the current copy first; its failure does not fall back either.
+    stub.answer_get(
+        "/account_data/com.steegler.matrixmedia.feed_muted",
+        StatusCode::OK,
+        json!({ "rooms": ["!old:example.org"] }),
+    );
+    stub.answer_get(
+        "/account_data/dev.matrixmedia.feed_muted",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({}),
+    );
+    assert!(read(retired.clone()).await.is_empty());
+    // Absent current copy: the legacy one.
+    stub.answer_get(
+        "/account_data/dev.matrixmedia.feed_muted",
+        StatusCode::NOT_FOUND,
+        json!({ "errcode": "M_NOT_FOUND" }),
+    );
+    assert_eq!(read(retired).await, vec!["!old:example.org".to_string()]);
+}

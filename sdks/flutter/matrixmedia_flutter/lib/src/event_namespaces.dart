@@ -126,9 +126,9 @@ abstract final class MMEventSuffix {
     contentGate,
   };
 
-  /// Account-data suffixes. These are read under `dev.matrixmedia` first
-  /// with the legacy name as fallback, and written under both names
-  /// (brief 2.4); the announced write choice does not apply to them.
+  /// Account-data suffixes. Always written under two names and read with a
+  /// fallback, in an order set by the write choice (brief 7.7); see
+  /// [mmAccountDataTypesToRead] and [mmEventTypesToWrite].
   static const Set<String> accountData = {feedMuted, reactionRecents};
 
   /// The legacy full name of [suffix], or null when it has none.
@@ -162,12 +162,15 @@ bool isValidMMNamespace(String namespace) {
 
 bool _isBuiltIn(String namespace) => kMMBuiltInNamespaces.contains(namespace);
 
-/// True when [userId] looks like a Matrix user id (`@local:server`).
+/// Longest user id accepted from an announcement (brief 7.8).
+const int kMMMaxUserIdLength = 255;
+
+final RegExp _userIdPattern = RegExp(r'^@[^:\s]+:\S+$');
+
+/// True when [userId] has the form `@localpart:server` and is at most
+/// [kMMMaxUserIdLength] characters (brief 7.8).
 bool _looksLikeUserId(String userId) =>
-    userId.length > 3 &&
-    userId.startsWith('@') &&
-    userId.indexOf(':') > 1 &&
-    !userId.endsWith(':');
+    userId.length <= kMMMaxUserIdLength && _userIdPattern.hasMatch(userId);
 
 /// The server part of a Matrix user id, or null when it is not one.
 String? mmUserIdServer(String userId) {
@@ -324,21 +327,33 @@ String mmEventTypeToWrite(String suffix, {String? writeNamespace}) {
   return MMEventSuffix.legacyName(suffix) ?? '$kMMCurrentNamespace.$suffix';
 }
 
-/// Every type a client writes for [suffix]. Account data (`feed_muted`,
-/// `reaction_recents`) goes under `dev.matrixmedia.<suffix>` and the legacy
-/// name, whatever the write choice (brief 2.4); anything else is the one
-/// type [mmEventTypeToWrite] gives.
+/// Every type a client writes for [suffix], in the order to write them.
+/// Account data (`feed_muted`, `reaction_recents`) goes under two names,
+/// legacy first (brief 7.7): with a legacy write choice the legacy name and
+/// `dev.matrixmedia.<suffix>`, with a namespace the legacy name and
+/// `<namespace>.<suffix>`. A failure of the second write should be logged
+/// and not fail the operation. Anything else is the one type
+/// [mmEventTypeToWrite] gives.
 List<String> mmEventTypesToWrite(String suffix, {String? writeNamespace}) {
   if (MMEventSuffix.accountData.contains(suffix)) {
-    return _accountDataTypes(suffix);
+    final legacy = MMEventSuffix.legacyName(suffix)!;
+    return [legacy, '${writeNamespace ?? kMMCurrentNamespace}.$suffix'];
   }
   return [mmEventTypeToWrite(suffix, writeNamespace: writeNamespace)];
 }
 
-List<String> _accountDataTypes(String suffix) => [
-  '$kMMCurrentNamespace.$suffix',
-  MMEventSuffix.legacyName(suffix)!,
-];
+/// The account-data types to read for [suffix], in order: the first that
+/// exists is the value (brief 7.7). With a legacy write choice (null) the
+/// legacy copy is the truth: legacy first, then `dev.matrixmedia.<suffix>`.
+/// With a namespace: `<namespace>.<suffix>` first, then legacy.
+List<String> mmAccountDataTypesToRead(String suffix, {String? writeNamespace}) {
+  if (!MMEventSuffix.accountData.contains(suffix)) {
+    throw ArgumentError.value(suffix, 'suffix', 'not an account-data suffix');
+  }
+  final legacy = MMEventSuffix.legacyName(suffix)!;
+  if (writeNamespace == null) return [legacy, '$kMMCurrentNamespace.$suffix'];
+  return ['$writeNamespace.$suffix', legacy];
+}
 
 /// A recognised MatrixMedia event type.
 class MMEventTypeMatch {
@@ -524,11 +539,11 @@ class MMEventNamespaces {
 
   /// Every full type to read for [suffix], in the order to try them: the
   /// legacy name first, then the other built-in names, then announced
-  /// ones. Account data is `dev.matrixmedia.<suffix>` then the legacy name
-  /// (brief 2.4).
+  /// ones. Account data follows this list's write choice
+  /// ([mmAccountDataTypesToRead], brief 7.7).
   List<String> typesFor(String suffix) {
     if (MMEventSuffix.accountData.contains(suffix)) {
-      return _accountDataTypes(suffix);
+      return mmAccountDataTypesToRead(suffix, writeNamespace: writeNamespace);
     }
     final legacy = MMEventSuffix.legacyName(suffix);
     return [

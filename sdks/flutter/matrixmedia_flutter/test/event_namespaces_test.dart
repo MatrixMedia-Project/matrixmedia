@@ -282,6 +282,32 @@ void main() {
       );
     });
 
+    test('bot_user_id must be @localpart:server, at most 255 characters '
+        '(brief 7.8)', () {
+      final long = '@${'a' * 240}:example.org'; // 253 characters
+      expect(
+        MMEventNamespaceAnnouncement.tryParse(_block(bot: long))!.botUserId,
+        long,
+      );
+      for (final bad in [
+        '@${'a' * 243}:example.org', // 256 characters
+        '@:example.org',
+        '@bot:',
+        '@bot',
+        'bot:example.org',
+        '@bo t:example.org',
+        '@bot:exa mple.org',
+      ]) {
+        final a = MMEventNamespaceAnnouncement.tryParse(
+          _block(bot: bad, write: 'dev.matrixmedia'),
+        )!;
+        expect(a.botUserId, isNull, reason: bad);
+        // The rest of the block still applies.
+        expect(a.writeNamespace, 'dev.matrixmedia');
+        expect(a.read, isNotEmpty);
+      }
+    });
+
     test('a malformed bot_user_id is dropped', () {
       expect(
         MMEventNamespaceAnnouncement.tryParse(_block(bot: 'mmbot'))!.botUserId,
@@ -318,23 +344,26 @@ void main() {
       );
     });
 
-    test('account data is written under both names, whatever the write '
-        'choice (brief 2.4)', () {
-      for (final w in [null, 'dev.matrixmedia', 'org.example.media']) {
-        expect(
-          mmEventTypesToWrite(MMEventSuffix.feedMuted, writeNamespace: w),
-          ['dev.matrixmedia.feed_muted', 'com.steegler.matrixmedia.feed_muted'],
-        );
-        expect(
-          mmEventTypesToWrite(MMEventSuffix.reactionRecents, writeNamespace: w),
-          [
-            'dev.matrixmedia.reaction_recents',
-            'com.steegler.matrixmedia.reaction_recents',
-          ],
-        );
-      }
+    test('account data: legacy write choice reads legacy first, writes '
+        'both legacy first (brief 7.7)', () {
+      expect(mmEventTypesToWrite(MMEventSuffix.feedMuted), [
+        'com.steegler.matrixmedia.feed_muted',
+        'dev.matrixmedia.feed_muted',
+      ]);
+      expect(mmAccountDataTypesToRead(MMEventSuffix.reactionRecents), [
+        'com.steegler.matrixmedia.reaction_recents',
+        'dev.matrixmedia.reaction_recents',
+      ]);
+      expect(MMEventNamespaces.builtIn.typesFor(MMEventSuffix.feedMuted), [
+        'com.steegler.matrixmedia.feed_muted',
+        'dev.matrixmedia.feed_muted',
+      ]);
       expect(
         () => mmEventTypeToWrite(MMEventSuffix.feedMuted),
+        throwsArgumentError,
+      );
+      expect(
+        () => mmAccountDataTypesToRead(MMEventSuffix.feedPost),
         throwsArgumentError,
       );
       expect(MMEventNamespaces.builtIn.writeTypesFor(MMEventSuffix.feedPost), [
@@ -342,19 +371,28 @@ void main() {
       ]);
     });
 
-    test('account data is read under dev.matrixmedia first, then legacy', () {
-      final ns = MMEventNamespaces.builtIn.merge(
-        MMEventNamespaceAnnouncement.tryParse(
-          _block(read: [_entry('org.example.media')]),
+    test('account data: a namespace write choice reads it first, then '
+        'legacy, and writes both (brief 7.7)', () {
+      expect(
+        mmEventTypesToWrite(
+          MMEventSuffix.reactionRecents,
+          writeNamespace: 'org.example.media',
         ),
+        [
+          'com.steegler.matrixmedia.reaction_recents',
+          'org.example.media.reaction_recents',
+        ],
+      );
+      final ns = MMEventNamespaces.builtIn.merge(
+        MMEventNamespaceAnnouncement.tryParse(_block(write: 'dev.matrixmedia')),
       );
       expect(ns.typesFor(MMEventSuffix.feedMuted), [
         'dev.matrixmedia.feed_muted',
         'com.steegler.matrixmedia.feed_muted',
       ]);
-      expect(ns.typesFor(MMEventSuffix.reactionRecents), [
-        'dev.matrixmedia.reaction_recents',
-        'com.steegler.matrixmedia.reaction_recents',
+      expect(ns.writeTypesFor(MMEventSuffix.feedMuted), [
+        'com.steegler.matrixmedia.feed_muted',
+        'dev.matrixmedia.feed_muted',
       ]);
     });
 

@@ -1,4 +1,5 @@
-export const SDK_VERSION = "0.1.0";
+export { SDK_VERSION } from "./version";
+export * from "./eventNamespaces";
 
 export * from "./types";
 export * from "./MMClient";

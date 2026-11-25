@@ -63,9 +63,10 @@ export interface paths {
         /**
          * Create and start a stream
          * @description Creates a new live stream in the specified Matrix room. The authenticated user
-         *     becomes the host. The server creates an SFU room, publishes a
-         *     `com.matrixmedia.stream` state event, and sends an `m.notice` timeline message
-         *     with a web viewer link.
+         *     becomes the host. The server creates an SFU room, publishes the stream state
+         *     event (the legacy `com.matrixmedia.stream`, then `dev.matrixmedia.stream`;
+         *     ADR-0011) and a `feed.broadcast.started` timeline event, whose body is a
+         *     human-readable notice.
          *
          *     Only one stream may be active per room at a time (single-stream-per-room in v1).
          *
@@ -171,8 +172,9 @@ export interface paths {
         /**
          * End a stream (host only)
          * @description Ends the stream. Only the stream host may call this endpoint. The server tears
-         *     down the SFU room, clears the `com.matrixmedia.stream` state event, and sends
-         *     an `m.notice` timeline message.
+         *     down the SFU room, writes the terminal stream state event (`status: "ended"`)
+         *     under the legacy `com.matrixmedia.stream` and `dev.matrixmedia.stream` names
+         *     (ADR-0011), and sends a `feed.broadcast.ended` timeline event.
          *
          *     This endpoint is idempotent when the `Idempotency-Key` header is provided.
          */
@@ -481,7 +483,8 @@ export interface paths {
          *     or the publisher PeerConnection Failed/Closed without one). Same
          *     internal auth as `ingest/resolve`. Ends the stream through the
          *     shared host end path only when it is still active and its
-         *     `com.matrixmedia.stream` marker carries `source: "whip"`; an
+         *     stream marker (`dev.matrixmedia.stream`, else the legacy
+         *     `com.matrixmedia.stream`) carries `source: "whip"`; an
          *     app-published stream is refused (403 MM_PERMISSION_DENIED), an
          *     already-ended stream is an idempotent `200 {ended:false}`, an
          *     unknown stream is 404.
@@ -905,7 +908,8 @@ export interface paths {
          * @description Creates a donation to the host of the specified stream. Returns a Stripe
          *     Checkout URL for payment. On successful payment, Stripe fires a
          *     `checkout.session.completed` webhook which records the donation and emits
-         *     a Matrix `com.matrixmedia.donation` event for the overlay.
+         *     a Matrix donation event for the overlay (`com.matrixmedia.donation` while
+         *     the legacy contract is active, `dev.matrixmedia.donation` after; ADR-0011).
          *
          *     **Rate limit:** 5 requests per minute per user.
          */
@@ -1025,7 +1029,8 @@ export interface paths {
          * @description Creates a Stripe Checkout Session for a subscription to the specified tier.
          *     Returns a Checkout URL. On successful payment, Stripe fires a
          *     `customer.subscription.created` webhook which records the subscription and
-         *     emits a Matrix `com.matrixmedia.subscription_proof` state event.
+         *     is meant to emit a Matrix `dev.matrixmedia.subscription_proof` state event
+         *     (not sent by the server today).
          *
          *     Only one active subscription per creator per viewer.
          *
@@ -1186,7 +1191,8 @@ export interface paths {
         /**
          * Rotate the E2EE key (host only)
          * @description Generates generation+1 key material, persists it, publishes the
-         *     updated `com.matrixmedia.stream.e2ee_key` state event, and returns
+         *     updated stream E2EE key state event (legacy `com.matrixmedia.stream.e2ee_key`
+         *     and `dev.matrixmedia.stream.e2ee_key`; ADR-0011), and returns
          *     the new key so the caller can immediately re-key.
          */
         post: operations["rotateStreamKey"];
@@ -1250,7 +1256,53 @@ export interface components {
         AuthTokenRequest: {
             openid_token: components["schemas"]["OpenIdToken"];
         };
+        /**
+         * @description Which Matrix event names this server reads and writes (ADR-0011).
+         *     Absent from servers that predate it: a client then reads the
+         *     built-in namespaces and writes the legacy names. A client ignores
+         *     the block when `version` is unknown, drops invalid `read` entries,
+         *     keeps the built-in namespaces whatever is announced, and honours
+         *     `write` only when it is `"legacy"` or a namespace on `read`.
+         */
+        EventNamespaces: {
+            /**
+             * @description Format version of this block. Always 1.
+             * @example 1
+             */
+            version: number;
+            /**
+             * @description Names a client uses for the events it sends itself (`feed.post`):
+             *     `"legacy"` for the legacy names, or a namespace listed in `read`.
+             * @example legacy
+             */
+            write: string;
+            /**
+             * @description Every namespace this server writes or has written: the current one,
+             *     the built-in ones, then older ones. At most 8 entries that are not
+             *     built in.
+             */
+            read: components["schemas"]["AnnouncedNamespace"][];
+            /**
+             * @description The server's bot. Events under a namespace that is not built in are
+             *     honoured only from this sender. Omitted when not well-formed.
+             * @example @mmbot:example.org
+             */
+            bot_user_id?: string;
+        };
+        AnnouncedNamespace: {
+            /**
+             * @description Lower-case reverse-DNS namespace.
+             * @example dev.matrixmedia
+             */
+            namespace: string;
+            /**
+             * @description Payload profile of the events under it; only `v1` exists.
+             * @example v1
+             */
+            profile: string;
+        };
         AuthTokenResponse: {
+            event_namespaces?: components["schemas"]["EventNamespaces"];
             /** @description HS256 MM session JWT (15-minute TTL). Include as `Authorization: Bearer <mm_token>`. */
             mm_token: string;
             /** @description Opaque refresh token (24-hour TTL). Use with `POST /auth/refresh`. */
@@ -1334,7 +1386,7 @@ export interface components {
             /** @description Short-lived SFU access token (60s TTL). */
             sfu_token: string;
             /**
-             * @description Matrix event ID of the `com.matrixmedia.stream` state event.
+             * @description Matrix event ID of the stream's start state event. While the server's legacy contract is active this is the legacy `com.matrixmedia.stream` event (the comment-thread root); the server also writes `dev.matrixmedia.stream` (ADR-0011).
              * @example $abc123:example.com
              */
             state_event_id: string;
@@ -1395,8 +1447,10 @@ export interface components {
              */
             ended_at?: string | null;
             /**
-             * @description STARTED `com.matrixmedia.stream` state-event id; clients anchor the
-             *     stream-comments thread on this. `null` for legacy streams.
+             * @description STARTED stream state-event id; clients anchor the stream-comments
+             *     thread on this. The legacy `com.matrixmedia.stream` event while the
+             *     server's legacy contract is active, the `dev.matrixmedia.stream`
+             *     event after (ADR-0011). `null` for legacy streams.
              */
             state_event_id?: string | null;
             /**

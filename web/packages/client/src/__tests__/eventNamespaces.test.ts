@@ -7,6 +7,7 @@ import {
   parseEventNamespaces,
 } from "../eventNamespaces";
 import { MMClient, clientHeader } from "../MMClient";
+import { clientHeaders } from "../clientHeader";
 import { SDK_VERSION } from "../version";
 
 const v1 = (namespace: string) => ({ namespace, profile: "v1" });
@@ -113,6 +114,55 @@ describe("X-MM-Client", () => {
     );
     // An old server sends no block: the client writes legacy names.
     expect(out.eventNamespaces.write).toBe("legacy");
+  });
+
+  it("in a browser, goes to the page's own origin only, unless opted in", async () => {
+    vi.stubGlobal("location", { origin: "https://app.example", href: "https://app.example/x" });
+    try {
+      const ok = () =>
+        Promise.resolve(
+          new Response(JSON.stringify({ streams: [] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      const header = (f: ReturnType<typeof vi.fn>) =>
+        ((f.mock.calls[0][1] as RequestInit).headers as Record<string, string>)["X-MM-Client"];
+
+      const cross = vi.fn().mockImplementation(ok);
+      await new MMClient({ baseUrl: "https://mm.other", getToken: () => "t", fetch: cross }).listRoomStreams("!r:hs");
+      expect(header(cross)).toBeUndefined();
+
+      const optIn = vi.fn().mockImplementation(ok);
+      await new MMClient({
+        baseUrl: "https://mm.other",
+        getToken: () => "t",
+        fetch: optIn,
+        sendClientHeaderCrossOrigin: true,
+      }).listRoomStreams("!r:hs");
+      expect(header(optIn)).toMatch(/^matrixmedia-web\//);
+
+      const same = vi.fn().mockImplementation(ok);
+      await new MMClient({ baseUrl: "https://app.example", getToken: () => "t", fetch: same }).listRoomStreams("!r:hs");
+      expect(header(same)).toMatch(/^matrixmedia-web\//);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("clientHeaders follows the same rule", () => {
+    expect(clientHeaders("/_mm/client/v1/x", { platform: "viewer" })).toEqual({
+      "X-MM-Client": `matrixmedia-web/${SDK_VERSION} (viewer; build 0)`,
+    });
+    vi.stubGlobal("location", { origin: "https://app.example", href: "https://app.example/" });
+    try {
+      expect(clientHeaders("https://mm.other/x")).toEqual({});
+      expect(clientHeaders("https://mm.other/x", {}, { crossOrigin: true })).not.toEqual({});
+      expect(clientHeaders("/relative")).not.toEqual({});
+      expect(clientHeaders("/relative", false)).toEqual({});
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("can be customised or switched off", () => {

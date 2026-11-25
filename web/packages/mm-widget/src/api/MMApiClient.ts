@@ -1,3 +1,4 @@
+import { clientHeaders } from '@matrixmedia/client';
 import type { StreamInfo, AuthResponse, JoinResponse, CreateStreamResponse, MMError, MatrixOpenIdToken, RecordingInfo, RecordingsResponse, DonationFeedResponse, EntitlementCheck, AdDecision, AdCreative, AdStats, CaptionsOptIn, StreamCaptions } from '../types';
 
 /** Default request timeout in milliseconds. */
@@ -20,10 +21,18 @@ export class MMApiClient {
   /** In-flight GET dedup map: URL -> Promise. Cleared when the request settles. */
   private inflightGets = new Map<string, Promise<unknown>>();
 
-  constructor(baseUrl: string, getToken: () => string | null) {
+  /** Send `X-MM-Client` to a cross-origin mm-core too (see `clientHeaders`). */
+  private sendClientHeaderCrossOrigin: boolean;
+
+  constructor(
+    baseUrl: string,
+    getToken: () => string | null,
+    opts: { sendClientHeaderCrossOrigin?: boolean } = {},
+  ) {
     // Strip trailing slash
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.getToken = getToken;
+    this.sendClientHeaderCrossOrigin = opts.sendClientHeaderCrossOrigin ?? false;
   }
 
   // ---------------------------------------------------------------------------
@@ -320,6 +329,13 @@ export class MMApiClient {
   private headers(withAuth: boolean): Record<string, string> {
     const h: Record<string, string> = {
       'Content-Type': 'application/json',
+      // ADR-0011: identify the widget to mm-core; only same-origin unless
+      // opted in, since an older mm-core's CORS list lacks the header.
+      ...clientHeaders(
+        this.baseUrl || '/',
+        { platform: 'widget' },
+        { crossOrigin: this.sendClientHeaderCrossOrigin },
+      ),
     };
     if (withAuth) {
       const token = this.getToken();

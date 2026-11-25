@@ -1,3 +1,4 @@
+import { dashboardClientHeaders } from './clientHeader';
 import type {
   HealthResponse,
   StatsResponse,
@@ -130,6 +131,7 @@ async function request<T>(
   const token = getToken();
   const headers: Record<string, string> = {
     'Accept': 'application/json',
+    ...dashboardClientHeaders(),
     ...(options.headers as Record<string, string> | undefined),
   };
 

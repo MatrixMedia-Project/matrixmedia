@@ -40,7 +40,7 @@ import {
   type StopRecordingResult,
   type RotateKeyResult,
 } from "./types";
-import { SDK_VERSION } from "./version";
+import { formatClientHeader, isSameOrigin, X_MM_CLIENT, type ClientIdentity } from "./clientHeader";
 
 /** The API path prefix every request is mounted under. */
 const API_PREFIX = "/_mm/client/v1";
@@ -81,20 +81,21 @@ export interface MMClientOptions {
    * How this app identifies itself to mm-core in the `X-MM-Client` header
    * (`<id>/<version> (<platform>; build <build>)`), which the server counts
    * to tell updated apps from old ones. Defaults to
-   * `matrixmedia-web/<SDK_VERSION> (web; build 0)`. `false` sends no header
-   * (for a cross-origin deployment against an mm-core older than ADR-0011,
-   * whose CORS allow-list does not include the header).
+   * `matrixmedia-web/<SDK_VERSION> (web; build 0)`; `false` sends none.
    */
-  client?: { id?: string; version?: string; platform?: string; build?: string } | false;
+  client?: ClientIdentity | false;
+  /**
+   * Send `X-MM-Client` to a server on another origin too. Off by default: an
+   * mm-core older than ADR-0011 does not list the header in its CORS
+   * allow-list, and a browser would block every request. Same-origin
+   * requests, and every request outside a browser, always carry it.
+   */
+  sendClientHeaderCrossOrigin?: boolean;
 }
 
 /** The `X-MM-Client` value for `opts.client`, or `undefined` for none. */
 export function clientHeader(client: MMClientOptions["client"]): string | undefined {
-  if (client === false) return undefined;
-  const c = client ?? {};
-  const id = c.id ?? "matrixmedia-web";
-  const version = c.version ?? SDK_VERSION;
-  return `${id}/${version} (${c.platform ?? "web"}; build ${c.build ?? "0"})`;
+  return client === false ? undefined : formatClientHeader(client ?? {});
 }
 
 type HttpMethod = "GET" | "POST" | "DELETE" | "PUT";
@@ -107,6 +108,7 @@ export class MMClient {
   private readonly maxRetries: number;
   private readonly retryBaseMs: number;
   private readonly clientHeader: string | undefined;
+  private readonly clientHeaderCrossOrigin: boolean;
 
   constructor(opts: MMClientOptions) {
     // Strip trailing slashes so we don't produce "//_mm/...".
@@ -122,6 +124,7 @@ export class MMClient {
     this.maxRetries = Math.max(0, opts.maxRetries ?? 2);
     this.retryBaseMs = Math.max(0, opts.retryBaseMs ?? 250);
     this.clientHeader = clientHeader(opts.client);
+    this.clientHeaderCrossOrigin = opts.sendClientHeaderCrossOrigin ?? false;
   }
 
   // -------------------------------------------------------------------------
@@ -437,7 +440,9 @@ export class MMClient {
       const token = await this.getToken();
       const headers: Record<string, string> = { Accept: "application/json" };
       if (token) headers.Authorization = `Bearer ${token}`;
-      if (this.clientHeader) headers["X-MM-Client"] = this.clientHeader;
+      if (this.clientHeader && (this.clientHeaderCrossOrigin || isSameOrigin(url))) {
+        headers[X_MM_CLIENT] = this.clientHeader;
+      }
       const init: RequestInit = { method, headers };
       if (bodyJson !== undefined) {
         headers["Content-Type"] = "application/json";

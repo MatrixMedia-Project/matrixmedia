@@ -1,0 +1,13 @@
+{
+  "body": "🎬 New recording: Morning Show (6m 0s)",
+  "caption_url_hint": "https://mm.example.org/_mm/recordings/rec-1.en.vtt",
+  "duration_ms": "<volatile>",
+  "host": "@alice:example.org",
+  "msgtype": "m.notice",
+  "recording_id": "rec-1",
+  "stream_id": "<volatile>",
+  "summary": "A morning show.",
+  "thumbnail_url_hint": "https://mm.example.org/_mm/recordings/rec-1.jpg",
+  "title": "Morning Show",
+  "version": 1
+}

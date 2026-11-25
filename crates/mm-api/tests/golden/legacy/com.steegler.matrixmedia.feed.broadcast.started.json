@@ -1,0 +1,9 @@
+{
+  "body": "📺 @alice:example.org started a broadcast: Morning Show",
+  "host": "@alice:example.org",
+  "msgtype": "m.notice",
+  "started_at": "<volatile>",
+  "stream_id": "<volatile>",
+  "title": "Morning Show",
+  "version": 1
+}

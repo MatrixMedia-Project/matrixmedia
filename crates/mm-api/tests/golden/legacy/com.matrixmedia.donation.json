@@ -1,0 +1,12 @@
+{
+  "amount_cents": 500,
+  "color": "#FFEB3B",
+  "currency": "usd",
+  "donation_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "donor_display_name": "Bob",
+  "message": "Great stream!",
+  "pin_duration_secs": 90,
+  "stream_id": "<volatile>",
+  "tier": "yellow",
+  "version": 1
+}

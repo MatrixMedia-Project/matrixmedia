@@ -631,7 +631,9 @@ async fn recording_available_goes_out_under_the_legacy_name() {
         None,
         None,
     );
-    events::emit_feed_recording_available(&h.client, &h.room_id, &content)
+    // `announce_ready_recordings` (the end path) sends each one through this
+    // function; it picks the name from the settings.
+    mm_api::matrix_writes::emit_feed_recording_available(&h.ctx(), &h.room_id, &content)
         .await
         .expect("sent");
     let sends = h.stub.sends(LEGACY_FEED_RECORDING);
@@ -941,5 +943,161 @@ async fn pg_the_end_path_announces_ready_recordings_under_the_legacy_name() {
     assert_eq!(
         ours[0]["thumbnail_url_hint"],
         format!("{PUBLIC_URL}/_mm/recordings/{rec_id}.jpg")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Golden payloads: every optional field the server sends today
+// ---------------------------------------------------------------------------
+
+/// Replace the values that change from run to run (ids, clocks, durations)
+/// with a placeholder, keeping every key.
+fn normalise(mut v: Value) -> Value {
+    const VOLATILE: &[&str] = &[
+        "stream_id",
+        "started_at_ms",
+        "updated_at_ms",
+        "ended_at_ms",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "viewer_url",
+        "rotated_at_ms",
+        "rotates_next_ms",
+    ];
+    if let Some(o) = v.as_object_mut() {
+        for (k, val) in o.iter_mut() {
+            if VOLATILE.contains(&k.as_str()) {
+                *val = json!("<volatile>");
+            } else {
+                *val = normalise(val.take());
+            }
+        }
+    }
+    v
+}
+
+/// Compare `payload` with `tests/golden/legacy/<name>.json` (written when
+/// `MM_WRITE_GOLDEN=1`). Exact key-for-key equality after [`normalise`], so a
+/// field that disappears, is renamed or changes value fails here.
+#[track_caller]
+fn assert_golden(name: &str, payload: &Value) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/legacy")
+        .join(format!("{name}.json"));
+    let actual = normalise(payload.clone());
+    if std::env::var("MM_WRITE_GOLDEN").is_ok() {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string_pretty(&actual).unwrap() + "\n").unwrap();
+        return;
+    }
+    let expected: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+    )
+    .expect("golden parses");
+    assert_eq!(
+        actual, expected,
+        "{name}: the payload differs from its golden file"
+    );
+}
+
+#[tokio::test]
+async fn every_legacy_payload_matches_its_golden_file() {
+    let h = Harness::new().await;
+    let stream = h.seed_stream("video").await;
+    // Every optional field of the active marker at once: video, E2EE, the
+    // public URL, the encoder source.
+    h.start(&stream, &e2ee_info(), Some("whip")).await;
+    assert_golden(
+        "com.matrixmedia.stream.active",
+        &h.stub.state_puts(LEGACY_STREAM)[0].body,
+    );
+    assert_golden(
+        LEGACY_FEED_STARTED,
+        &h.stub.sends(LEGACY_FEED_STARTED)[0].body,
+    );
+
+    let key = E2eeKeyEvent {
+        stream_id: stream.id.clone(),
+        algorithm: "aes-gcm-256".into(),
+        key_id: "0011223344556677".into(),
+        key_generation: 2,
+        key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+        rotated_at_ms: 1_765_000_000_000,
+        rotates_next_ms: Some(1_765_000_600_000),
+    };
+    mm_api::matrix_writes::publish_stream_e2ee_key(&h.ctx(), &h.room_id, &key)
+        .await
+        .expect("key");
+    assert_golden(LEGACY_E2EE_KEY, &h.stub.state_puts(LEGACY_E2EE_KEY)[0].body);
+
+    let mut row = h.stored(&stream).await;
+    row.e2ee_enabled = true;
+    row.feed_started_event_id = Some("$started:stub".into());
+    let before = h.stub.state_puts(LEGACY_STREAM).len();
+    let sfu = NoSfu;
+    let ctx = EndContext {
+        marker: h.ctx(),
+        sfu: &sfu,
+        switch: None,
+        pg_pool: None,
+        public_url: PUBLIC_URL,
+        switch_call_timeout: Duration::from_secs(1),
+    };
+    mm_api::stream_lifecycle::end_and_finalise_stream_with_reason(
+        &ctx,
+        &row,
+        RecordingRelease::Publish,
+        Some("This broadcast has been ended because the balance ran out."),
+    )
+    .await
+    .expect("end");
+    assert_golden(
+        "com.matrixmedia.stream.ended",
+        &h.stub.state_puts(LEGACY_STREAM)[before].body,
+    );
+    assert_golden(
+        "com.matrixmedia.stream.e2ee_key.cleared",
+        &h.stub.state_puts(LEGACY_E2EE_KEY).last().unwrap().body,
+    );
+    assert_golden(LEGACY_FEED_ENDED, &h.stub.sends(LEGACY_FEED_ENDED)[0].body);
+
+    let recording = events::build_feed_recording_available(
+        &stream.id,
+        "rec-1",
+        HOST,
+        Some("Morning Show"),
+        360_000,
+        Some(format!("{PUBLIC_URL}/_mm/recordings/rec-1.jpg")),
+        Some(format!("{PUBLIC_URL}/_mm/recordings/rec-1.en.vtt")),
+        Some("A morning show.".into()),
+    );
+    mm_api::matrix_writes::emit_feed_recording_available(&h.ctx(), &h.room_id, &recording)
+        .await
+        .expect("recording");
+    assert_golden(
+        LEGACY_FEED_RECORDING,
+        &h.stub.sends(LEGACY_FEED_RECORDING)[0].body,
+    );
+
+    let donation = DonationEventContent {
+        donation_id: "b2c3d4e5-f6a7-8901-bcde-f12345678901".into(),
+        stream_id: stream.id.clone(),
+        donor_display_name: "Bob".into(),
+        amount_cents: 500,
+        currency: "usd".into(),
+        message: Some("Great stream!".into()),
+        tier: "yellow".into(),
+        pin_duration_secs: 90,
+        color: "#FFEB3B".into(),
+        version: 1,
+    };
+    mm_api::matrix_writes::emit_donation(&h.ctx(), &h.room_id, &donation)
+        .await
+        .expect("donation");
+    assert_golden(LEGACY_DONATION, &h.stub.sends(LEGACY_DONATION)[0].body);
+    assert_golden(
+        "m.room.message.donation_notice",
+        &h.stub.sends("m.room.message")[0].body,
     );
 }

@@ -1,0 +1,27 @@
+{
+  "e2ee_algorithm": "aes-gcm-256",
+  "e2ee_enabled": true,
+  "e2ee_key_generation": 1,
+  "e2ee_key_id": "0011223344556677",
+  "federation_enabled": false,
+  "host_user_id": "@alice:example.org",
+  "marker_generation": 1,
+  "media_type": "video",
+  "mm_matrix_server": "example.org",
+  "mm_server_url": "https://mm.example.org",
+  "participant_count": 1,
+  "source": "whip",
+  "started_at_ms": "<volatile>",
+  "status": "active",
+  "stream_id": "<volatile>",
+  "title": "Morning Show",
+  "updated_at_ms": "<volatile>",
+  "video_config": {
+    "max_bitrate": 2500000,
+    "max_frame_rate": 30,
+    "max_height": 720,
+    "max_width": 1280,
+    "simulcast_enabled": true
+  },
+  "viewer_url": "<volatile>"
+}

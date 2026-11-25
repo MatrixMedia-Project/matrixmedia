@@ -1,0 +1,13 @@
+{
+  "body": "@alice:example.org's broadcast ended",
+  "duration_ms": "<volatile>",
+  "ended_at": "<volatile>",
+  "host": "@alice:example.org",
+  "m.relates_to": {
+    "event_id": "$started:stub",
+    "rel_type": "m.reference"
+  },
+  "msgtype": "m.notice",
+  "stream_id": "<volatile>",
+  "version": 1
+}

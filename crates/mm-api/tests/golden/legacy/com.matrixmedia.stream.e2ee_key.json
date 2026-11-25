@@ -1,0 +1,9 @@
+{
+  "algorithm": "aes-gcm-256",
+  "key_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "key_generation": 2,
+  "key_id": "0011223344556677",
+  "rotated_at_ms": "<volatile>",
+  "rotates_next_ms": "<volatile>",
+  "stream_id": "<volatile>"
+}

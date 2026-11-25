@@ -109,9 +109,10 @@ impl AppserviceHandler {
 
     /// Also read the namespaces in `extra` (namespaces this server has written
     /// besides the built-in ones; invalid entries are dropped). The feed
-    /// indexer gets the same list. Events under a namespace that is not built
-    /// in count only when the bot sent them (rule 5), which the indexer
-    /// enforces.
+    /// indexer gets the same list. Server-written events under a namespace
+    /// that is not built in count only when the bot sent them (rule 5);
+    /// client-written ones (`feed.post`) are taken from any sender, since
+    /// every extra namespace here is one this server announces (brief 8.5).
     pub fn with_read_namespaces<I, S>(mut self, extra: I) -> Self
     where
         I: IntoIterator<Item = S>,

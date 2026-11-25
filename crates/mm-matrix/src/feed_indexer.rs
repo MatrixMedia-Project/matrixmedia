@@ -230,9 +230,9 @@ impl FeedIndexer {
 
     /// Read feed events under these namespaces too (the appservice handler
     /// passes the built-in list plus every namespace the server has written).
-    /// An event under a namespace that is not built in is indexed only when
-    /// the bot sent it and its suffix is one the server writes (ADR-0011
-    /// section 4, rule 5).
+    /// Under a namespace that is not built in, a server-written type is
+    /// indexed only when the bot sent it (ADR-0011 section 4, rule 5); a
+    /// client-written type from any sender (brief 8.5).
     pub fn set_read_namespaces(&mut self, namespaces: Arc<Vec<String>>) {
         self.read_namespaces = namespaces;
     }
@@ -273,12 +273,17 @@ impl FeedIndexer {
         else {
             return Ok(false);
         };
-        // Rule 5: a name that is not built in is trusted only from the bot, and
-        // only for the suffixes the server writes (never a client's feed.post).
-        if !is_builtin(&namespace) {
+        // Rule 5: under a name that is not built in, a server-written type is
+        // trusted only from the bot. Every non-built-in name on this list is
+        // one this server writes or has written (the appservice handler builds
+        // it from the setting and the history), and the announcement tells
+        // clients to write `<namespace>.feed.post` there, so client-written
+        // types under it are taken from any sender, as under the built-in
+        // names (brief 8.5).
+        if !is_builtin(&namespace) && suffix.server_written() {
             let sender = event.get("sender").and_then(|s| s.as_str()).unwrap_or_default();
-            if !suffix.server_written() || sender != self.bot_user_id {
-                debug!(event_type, sender, "feed event under an announced namespace not from the bot; skipped");
+            if sender != self.bot_user_id {
+                debug!(event_type, sender, "server-written feed event under an announced namespace not from the bot; skipped");
                 return Ok(false);
             }
         }
@@ -853,12 +858,42 @@ mod tests {
         // A member posing as the bot under the announced name: skipped.
         let ev = from("@mallory:localhost", "org.example.media.feed.broadcast.started");
         assert!(!indexer.handle_event(&ev).await.unwrap());
-        // A client-written type is never taken from a non-built-in name, even from the bot.
-        let ev = from("@mmbot:localhost", "org.example.media.feed.post");
-        assert!(!indexer.handle_event(&ev).await.unwrap());
         // A namespace not on the list at all: not a feed event.
         let ev = from("@mmbot:localhost", "org.other.feed.broadcast.started");
         assert!(!indexer.handle_event(&ev).await.unwrap());
+    }
+
+    /// Brief 8.5: a client-written `feed.post` under the server's own
+    /// (announced) namespace is indexed from any sender. The resolver being
+    /// asked for members shows the event got past the namespace rule; the
+    /// database is never reachable here, so nothing is inserted.
+    #[tokio::test]
+    async fn a_client_post_under_the_servers_own_namespace_is_accepted_from_a_member() {
+        struct Seen(std::sync::atomic::AtomicBool);
+        #[async_trait]
+        impl MemberResolver for Seen {
+            async fn joined_members(&self, _: &str) -> Result<Vec<String>, mm_core::error::MMError> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+        let seen = Arc::new(Seen(std::sync::atomic::AtomicBool::new(false)));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://unused@127.0.0.1:9/unused")
+            .expect("lazy pool");
+        let mut indexer = FeedIndexer::new(pool, seen.clone(), "localhost", "@mmbot:localhost");
+        let mut list: Vec<String> = BUILTIN_READ_NAMESPACES.iter().map(|s| s.to_string()).collect();
+        list.push("org.example.media".to_string());
+        indexer.set_read_namespaces(Arc::new(list));
+        let ev = serde_json::json!({
+            "type": "org.example.media.feed.post", "room_id": "!r:localhost", "event_id": "$p",
+            "sender": "@alice:localhost",
+            "content": { "version": 1, "body": "x", "msgtype": "m.notice", "post_id": "p",
+                         "author": "@alice:localhost", "text": "hi" }
+        });
+        let _ = indexer.handle_event(&ev).await;
+        assert!(seen.0.load(std::sync::atomic::Ordering::SeqCst), "the post was taken past rule 5");
     }
 
     /// A resolver that answers power levels too.

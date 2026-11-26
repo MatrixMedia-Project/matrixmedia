@@ -157,3 +157,16 @@ var whipSessionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "mm_switch_whip_sessions",
 	Help: "Live WHIP sessions.",
 })
+
+// Resend requests from viewers (the sequence numbers inside their NACKs), by what the
+// resend limit did with them: allowed (passed to the responder) or limited (removed:
+// asked for too often, too soon, beyond the stream's allowance, or never sent). Programme
+// egress is counted in mm_switch_egress_bytes_total and resends are not, so a sustained
+// "limited" rate is the one sign that a viewer or a link is asking for more than it can take.
+var resendRequestsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "mm_switch_resend_requests_total",
+		Help: "Packets viewers asked to be sent again, by result: allowed, limited (see resend_limit.go).",
+	},
+	[]string{"result"},
+)

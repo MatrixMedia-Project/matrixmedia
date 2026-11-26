@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'event_namespaces.dart';
 import 'mm_types.dart';
 import 'mm_error.dart';
 
@@ -10,8 +12,53 @@ class MMApiClient {
   String? _mmToken;
   String? _refreshToken;
 
-  MMApiClient({required this.baseUrl, http.Client? httpClient})
-      : _http = httpClient ?? http.Client();
+  /// Value of the `X-MM-Client` header sent on every request, or null to
+  /// send none. Build it with [formatMMClientHeader].
+  String? clientHeader;
+
+  /// A header value still being resolved (for example while the app reads
+  /// its own version). While [clientHeader] is null, requests wait for it,
+  /// at most [clientHeaderWait], so the first token exchange can carry the
+  /// header; after that the request is sent without it (brief 7.5). One
+  /// wait at most: requests made after it ended do not wait again, and a
+  /// late answer still sets [clientHeader] for them.
+  Future<String?>? pendingClientHeader;
+
+  /// The longest any request waits for [pendingClientHeader].
+  final Duration clientHeaderWait;
+
+  /// On web, also send `X-MM-Client` when [baseUrl] is on another origin
+  /// than the page. Off by default: a server whose CORS allow-list lacks
+  /// the header would make the browser block every request (brief 8.4).
+  /// Other platforms always send it.
+  bool sendClientHeaderCrossOrigin;
+
+  /// Test hooks for [mmMaySendClientHeader]'s platform inputs.
+  @visibleForTesting
+  bool? debugIsWeb;
+  @visibleForTesting
+  Uri? debugPageUri;
+
+  Future<void>? _headerWait;
+
+  /// Called after every successful token exchange or refresh with the
+  /// announcement it carried, or null when it carried none.
+  void Function(MMEventNamespaceAnnouncement? announcement)? onEventNamespaces;
+
+  MMEventNamespaceAnnouncement? _eventNamespaces;
+
+  MMApiClient({
+    required this.baseUrl,
+    http.Client? httpClient,
+    this.clientHeader,
+    this.pendingClientHeader,
+    this.clientHeaderWait = const Duration(seconds: 2),
+    this.sendClientHeaderCrossOrigin = false,
+  }) : _http = httpClient ?? http.Client();
+
+  /// The `event_namespaces` block of the latest token exchange or refresh,
+  /// or null when that response had none (or no exchange happened yet).
+  MMEventNamespaceAnnouncement? get eventNamespaces => _eventNamespaces;
 
   /// Set the current MM JWT token.
   void setToken(String token, String refreshToken) {
@@ -31,9 +78,17 @@ class MMApiClient {
   // HTTP helpers
   // -----------------------------------------------------------------------
 
-  Map<String, String> get _headers => {
+  Map<String, String> _headersFor(Uri uri) => {
         'Content-Type': 'application/json',
         if (_mmToken != null) 'Authorization': 'Bearer $_mmToken',
+        if (clientHeader != null &&
+            mmMaySendClientHeader(
+              uri,
+              isWeb: debugIsWeb ?? kIsWeb,
+              page: debugPageUri ?? Uri.base,
+              crossOriginOptIn: sendClientHeaderCrossOrigin,
+            ))
+          'X-MM-Client': clientHeader!,
       };
 
   Future<Map<String, dynamic>> _request(
@@ -45,7 +100,8 @@ class MMApiClient {
     bool isRetry = false,
   }) async {
     final uri = Uri.parse('$baseUrl$apiPrefix$path');
-    final headers = {..._headers, ...?extraHeaders};
+    await _waitForClientHeader();
+    final headers = {..._headersFor(uri), ...?extraHeaders};
 
     late http.Response res;
     switch (method) {
@@ -103,6 +159,27 @@ class MMApiClient {
     throw ex;
   }
 
+  /// Wait, bounded and shared by concurrent requests, for
+  /// [pendingClientHeader]. Never throws.
+  Future<void> _waitForClientHeader() {
+    final pending = pendingClientHeader;
+    if (clientHeader != null || pending == null) return Future.value();
+    return _headerWait ??= () async {
+      // A late answer still fills the header for later requests.
+      pending.then((v) {
+        if (v != null) clientHeader ??= v;
+      }, onError: (_) {}).ignore();
+      try {
+        final v = await pending.timeout(clientHeaderWait);
+        if (v != null) clientHeader ??= v;
+      } catch (_) {
+        // Timed out or failed: send without the header.
+      }
+      if (identical(pendingClientHeader, pending)) pendingClientHeader = null;
+      _headerWait = null;
+    }();
+  }
+
   // -----------------------------------------------------------------------
   // Auth
   // -----------------------------------------------------------------------
@@ -114,7 +191,18 @@ class MMApiClient {
     });
     final result = MMAuthResult.fromJson(data);
     setToken(result.mmToken, result.refreshToken);
+    _recordEventNamespaces(result);
     return result;
+  }
+
+  void _recordEventNamespaces(MMAuthResult result) {
+    _eventNamespaces = result.eventNamespaces;
+    try {
+      onEventNamespaces?.call(result.eventNamespaces);
+    } catch (_) {
+      // The listener's failure must not fail a token exchange that has
+      // already succeeded and set the token.
+    }
   }
 
   /// Refresh the MM JWT using the refresh token.
@@ -125,6 +213,7 @@ class MMApiClient {
     });
     final result = MMAuthResult.fromJson(data);
     setToken(result.mmToken, result.refreshToken);
+    _recordEventNamespaces(result);
     return result;
   }
 

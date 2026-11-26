@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,6 +102,110 @@ func TestCascadeLoopbackRTPFlowsFromOriginToRelaySubscriber(t *testing.T) {
 	if mediaSwitch.ListViewers()[0].CurrentSource != sourceID {
 		t.Fatalf("B3: cascade viewer's current_source = %q, want %q — it was never attached to the programme source", mediaSwitch.ListViewers()[0].CurrentSource, sourceID)
 	}
+}
+
+// ─── Two hops: origin → relay A → relay B, real RTP all the way ─────────────────────────
+//
+// The media-path work feeds a new relay from the closest RELAY rather than from the origin,
+// which only holds if a relay can itself be the upstream of another relay. This test pins
+// that: relay A cascades stream-b1 from the origin, relay B cascades it from relay A, and
+// one viewer on relay B receives the origin's RTP.
+//
+// Origin and relay A both answer viewer offers through the production route
+// (wrapViewerOfferAuth + handleViewerOffer), each with its own secret and its own
+// MediaSwitch — see viewerOfferServerFor for how two switches share one process. Relay B
+// is a bare CascadeSource with one subscriber, the same shape as the single-hop test's
+// relay.
+func TestCascadeTwoHopsRTPFlowsFromOriginThroughRelayToRelay(t *testing.T) {
+	const (
+		originSecret = "origin-secret"
+		relayASecret = "relay-a-secret"
+		relayANodeID = "relay-a"
+		relayBNodeID = "relay-b"
+	)
+	sourceID := switch_source_id_for_test("b1") // "stream-b1"
+	future := time.Now().Add(time.Hour).Unix()
+
+	origin := NewMediaSwitch()
+	relayA := NewMediaSwitch()
+	setSwitch(origin)
+
+	prog := newTestProgrammeSource()
+	origin.AddSource(sourceID, prog)
+	defer prog.Stop()
+
+	originSrv := viewerOfferServerFor(origin, originSecret)
+	defer originSrv.Close()
+
+	// Hop 1: relay A cascades from the origin, with a token the origin's secret signed.
+	cascadeA, err := NewCascadeSource(sourceID, originSrv.URL,
+		mintCascadeTokenForTest(originSecret, sourceID, relayANodeID, future), relayANodeID)
+	if err != nil {
+		t.Fatalf("relay A could not cascade from the origin: %v", err)
+	}
+	defer cascadeA.Stop()
+	relayA.AddSource(sourceID, cascadeA)
+
+	relayASrv := viewerOfferServerFor(relayA, relayASecret)
+	defer relayASrv.Close()
+
+	// Hop 2: relay B cascades from relay A, with a token relay A's secret signed.
+	cascadeB, err := NewCascadeSource(sourceID, relayASrv.URL,
+		mintCascadeTokenForTest(relayASecret, sourceID, relayBNodeID, future), relayBNodeID)
+	if err != nil {
+		t.Fatalf("relay B could not cascade from relay A: %v", err)
+	}
+	defer cascadeB.Stop()
+
+	var subscriberPackets atomic.Int64
+	unsub := cascadeB.Subscribe("relay-b-viewer", func(kind string, pkt *rtp.Packet) {
+		if kind == "video" && len(pkt.Payload) > 0 {
+			subscriberPackets.Add(1)
+		}
+	})
+	defer unsub()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for subscriberPackets.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if got := subscriberPackets.Load(); got == 0 {
+		t.Fatal("no RTP reached the viewer on relay B")
+	}
+	if n := len(origin.ListViewers()); n != 1 {
+		t.Fatalf("origin has %d sessions, want exactly 1 (relay A)", n)
+	}
+	if n := len(relayA.ListViewers()); n != 1 {
+		t.Fatalf("relay A has %d sessions, want exactly 1 (relay B)", n)
+	}
+	if got, want := origin.ListViewers()[0].ID, "cascade-"+sourceID+"-"+relayANodeID; got != want {
+		t.Fatalf("origin's session id = %q, want %q (relay A's cascade viewer)", got, want)
+	}
+	if got, want := relayA.ListViewers()[0].ID, "cascade-"+sourceID+"-"+relayBNodeID; got != want {
+		t.Fatalf("relay A's session id = %q, want %q (relay B's cascade viewer)", got, want)
+	}
+}
+
+// viewerOfferMu serialises viewerOfferServerFor's requests across all its servers.
+var viewerOfferMu sync.Mutex
+
+// viewerOfferServerFor serves POST /api/viewers/offer through the production route
+// (wrapViewerOfferAuth + handleViewerOffer) against sw. handleViewerOffer reads the
+// package-level switch, which in production is the process's only one; here several
+// switches share one process, so each request points the package-level switch at sw for
+// its duration, one request at a time. A Viewer keeps the switch it was created with, so
+// nothing after the request depends on which switch the package-level one names.
+func viewerOfferServerFor(sw *MediaSwitch, secret string) *httptest.Server {
+	route := wrapViewerOfferAuth(secret, []string{roleServer, roleViewer}, handleViewerOffer)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/viewers/offer", func(w http.ResponseWriter, r *http.Request) {
+		viewerOfferMu.Lock()
+		defer viewerOfferMu.Unlock()
+		setSwitch(sw)
+		route.ServeHTTP(w, r)
+	})
+	return httptest.NewServer(mux)
 }
 
 // ─── B2: the relay's /api/sources/cascade endpoint demands a server bearer ──────────────

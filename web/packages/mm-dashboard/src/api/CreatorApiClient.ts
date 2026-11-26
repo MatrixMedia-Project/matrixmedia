@@ -1,3 +1,4 @@
+import { dashboardClientHeaders } from './clientHeader';
 // Creator self-service endpoints under /_mm/client/v1/creator/me/*.
 // All calls use the same session token as the admin API; the backend scopes
 // every action to the authenticated Matrix user.
@@ -41,6 +42,7 @@ async function errorFrom(res: Response): Promise<CreatorApiError> {
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
+    ...dashboardClientHeaders(),
     ...(options.headers as Record<string, string> | undefined),
   };
   const token = getToken();
@@ -327,6 +329,7 @@ const CLIENT_BASE = '/_mm/client/v1';
 async function clientRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
+    ...dashboardClientHeaders(),
     ...(init.headers as Record<string, string> | undefined),
   };
   const token = getToken();

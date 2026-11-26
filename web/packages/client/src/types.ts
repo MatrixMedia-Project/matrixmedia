@@ -4,6 +4,8 @@
 // exposes camelCase to consumers and maps at the network boundary (see the
 // small `map*` helpers below). Keep all SDK types in this single file.
 
+import { parseEventNamespaces, type EventNamespaces } from "./eventNamespaces";
+
 import type { components } from "./generated/api-types";
 
 // ---------------------------------------------------------------------------
@@ -231,6 +233,11 @@ export interface AuthResult {
   userId: string;
   /** Token lifetime in seconds. */
   expiresIn: number;
+  /**
+   * The server's event names (ADR-0011), validated. A server that announces
+   * nothing yields the default: built-in names, write legacy.
+   */
+  eventNamespaces: EventNamespaces;
 }
 
 interface AuthResponseWire {
@@ -238,6 +245,8 @@ interface AuthResponseWire {
   refresh_token: string;
   user_id: string;
   expires_in: number;
+  /** Absent from servers older than ADR-0011. */
+  event_namespaces?: unknown;
 }
 
 export function mapAuthResult(w: AuthResponseWire): AuthResult {
@@ -246,6 +255,7 @@ export function mapAuthResult(w: AuthResponseWire): AuthResult {
     refreshToken: w.refresh_token,
     userId: w.user_id,
     expiresIn: w.expires_in,
+    eventNamespaces: parseEventNamespaces(w.event_namespaces),
   };
 }
 

@@ -75,6 +75,13 @@ pub struct AuthTokenResponse {
     pub refresh_token: String,
     pub user_id: String,
     pub expires_in: u64,
+    /// Which Matrix event names this server reads and writes (ADR-0011).
+    /// Clients write their own events (`feed.post`, account data) under
+    /// `write`, and recognise events under every namespace in `read`. Always
+    /// sent by this server, but absent from servers that predate it, so not
+    /// required in the contract.
+    #[schema(required = false)]
+    pub event_namespaces: crate::event_namespaces::EventNamespaces,
 }
 
 /// Request body for `POST /auth/refresh`.
@@ -141,8 +148,10 @@ pub struct StreamResponse {
     pub participant_count: i32,
     pub started_at: String,
     pub ended_at: Option<String>,
-    /// STARTED `com.matrixmedia.stream` state-event id; clients anchor
-    /// the stream-comments thread on this. None for legacy streams.
+    /// STARTED stream state-event id; clients anchor the stream-comments
+    /// thread on this. The legacy `com.matrixmedia.stream` event while the
+    /// legacy contract is active, `dev.matrixmedia.stream` after (ADR-0011).
+    /// None for legacy streams.
     pub state_event_id: Option<String>,
     /// Per-content tier gate (V026). `None` = free; `Some(n)` = requires
     /// an active subscription at level >= n. Clients use this to show a
@@ -625,12 +634,15 @@ async fn auth_token(
 
     // Issue MM session JWT + refresh token.
     let (mm_token, refresh_token) = issue_session_token(&user_id, &state.jwt_signing_key)?;
+    let event_namespaces =
+        crate::event_namespaces::load(&cfg.matrix, shared.db.as_ref()).await;
 
     Ok(Json(AuthTokenResponse {
         mm_token,
         refresh_token,
         user_id,
         expires_in: 900,
+        event_namespaces,
     }))
 }
 
@@ -650,6 +662,7 @@ async fn auth_token(
     ),
 )]
 async fn auth_refresh(
+    State(shared): State<SharedState>,
     Extension(state): Extension<Arc<ClientState>>,
     Json(body): Json<AuthRefreshRequest>,
 ) -> Result<Json<AuthTokenResponse>, ApiError> {
@@ -658,12 +671,15 @@ async fn auth_refresh(
 
     // Decode the new session token to extract user_id for the response.
     let claims = mm_core::auth::validate_session_token(&mm_token, &state.jwt_signing_key)?;
+    let event_namespaces =
+        crate::event_namespaces::load(&shared.config().matrix, shared.db.as_ref()).await;
 
     Ok(Json(AuthTokenResponse {
         mm_token,
         refresh_token: new_refresh,
         user_id: claims.sub,
         expires_in: 900,
+        event_namespaces,
     }))
 }
 
@@ -708,6 +724,9 @@ pub(crate) async fn create_stream_record(
             "Failed to ensure bot in room (continuing; downstream Matrix sends may 403)"
         );
     }
+    // ADR-0011: write the MM-room marker if it is missing or out of date
+    // (best-effort; repairs any room the backfill missed).
+    crate::room_marker::ensure_room_marker_for(state, matrix_room_id).await;
 
     let room = state
         .db
@@ -859,6 +878,37 @@ pub(crate) async fn publish_stream_started(
     source: Option<&str>,
 ) -> String {
     let cfg = state.config();
+    let ctx = crate::stream_lifecycle::MarkerContext::from_state(state, &cfg);
+    publish_stream_started_with(
+        &ctx,
+        &cfg,
+        stream,
+        matrix_room_id,
+        title,
+        media_type,
+        has_video,
+        e2ee_info,
+        source,
+    )
+    .await
+}
+
+/// [`publish_stream_started`] over the slice of state it actually uses (the
+/// homeserver client, the database and a config snapshot), so the wire
+/// contract tests can drive it against a stub homeserver without an
+/// `AppState`. Same steps, same order, same best-effort error handling.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_stream_started_with(
+    ctx: &crate::stream_lifecycle::MarkerContext<'_>,
+    cfg: &mm_core::config::Config,
+    stream: &mm_db::models::Stream,
+    matrix_room_id: &str,
+    title: Option<&str>,
+    media_type: &str,
+    has_video: bool,
+    e2ee_info: &Option<E2eeStreamInfo>,
+    source: Option<&str>,
+) -> String {
     let viewer_url = cfg
         .server
         .public_url
@@ -908,33 +958,28 @@ pub(crate) async fn publish_stream_started(
         source: source.map(str::to_string),
     };
 
-    let state_event_id =
-        events::publish_stream_active(&state.hs_client, matrix_room_id, &event_content)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    stream_id = %stream.id,
-                    room_id = %matrix_room_id,
-                    user_id = %stream.host_user_id,
-                    error = %e,
-                    "Failed to publish stream state event"
-                );
-                String::new()
-            });
-
-    if !state_event_id.is_empty() {
-        if let Err(e) = state
-            .db
-            .set_stream_state_event_id(&StreamId(stream.id.clone()), &state_event_id)
-            .await
-        {
-            tracing::warn!(
-                stream_id = %stream.id,
-                error = %e,
-                "Failed to persist stream state_event_id"
-            );
-        }
+    // ADR-0011: the stream marker goes out under the legacy name first (while
+    // the legacy contract is active), then under the current name. The legacy
+    // event's id stays `state_event_id`; the current one's is kept beside it.
+    let names = crate::matrix_writes::write_names(ctx);
+    let write = crate::matrix_writes::write_state(
+        ctx,
+        matrix_room_id,
+        names.state_names(mm_core::event_namespace::EventSuffix::Stream, names.legacy_active()),
+        crate::matrix_writes::StatePayload::Active(&event_content),
+    )
+    .await;
+    if let Some(e) = write.first_error() {
+        tracing::warn!(
+            stream_id = %stream.id,
+            room_id = %matrix_room_id,
+            user_id = %stream.host_user_id,
+            error = %e,
+            "Failed to publish stream state event"
+        );
     }
+    crate::matrix_writes::persist_state_ids(ctx, &stream.id, &write).await;
+    let state_event_id = write.anchor_id().unwrap_or_default().to_string();
 
     let started_at_ms = stream.started_at.timestamp_millis();
     let feed_started_content = events::build_feed_broadcast_started(
@@ -943,15 +988,11 @@ pub(crate) async fn publish_stream_started(
         title,
         started_at_ms,
     );
-    match events::emit_feed_broadcast_started(
-        &state.hs_client,
-        matrix_room_id,
-        &feed_started_content,
-    )
-    .await
+    match crate::matrix_writes::emit_feed_broadcast_started(ctx, matrix_room_id, &feed_started_content)
+        .await
     {
         Ok(event_id) => {
-            if let Err(e) = state
+            if let Err(e) = ctx
                 .db
                 .set_stream_feed_started_event_id(&StreamId(stream.id.clone()), &event_id)
                 .await
@@ -1091,7 +1132,10 @@ async fn create_stream(
             rotated_at_ms: now_ms,
             rotates_next_ms,
         };
-        if let Err(e) = events::publish_e2ee_key(&state.hs_client, &body.room_id, &key_event).await
+        let marker_ctx = crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg);
+        if let Err(e) =
+            crate::matrix_writes::publish_stream_e2ee_key(&marker_ctx, &body.room_id, &key_event)
+                .await
         {
             tracing::warn!(
                 stream_id = %stream.id,
@@ -4059,7 +4103,8 @@ async fn end_stream(
 /// 1. Verifies the stream exists, is E2EE-enabled, and the caller is the host.
 /// 2. Generates a new key with `generation = prev_generation + 1`.
 /// 3. Persists the new key (DB + history).
-/// 4. Publishes an updated `com.matrixmedia.stream.e2ee_key` state event.
+/// 4. Publishes the updated stream E2EE key state event (legacy
+///    `com.matrixmedia.stream.e2ee_key` and `dev.matrixmedia.stream.e2ee_key`, ADR-0011).
 /// 5. Returns the new key so the caller can immediately re-key.
 #[utoipa::path(
     post,
@@ -4145,8 +4190,13 @@ async fn rotate_stream_key(
             rotated_at_ms: now_ms,
             rotates_next_ms,
         };
-        if let Err(e) =
-            events::publish_e2ee_key(&state.hs_client, &room.matrix_room_id, &key_event).await
+        let marker_ctx = crate::stream_lifecycle::MarkerContext::from_state(&state, &cfg);
+        if let Err(e) = crate::matrix_writes::publish_stream_e2ee_key(
+            &marker_ctx,
+            &room.matrix_room_id,
+            &key_event,
+        )
+        .await
         {
             tracing::warn!(
                 stream_id = %stream.id,

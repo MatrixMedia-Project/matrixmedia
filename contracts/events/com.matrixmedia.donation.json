@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.donation.json",
   "title": "com.matrixmedia.donation",
+  "deprecated": true,
+  "$comment": "Legacy name (ADR-0011). New name: dev.matrixmedia.donation (dev.matrixmedia.donation.json), same payload. Kept, frozen, as the schema the legacy wire-contract tests validate against; servers keep sending this name while the legacy contract is active and every reader keeps reading it.",
   "description": "Timeline event representing a viewer donation (Super Chat) during a MatrixMedia stream. Sent as a regular room message event (not state). The tier and color determine how the donation is rendered in the stream overlay.",
   "type": "object",
   "required": [
@@ -34,14 +36,13 @@
     },
     "amount_cents": {
       "type": "integer",
-      "minimum": 100,
-      "maximum": 10000,
-      "description": "Donation amount in the smallest currency unit (cents). Range: $1.00 to $100.00 equivalent."
+      "minimum": 0,
+      "description": "Donation amount in the smallest currency unit (cents). Card donations are bounded by the server's monetization.min_donation_cents / max_donation_cents settings (defaults $1.00 to $100.00); Lightning donations carry an approximate USD-cent value converted from sats, with no floor."
     },
     "currency": {
       "type": "string",
-      "enum": ["usd", "eur", "gbp"],
-      "description": "ISO 4217 currency code (lowercase). Supported currencies for donations."
+      "enum": ["usd", "eur", "gbp", "sats"],
+      "description": "ISO 4217 currency code (lowercase) for card donations, or \"sats\" for Lightning donations."
     },
     "message": {
       "type": ["string", "null"],

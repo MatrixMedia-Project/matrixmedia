@@ -256,6 +256,128 @@ impl Database for SqliteDatabase {
         Ok(())
     }
 
+    async fn set_stream_current_state_event_id(
+        &self,
+        stream_id: &StreamId,
+        event_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query("UPDATE mm_streams SET current_state_event_id = ?1 WHERE id = ?2")
+            .bind(event_id)
+            .bind(&stream_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn set_stream_current_ended_event_id(
+        &self,
+        stream_id: &StreamId,
+        event_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query("UPDATE mm_streams SET current_ended_event_id = ?1 WHERE id = ?2")
+            .bind(event_id)
+            .bind(&stream_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_stream_current_event_ids(
+        &self,
+        stream_id: &StreamId,
+    ) -> Result<(Option<String>, Option<String>), MMError> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT current_state_event_id, current_ended_event_id FROM mm_streams WHERE id = ?1",
+        )
+        .bind(&stream_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    async fn get_room_marker(
+        &self,
+        matrix_room_id: &str,
+    ) -> Result<Option<(String, String)>, MMError> {
+        sqlx::query_as("SELECT event_id, content_hash FROM mm_room_marker WHERE matrix_room_id = ?1")
+            .bind(matrix_room_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)
+    }
+
+    async fn set_room_marker(
+        &self,
+        matrix_room_id: &str,
+        event_id: &str,
+        content_hash: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "INSERT INTO mm_room_marker (matrix_room_id, event_id, content_hash, written_at) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (matrix_room_id) DO UPDATE SET event_id = excluded.event_id, \
+             content_hash = excluded.content_hash, written_at = excluded.written_at",
+        )
+        .bind(matrix_room_id)
+        .bind(event_id)
+        .bind(content_hash)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn get_room_marker_pin(&self, matrix_room_id: &str) -> Result<Option<String>, MMError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT pin_hash FROM mm_room_marker WHERE matrix_room_id = ?1")
+                .bind(matrix_room_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    async fn set_room_marker_pin(
+        &self,
+        matrix_room_id: &str,
+        pin_hash: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query("UPDATE mm_room_marker SET pin_hash = ?2 WHERE matrix_room_id = ?1")
+            .bind(matrix_room_id)
+            .bind(pin_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn record_event_namespace(&self, namespace: &str, profile: &str) -> Result<(), MMError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO mm_event_namespace_history (namespace, profile, first_written_at) \
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(namespace)
+        .bind(profile)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn list_event_namespaces(&self) -> Result<Vec<(String, String)>, MMError> {
+        sqlx::query_as(
+            "SELECT namespace, profile FROM mm_event_namespace_history \
+             ORDER BY first_written_at, namespace",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
     async fn bump_stream_marker_generation(
         &self,
         stream_id: &StreamId,

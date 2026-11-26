@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Matrix event namespace `dev.matrixmedia.*` (ADR-0011, phase A).** The
+  custom event types move from `com.matrixmedia.*` / `com.steegler.matrixmedia.*`
+  to `dev.matrixmedia.*` without breaking an app already in the stores:
+  - The stream state events (`stream`, `stream.e2ee_key`) are written under the
+    legacy name first, then under the new one, at start, resume, end and key
+    rotation. `state_event_id` / `ended_event_id` keep pointing at the legacy
+    events (comment threads); the new ids are stored beside them (V063).
+  - Timeline events (`donation`, the feed events) keep the legacy name while the
+    legacy contract is active. The server reads feed events and `feed_muted`
+    under every name.
+  - Settings `matrix.event_namespace` (default `dev.matrixmedia`) and
+    `matrix.event_legacy_contract` (`active`; `retired` is a deliberate,
+    file-only switch).
+  - `POST /auth/token`, `POST /auth/refresh` and the operator manifest return an
+    `event_namespaces` block: which names to write (`"legacy"` for now) and every
+    namespace the server reads or has written.
+  - The room marker `dev.matrixmedia.room_config` (content version 2) is written
+    when MatrixMedia is enabled in a room, when the owner switches it, and at
+    stream start; `POST /_mm/admin/v1/room-markers/backfill` (dry run by default)
+    writes it into existing rooms (V064). Power levels for the new state types
+    are pinned at 100 where the bot can (`matrix.pin_event_power_levels`).
+  - The feed indexer checks who sent a server-written feed event
+    (`matrix.feed_sender_check`: `off`, `log` (default), `enforce`).
+  - Metrics: `mm_matrix_events_written_total{event_type}`,
+    `mm_client_requests_total{client,version}` (from the new `X-MM-Client`
+    header; requests without it count as `unknown`),
+    `mm_feed_sender_check_total{outcome}`.
+  - Contracts: `contracts/events/dev.matrixmedia.*.json` for every type; the
+    legacy schemas are kept, frozen and marked deprecated; new frozen legacy
+    schemas for the feed types, `stream.e2ee_key` and `feed_muted`.
+  - `@matrixmedia/client`: `event_namespaces` parsing and event-type matching
+    (`parseEventNamespaces`, `matchEventType`), `AuthResult.eventNamespaces`, and
+    the `X-MM-Client` header on every request (option `client`, `false` to omit
+    it against an older mm-core whose CORS list lacks the header).
+- **Legacy wire-contract tests and REST compatibility check.** The legacy event
+  names, payloads, stored ids and notice texts are pinned by tests, and the REST
+  contracts are compared with a committed baseline
+  (`contracts/api/baselines/`): a removed route or field, a changed type or a new
+  required request field fails the build.
+
+### Fixed
+- The legacy event schemas now describe what the server sends: `source` on an
+  ingest-started stream, `reason` on a terminal stream event, and Lightning
+  donations (`currency: "sats"`, no fixed amount range).
+
 ## [0.11.0] - 2026-11-08
 
 ### Added

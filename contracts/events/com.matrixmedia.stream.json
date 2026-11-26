@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.stream.json",
   "title": "com.matrixmedia.stream",
+  "deprecated": true,
+  "$comment": "Legacy name (ADR-0011). New name: dev.matrixmedia.stream (dev.matrixmedia.stream.json), same payload. Kept, frozen, as the schema the legacy wire-contract tests validate against; servers keep sending this name while the legacy contract is active and every reader keeps reading it.",
   "description": "State event representing a MatrixMedia stream in a Matrix room. State key is the empty string (single-stream-per-room in v1). Schema v2: the active branch matches the fields the server actually emits (including the started_at_ms/updated_at_ms/marker_generation staleness fields), and stream end is signalled by an explicit status:'ended' terminal payload. The legacy empty-object clear written by pre-v2 servers remains accepted. Staleness rule for content-capable consumers: an 'active' marker whose updated_at_ms is older than auto_end_grace_secs + sweep interval + slack (~12 min with defaults) is suspect — reconcile via the MatrixMedia REST API before rendering live UI.",
   "type": "object",
   "oneOf": [
@@ -121,6 +123,11 @@
           "type": "integer",
           "minimum": 1,
           "description": "Marker publish counter: 1 at create, incremented on every republish for the same stream id (host resume, terminal event). Lets consumers detect ordering."
+        },
+        "source": {
+          "type": "string",
+          "enum": ["whip"],
+          "description": "How the broadcast is published: absent for app-published streams, \"whip\" for streams started by an encoder through an ingest key. Omitted when absent."
         }
       },
       "additionalProperties": false
@@ -149,6 +156,10 @@
           "type": "integer",
           "minimum": 1,
           "description": "Marker publish counter at end time."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the stream ended, when a viewer should be told (a demotion-ladder slate or a moderation action). Omitted when absent."
         }
       },
       "additionalProperties": false

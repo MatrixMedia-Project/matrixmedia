@@ -178,16 +178,36 @@ pub async fn run(
     //    `signup_pool` (cloned a few lines below) is the right pool here
     //    because it exists regardless of monetization enablement.
     // ---------------------------------------------------------------
+    //    ADR-0011: it reads the built-in namespaces plus the configured one and
+    //    every namespace this server has written (read once here; both
+    //    settings apply on restart).
+    let mut written_namespaces = vec![config.matrix.event_namespace.clone()];
+    match mm_db::Database::list_event_namespaces(&db).await {
+        Ok(history) => written_namespaces.extend(
+            history
+                .into_iter()
+                .filter(|(_, profile)| mm_core::event_namespace::is_known_profile(profile))
+                .map(|(namespace, _)| namespace),
+        ),
+        Err(e) => tracing::warn!(error = %e, "could not read the event namespace history"),
+    }
     let appservice_handler = AppserviceHandler::with_feed_indexer(
         hs_client.clone(),
         db.pool().clone(),
         config.matrix.server_name.clone(),
-    );
+    )
+    .with_read_namespaces(written_namespaces)
+    .with_feed_sender_check(mm_matrix::feed_indexer::SenderCheck::from_setting(
+        &config.matrix.feed_sender_check,
+    ));
 
     // ---------------------------------------------------------------
     // 7. Prometheus metrics
     // ---------------------------------------------------------------
     let metrics = Metrics::new();
+    metrics
+        .event_legacy_contract_active
+        .set(i64::from(config.matrix.legacy_contract_active()));
 
     // ---------------------------------------------------------------
     // 7b. Redis cache (optional -- shared L2 cache across instances)
@@ -480,17 +500,12 @@ pub async fn run(
     // ---------------------------------------------------------------
     // 10. Build routers
     // ---------------------------------------------------------------
-    let mut client_app = mm_api::client_router(shared_state.clone())
-        .merge(mm_api::wellknown::routes(shared_state.clone()))
-        // Unauthenticated K8s readiness probe (DB-backed). Liveness should
-        // use a static route instead — see mm_api::readyz.
-        .merge(mm_api::readyz::routes(shared_state.clone()));
-
-    // Optionally serve the built widget static files at /_mm/widget/.
+    // The client port's routes, assembled in mm_api so the route-presence
+    // test (crates/mm-api/tests/route_presence.rs) checks exactly these.
     if let Some(dir) = widget_dir.as_deref().filter(|d| !d.is_empty()) {
         info!("Serving widget static files from {dir} at /_mm/widget/");
-        client_app = client_app.merge(mm_api::widget_static_router(dir));
     }
+    let client_app = mm_api::client_port_router(shared_state.clone(), widget_dir.as_deref());
 
     let client_router = mm_api::middleware::apply_middleware(
         client_app,

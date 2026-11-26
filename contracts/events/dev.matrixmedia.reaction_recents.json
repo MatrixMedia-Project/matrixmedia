@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/dev.matrixmedia.reaction_recents.json",
+  "title": "dev.matrixmedia.reaction_recents",
+  "description": "Global account data written and read by clients only (the server never touches it): the user's recently used reactions. Clients write both this name and the legacy com.steegler.matrixmedia.reaction_recents, and read them in the order brief 7.7 gives. The content is defined by the apps; this schema only requires an object and is deliberately open (not verified against the app code here).",
+  "type": "object",
+  "examples": [
+    {}
+  ]
+}

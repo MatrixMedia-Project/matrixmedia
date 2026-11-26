@@ -340,7 +340,19 @@ async fn end_ingest_stream(
         .get_room(stream.room_id)
         .await?
         .ok_or_else(|| MMError::api(ErrorCode::NotFound, "stream room not found"))?;
-    let marker = state.hs_client.get_stream_state(&room.matrix_room_id).await?;
+    // ADR-0011: the marker under the current name first, then the legacy one
+    // (a stream started while the legacy contract was active has both; one
+    // started after it was retired has only the current name).
+    let current_type = mm_matrix::events::WriteNames::from_config(&state.config().matrix)
+        .current(mm_core::event_namespace::EventSuffix::Stream);
+    let marker = match state
+        .hs_client
+        .get_stream_state_of(&room.matrix_room_id, &current_type)
+        .await
+    {
+        Ok(Some(m)) if m.stream_id == stream.id => Some(m),
+        _ => state.hs_client.get_stream_state(&room.matrix_room_id).await?,
+    };
     let marker_source = marker.as_ref().and_then(|m| m.source.as_deref());
     // The marker must name THIS stream: a room's marker could already
     // belong to a newer broadcast.

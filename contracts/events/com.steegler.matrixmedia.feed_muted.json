@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.steegler.matrixmedia.feed_muted.json",
+  "title": "com.steegler.matrixmedia.feed_muted",
+  "deprecated": true,
+  "$comment": "Legacy name (ADR-0011). New name: dev.matrixmedia.feed_muted, same content. Apps in the stores write only this one.",
+  "description": "Global account data: the rooms a user muted in the newsfeed. Same content as dev.matrixmedia.feed_muted.",
+  "type": "object",
+  "required": [
+    "rooms"
+  ],
+  "properties": {
+    "rooms": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^!.+:.+$"
+      },
+      "uniqueItems": true,
+      "description": "Muted Matrix room ids."
+    }
+  },
+  "examples": [
+    {
+      "rooms": [
+        "!abc:example.org"
+      ]
+    },
+    {
+      "rooms": []
+    }
+  ]
+}

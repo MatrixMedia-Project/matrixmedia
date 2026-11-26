@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/com.steegler.matrixmedia.feed.broadcast.ended.json",
+  "title": "com.steegler.matrixmedia.feed.broadcast.ended",
+  "deprecated": true,
+  "$comment": "Legacy name (ADR-0011). New name: dev.matrixmedia.feed.broadcast.ended (dev.matrixmedia.feed.broadcast.ended.json), same payload. Kept, frozen, as the schema the legacy wire-contract tests validate against; servers keep sending this name while the legacy contract is active and every reader keeps reading it.",
+  "description": "Timeline event the server's bot sends when a live broadcast ends. Frozen legacy schema (ADR-0011): the payload the server sends today under the legacy name. The legacy wire-contract tests (crates/mm-api/tests/legacy_wire_contract.rs) validate real payloads against this file, so changing it changes what shipped apps are promised. The only allowed change is a new optional property that is omitted when empty.",
+  "type": "object",
+  "required": [
+    "version",
+    "body",
+    "msgtype",
+    "stream_id",
+    "ended_at",
+    "duration_ms"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version."
+    },
+    "body": {
+      "type": "string",
+      "description": "Human-readable fallback (\"<host>'s broadcast ended\"); shipped apps match \"broadcast ended\"."
+    },
+    "msgtype": {
+      "type": "string",
+      "const": "m.notice",
+      "description": "Fallback msgtype so non-MatrixMedia clients render the event as a notice."
+    },
+    "stream_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "host": {
+      "type": "string",
+      "pattern": "^@[^:]+:.+$"
+    },
+    "ended_at": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "m.relates_to": {
+      "type": "object",
+      "required": [
+        "rel_type",
+        "event_id"
+      ],
+      "properties": {
+        "rel_type": {
+          "type": "string",
+          "const": "m.reference"
+        },
+        "event_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "description": "Reference to the broadcast.started event of the same stream, when its id was stored."
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "version": 1,
+      "body": "@alice:example.org's broadcast ended",
+      "msgtype": "m.notice",
+      "stream_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "host": "@alice:example.org",
+      "ended_at": 1765000360000,
+      "duration_ms": 360000,
+      "m.relates_to": {
+        "rel_type": "m.reference",
+        "event_id": "$started:example.org"
+      }
+    }
+  ]
+}

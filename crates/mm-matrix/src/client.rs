@@ -580,7 +580,7 @@ impl HomeserverClient {
         })
     }
 
-    /// Fetch the current `com.matrixmedia.stream` state event for a room.
+    /// Fetch the current legacy `com.matrixmedia.stream` state event for a room.
     ///
     /// `GET /_matrix/client/v3/rooms/{room_id}/state/com.matrixmedia.stream/`
     ///
@@ -591,11 +591,19 @@ impl HomeserverClient {
         &self,
         room_id: &str,
     ) -> Result<Option<crate::events::StreamEventContent>, mm_core::error::MMError> {
+        self.get_stream_state_of(room_id, crate::events::LEGACY_STREAM_EVENT_TYPE)
+            .await
+    }
+
+    /// [`Self::get_stream_state`] for the stream marker under `event_type`.
+    pub async fn get_stream_state_of(
+        &self,
+        room_id: &str,
+        event_type: &str,
+    ) -> Result<Option<crate::events::StreamEventContent>, mm_core::error::MMError> {
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/state/{}/",
-            self.homeserver_url,
-            room_id,
-            crate::events::STREAM_EVENT_TYPE
+            self.homeserver_url, room_id, event_type
         );
         debug!("GET {url}");
 
@@ -634,6 +642,77 @@ impl HomeserverClient {
         let pls = self.get_power_levels(room_id).await?;
         let bot_pl = pls.users.get(&self.bot_user_id).copied().unwrap_or(0);
         Ok(bot_pl >= pls.state_default)
+    }
+
+    /// Read a room state event's raw content as the bot.
+    ///
+    /// `GET /_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}`
+    ///
+    /// `None` on 404. Used where the whole content must be written back
+    /// unchanged apart from one field (power-level pinning, ADR-0011).
+    pub async fn get_state_raw(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<serde_json::Value>, mm_core::error::MMError> {
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/{}/{}",
+            self.homeserver_url, room_id, event_type, state_key
+        );
+        debug!("GET {url}");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .send_timed(mm_core::http::DEP_SYNAPSE)
+            .await
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("get state failed: {e}")))?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "get state returned {status}"
+            )));
+        }
+        resp.json()
+            .await
+            .map(Some)
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("get state parse failed: {e}")))
+    }
+
+    /// Rooms the bot is joined to.
+    ///
+    /// `GET /_matrix/client/v3/joined_rooms`
+    pub async fn joined_rooms(&self) -> Result<Vec<String>, mm_core::error::MMError> {
+        let url = format!("{}/_matrix/client/v3/joined_rooms", self.homeserver_url);
+        debug!("GET {url}");
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .send_timed(mm_core::http::DEP_SYNAPSE)
+            .await
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("joined_rooms failed: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "joined_rooms returned {status}"
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("joined_rooms parse failed: {e}")))?;
+        Ok(body
+            .get("joined_rooms")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default())
     }
 
     // ---------------------------------------------------------------

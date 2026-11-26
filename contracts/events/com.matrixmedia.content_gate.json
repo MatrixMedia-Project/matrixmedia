@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://matrixmedia.dev/schemas/events/com.matrixmedia.content_gate.json",
   "title": "com.matrixmedia.content_gate",
+  "deprecated": true,
+  "$comment": "Legacy name (ADR-0011). New name: dev.matrixmedia.content_gate (dev.matrixmedia.content_gate.json), same payload. Kept, frozen, as the schema the legacy wire-contract tests validate against; servers keep sending this name while the legacy contract is active and every reader keeps reading it.",
   "description": "State event defining the minimum subscription tier required to view content in a Matrix room. State key is the empty string (one gate per room). When the gate is removed, the bot sets content to {} to clear the state (ungated).",
   "type": "object",
   "oneOf": [

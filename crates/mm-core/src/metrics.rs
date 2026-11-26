@@ -26,6 +26,19 @@ pub struct Metrics {
     /// failed after retries. Non-zero means rooms may carry stale "active"
     /// markers until clients reconcile via REST.
     pub stream_terminal_event_failures_total: IntCounter,
+    /// Matrix events written by the server, by event type (ADR-0011). Each
+    /// legacy and current name is its own series, so a dashboard can tell
+    /// legacy writes stopping while the legacy contract is active. The label
+    /// takes values from the protocol's suffix table under the configured and
+    /// legacy namespaces only: bounded.
+    pub matrix_events_written_total: IntCounterVec,
+    /// Failed writes under a current (non-legacy) event name, by event type
+    /// (ADR-0011, brief 8.1). While the legacy contract is active these never
+    /// fail the operation; this is where they show.
+    pub matrix_current_name_write_failures_total: IntCounterVec,
+    /// 1 while the legacy wire contract is active (ADR-0011), 0 after it is
+    /// retired. Set at startup; the alert on legacy writes stopping keys on it.
+    pub event_legacy_contract_active: IntGauge,
 
     // -- Participants ----------------------------------------------------------
     /// Current number of connected participants across all streams.
@@ -158,6 +171,36 @@ impl Metrics {
             registry
         )
         .expect("mm_stream_terminal_event_failures_total registration");
+
+        let matrix_events_written_total = register_int_counter_vec_with_registry!(
+            opts!(
+                "mm_matrix_events_written_total",
+                "Matrix events (state and timeline) written by the server, by event type"
+            ),
+            &["event_type"],
+            registry
+        )
+        .expect("mm_matrix_events_written_total registration");
+
+        let matrix_current_name_write_failures_total = register_int_counter_vec_with_registry!(
+            opts!(
+                "mm_matrix_current_name_write_failures_total",
+                "Failed Matrix event writes under a current (non-legacy) name, by event type"
+            ),
+            &["event_type"],
+            registry
+        )
+        .expect("mm_matrix_current_name_write_failures_total registration");
+
+        let event_legacy_contract_active = register_int_gauge_with_registry!(
+            opts!(
+                "mm_event_legacy_contract_active",
+                "1 while the legacy Matrix event names are written (ADR-0011), 0 after retirement"
+            ),
+            registry
+        )
+        .expect("mm_event_legacy_contract_active registration");
+        event_legacy_contract_active.set(1);
 
         let participant_count = register_int_gauge_with_registry!(
             opts!(
@@ -440,6 +483,9 @@ impl Metrics {
             streams_ended_total,
             stream_terminal_events_total,
             stream_terminal_event_failures_total,
+            matrix_events_written_total,
+            matrix_current_name_write_failures_total,
+            event_legacy_contract_active,
             participant_count,
             participant_joins_total,
             participant_leaves_total,
@@ -498,6 +544,60 @@ mod tests {
             !families.is_empty(),
             "registry should contain registered metrics"
         );
+    }
+
+    /// The ADR-0011 alerts in infra/prometheus/matrixmedia-alerts.yml name
+    /// these series; they must exist under exactly those names.
+    #[test]
+    fn the_event_namespace_alert_series_exist() {
+        let m = Metrics::new();
+        m.matrix_events_written_total.with_label_values(&["com.matrixmedia.stream"]).inc();
+        m.matrix_current_name_write_failures_total
+            .with_label_values(&["dev.matrixmedia.stream"])
+            .inc();
+        assert_eq!(m.event_legacy_contract_active.get(), 1, "active by default");
+        let names: Vec<String> = m.registry.gather().iter().map(|f| f.get_name().to_string()).collect();
+        let rules = include_str!("../../../infra/prometheus/matrixmedia-alerts.yml");
+        for series in [
+            "mm_event_legacy_contract_active",
+            "mm_matrix_events_written_total",
+            "mm_matrix_current_name_write_failures_total",
+        ] {
+            assert!(names.iter().any(|n| n == series), "{series} is exported");
+            assert!(rules.contains(series), "{series} is alerted on");
+        }
+
+        // MMLegacyEventWritesStopped compares only the dual-written state
+        // events. Writes without a legacy twin (the room marker, which is
+        // written by the backfill, enable-mm and mm-config with no stream) or
+        // timeline events must never count on the current-name side, or the
+        // alert fires with no fault.
+        let rule = rules
+            .split("- alert: MMLegacyEventWritesStopped")
+            .nth(1)
+            .expect("the rule exists")
+            .split("- alert:")
+            .next()
+            .unwrap();
+        let expr = rule.split("expr:").nth(1).unwrap().split("for:").next().unwrap();
+        let selectors: Vec<&str> = expr
+            .split("event_type=~\"")
+            .skip(1)
+            .map(|s| s.split('"').next().unwrap())
+            .collect();
+        assert_eq!(
+            selectors,
+            vec![
+                r"dev\\.matrixmedia\\.stream(\\.e2ee_key)?",
+                r"com\\.matrixmedia\\.stream(\\.e2ee_key)?",
+            ],
+            "only stream and stream.e2ee_key, current then legacy"
+        );
+        // Neither selector can reach the marker or a timeline event: the only
+        // alternatives they allow are `stream` and `stream.e2ee_key`.
+        for sel in &selectors {
+            assert!(!sel.contains("..*") && !sel.contains("room_config") && !sel.contains("feed"));
+        }
     }
 
     #[test]

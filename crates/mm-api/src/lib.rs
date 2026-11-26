@@ -16,6 +16,7 @@ pub mod client_ip;
 pub mod creator;
 pub mod discovery;
 pub mod error;
+pub mod event_namespaces;
 pub mod feed;
 pub mod fleet_boot_report;
 pub mod fleet_census;
@@ -23,6 +24,7 @@ pub mod honeypot;
 pub mod internal;
 pub mod reserved_names;
 pub mod return_pages;
+pub mod room_marker;
 pub mod rooms;
 pub mod settings_checks;
 pub mod settings_service;
@@ -40,6 +42,7 @@ pub mod pool_sync;
 pub mod rate_limit;
 pub mod state;
 pub mod ladder_actuator;
+pub mod matrix_writes;
 pub mod stream_lifecycle;
 pub mod switch_pool;
 pub mod switch_proxy;
@@ -169,6 +172,23 @@ pub fn admin_router(state: SharedState) -> Router {
 ///
 /// The files are served at `/_mm/widget/` with `index.html` appended
 /// automatically for directory requests.
+/// Every route the client port serves, as mm-server mounts it (before the
+/// shared middleware): the client API, the operator manifest
+/// (`.well-known`), the readiness probe and, when `widget_dir` is set, the
+/// built widget files.
+pub fn client_port_router(state: SharedState, widget_dir: Option<&str>) -> Router {
+    let mut app = client_router(state.clone())
+        .merge(wellknown::routes(state.clone()))
+        // Unauthenticated K8s readiness probe (DB-backed). Liveness should
+        // use a static route instead — see readyz.
+        .merge(readyz::routes(state));
+    // Optionally serve the built widget static files at /_mm/widget/.
+    if let Some(dir) = widget_dir.filter(|d| !d.is_empty()) {
+        app = app.merge(widget_static_router(dir));
+    }
+    app
+}
+
 pub fn widget_static_router(widget_dir: &str) -> Router {
     Router::new().nest_service(
         "/_mm/widget",

@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/dev.matrixmedia.feed.post.json",
+  "title": "dev.matrixmedia.feed.post",
+  "description": "Timeline event a client sends when a creator publishes a feed post. The server indexes it; it never sends it. Payload profile v1, identical to the legacy com.steegler.matrixmedia.feed.post (ADR-0011); readers accept both names.",
+  "type": "object",
+  "required": [
+    "version",
+    "body",
+    "msgtype",
+    "post_id",
+    "author",
+    "text"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version."
+    },
+    "body": {
+      "type": "string"
+    },
+    "msgtype": {
+      "type": "string",
+      "const": "m.notice",
+      "description": "Fallback msgtype so non-MatrixMedia clients render the event as a notice."
+    },
+    "post_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "author": {
+      "type": "string",
+      "pattern": "^@[^:]+:.+$"
+    },
+    "text": {
+      "type": "string"
+    },
+    "media": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "mxc"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "image",
+              "video",
+              "audio"
+            ]
+          },
+          "mxc": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "blurhash": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "scheduled_for_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "examples": [
+    {
+      "version": 1,
+      "body": "New post",
+      "msgtype": "m.notice",
+      "post_id": "01JABCDEF",
+      "author": "@alice:example.org",
+      "text": "Hello",
+      "media": []
+    }
+  ]
+}

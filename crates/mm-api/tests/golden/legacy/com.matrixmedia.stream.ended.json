@@ -1,0 +1,7 @@
+{
+  "ended_at_ms": "<volatile>",
+  "marker_generation": 2,
+  "reason": "This broadcast has been ended because the balance ran out.",
+  "status": "ended",
+  "stream_id": "<volatile>"
+}

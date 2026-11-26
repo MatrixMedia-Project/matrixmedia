@@ -16,6 +16,9 @@ use crate::state::SharedState;
 #[derive(Debug, Clone, Serialize)]
 pub struct WellKnownResponse {
     pub mm_server: MMServerInfo,
+    /// The same `event_namespaces` block the token exchange returns
+    /// (ADR-0011). Additive; no client reads the manifest for it today.
+    pub event_namespaces: crate::event_namespaces::EventNamespaces,
 }
 
 /// MM server descriptor returned by the `.well-known` endpoint.
@@ -113,7 +116,10 @@ pub fn routes(state: SharedState) -> Router {
 }
 
 async fn wellknown_handler(State(state): State<SharedState>) -> Json<WellKnownResponse> {
-    Json(build_response(&state))
+    let mut response = build_response(&state);
+    response.event_namespaces =
+        crate::event_namespaces::load(&state.config().matrix, state.db.as_ref()).await;
+    Json(response)
 }
 
 /// Build the `.well-known` response body from the server configuration.
@@ -140,6 +146,9 @@ pub fn build_response(state: &SharedState) -> WellKnownResponse {
             recording_enabled: cfg.recording.enabled,
             payment: build_payment_manifest(state),
         },
+        // Without the namespace history (a database read); the handler fills
+        // in the full block.
+        event_namespaces: crate::event_namespaces::build(&cfg.matrix, &[]),
     }
 }
 

@@ -40,6 +40,7 @@ import {
   type StopRecordingResult,
   type RotateKeyResult,
 } from "./types";
+import { formatClientHeader, isSameOrigin, X_MM_CLIENT, type ClientIdentity } from "./clientHeader";
 
 /** The API path prefix every request is mounted under. */
 const API_PREFIX = "/_mm/client/v1";
@@ -76,6 +77,25 @@ export interface MMClientOptions {
    * server `retryAfterMs` overrides this. Default: 250.
    */
   retryBaseMs?: number;
+  /**
+   * How this app identifies itself to mm-core in the `X-MM-Client` header
+   * (`<id>/<version> (<platform>; build <build>)`), which the server counts
+   * to tell updated apps from old ones. Defaults to
+   * `matrixmedia-web/<SDK_VERSION> (web; build 0)`; `false` sends none.
+   */
+  client?: ClientIdentity | false;
+  /**
+   * Send `X-MM-Client` to a server on another origin too. Off by default: an
+   * mm-core older than ADR-0011 does not list the header in its CORS
+   * allow-list, and a browser would block every request. Same-origin
+   * requests, and every request outside a browser, always carry it.
+   */
+  sendClientHeaderCrossOrigin?: boolean;
+}
+
+/** The `X-MM-Client` value for `opts.client`, or `undefined` for none. */
+export function clientHeader(client: MMClientOptions["client"]): string | undefined {
+  return client === false ? undefined : formatClientHeader(client ?? {});
 }
 
 type HttpMethod = "GET" | "POST" | "DELETE" | "PUT";
@@ -87,6 +107,8 @@ export class MMClient {
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly retryBaseMs: number;
+  private readonly clientHeader: string | undefined;
+  private readonly clientHeaderCrossOrigin: boolean;
 
   constructor(opts: MMClientOptions) {
     // Strip trailing slashes so we don't produce "//_mm/...".
@@ -101,6 +123,8 @@ export class MMClient {
     this.timeoutMs = opts.timeoutMs ?? 15000;
     this.maxRetries = Math.max(0, opts.maxRetries ?? 2);
     this.retryBaseMs = Math.max(0, opts.retryBaseMs ?? 250);
+    this.clientHeader = clientHeader(opts.client);
+    this.clientHeaderCrossOrigin = opts.sendClientHeaderCrossOrigin ?? false;
   }
 
   // -------------------------------------------------------------------------
@@ -269,7 +293,8 @@ export class MMClient {
   /**
    * Rotate a stream's E2EE key (host only). Returns the new key material so the
    * caller can immediately re-key; the server also publishes the updated
-   * `com.matrixmedia.stream.e2ee_key` state event.
+   * stream E2EE key state event (`dev.matrixmedia.stream.e2ee_key`, and the
+   * legacy `com.matrixmedia.stream.e2ee_key` while its legacy contract is active).
    */
   async rotateStreamKey(streamId: string): Promise<RotateKeyResult> {
     const body = await this.req<unknown>(
@@ -415,6 +440,9 @@ export class MMClient {
       const token = await this.getToken();
       const headers: Record<string, string> = { Accept: "application/json" };
       if (token) headers.Authorization = `Bearer ${token}`;
+      if (this.clientHeader && (this.clientHeaderCrossOrigin || isSameOrigin(url))) {
+        headers[X_MM_CLIENT] = this.clientHeader;
+      }
       const init: RequestInit = { method, headers };
       if (bodyJson !== undefined) {
         headers["Content-Type"] = "application/json";

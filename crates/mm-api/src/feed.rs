@@ -178,19 +178,83 @@ async fn fetch_muted_rooms(state: &SharedState, user_id: &str) -> Vec<String> {
 }
 
 async fn fetch_muted_rooms_uncached(state: &SharedState, user_id: &str) -> Vec<String> {
+    let cfg = state.config();
+    let names = mm_matrix::events::WriteNames::from_config(&cfg.matrix);
+    fetch_muted_rooms_with(&cfg.matrix.homeserver_url, &cfg.matrix.as_token, user_id, &names).await
+}
+
+/// The account-data read behind [`fetch_muted_rooms`] while the legacy
+/// contract is active (the default), over the two config values it uses, so
+/// it can be tested against a stub homeserver. See [`fetch_muted_rooms_with`].
+pub async fn fetch_muted_rooms_from(
+    homeserver_url: &str,
+    as_token: &str,
+    user_id: &str,
+) -> Vec<String> {
+    let names = mm_matrix::events::WriteNames::new(mm_matrix::events::EVENT_NAMESPACE, true);
+    fetch_muted_rooms_with(homeserver_url, as_token, user_id, &names).await
+}
+
+/// ADR-0011 with brief 7.7: clients write the mute list under both the
+/// legacy `com.steegler.matrixmedia.feed_muted` and the current name. While
+/// the legacy contract is active the LEGACY copy is the truth (an app that has
+/// not updated writes only that one), so it is read first; after the contract
+/// is retired `<current>.feed_muted` is read first. The second name is read
+/// only when the first one does not exist (404). Any other failure of the
+/// first read (network error, other status, unreadable body) yields "no muted
+/// rooms", exactly as before this change.
+pub async fn fetch_muted_rooms_with(
+    homeserver_url: &str,
+    as_token: &str,
+    user_id: &str,
+    names: &mm_matrix::events::WriteNames,
+) -> Vec<String> {
+    let legacy = mm_matrix::events::LEGACY_FEED_MUTED_ACCOUNT_DATA_TYPE.to_string();
+    let current = names.current(mm_core::event_namespace::EventSuffix::FeedMuted);
+    let (first, second) = if names.legacy_active() {
+        (legacy, current)
+    } else {
+        (current, legacy)
+    };
+    match fetch_muted_rooms_of(homeserver_url, as_token, user_id, &first).await {
+        MutedRead::Found(rooms) => rooms,
+        MutedRead::Failed => Vec::new(),
+        MutedRead::Absent => match fetch_muted_rooms_of(homeserver_url, as_token, user_id, &second).await {
+            MutedRead::Found(rooms) => rooms,
+            MutedRead::Absent | MutedRead::Failed => Vec::new(),
+        },
+    }
+}
+
+/// What one account-data read found.
+enum MutedRead {
+    Found(Vec<String>),
+    /// 404: the type was never set.
+    Absent,
+    /// Anything else: network error, other status, unreadable body.
+    Failed,
+}
+
+/// Read one account-data type.
+async fn fetch_muted_rooms_of(
+    homeserver_url: &str,
+    as_token: &str,
+    user_id: &str,
+    data_type: &str,
+) -> MutedRead {
     // `GET /_matrix/client/v3/user/{user_id}/account_data/{type}` returns
     // either the stored JSON object (200) or 404 if the account_data
-    // type was never set. Anything else degrades to "no muted rooms".
-    let cfg = state.config();
+    // type was never set.
     let url = format!(
-        "{}/_matrix/client/v3/user/{}/account_data/com.steegler.matrixmedia.feed_muted",
-        cfg.matrix.homeserver_url,
-        urlencoding::encode(user_id)
+        "{}/_matrix/client/v3/user/{}/account_data/{}",
+        homeserver_url,
+        urlencoding::encode(user_id),
+        data_type
     );
     let client = mm_core::http::shared();
     let resp = match client
         .get(&url)
-        .bearer_auth(&cfg.matrix.as_token)
+        .bearer_auth(as_token)
         .query(&[("user_id", user_id)])
         .send()
         .await
@@ -198,28 +262,30 @@ async fn fetch_muted_rooms_uncached(state: &SharedState, user_id: &str) -> Vec<S
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(error = %e, "feed_muted account_data fetch failed");
-            return Vec::new();
+            return MutedRead::Failed;
         }
     };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return MutedRead::Absent;
+    }
     if !resp.status().is_success() {
-        return Vec::new();
+        return MutedRead::Failed;
     }
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(_) => return MutedRead::Failed,
     };
     // Two shapes supported: `{"rooms": ["!a:hs", "!b:hs"]}` or a flat array.
-    if let Some(arr) = body.get("rooms").and_then(|v| v.as_array()) {
-        return arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
+    let list = body
+        .get("rooms")
+        .and_then(|v| v.as_array())
+        .or_else(|| body.as_array());
+    match list {
+        Some(arr) => MutedRead::Found(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        None => MutedRead::Failed,
     }
-    if let Some(arr) = body.as_array() {
-        return arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-    }
-    Vec::new()
 }

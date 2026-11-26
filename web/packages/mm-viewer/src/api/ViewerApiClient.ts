@@ -1,3 +1,4 @@
+import { clientHeaders } from '@matrixmedia/client';
 import { mapStreamInfo } from '../types';
 import type {
   StreamInfo,
@@ -35,6 +36,8 @@ export class ViewerApiClient {
   private headers(): HeadersInit {
     const h: Record<string, string> = {
       'Content-Type': 'application/json',
+      // Same origin (relative BASE): mm-core counts the viewer by version.
+      ...clientHeaders(BASE, { platform: 'viewer' }),
     };
     if (this.token) {
       h['Authorization'] = `Bearer ${this.token}`;

@@ -82,3 +82,19 @@ describe('ViewerApiClient stream mapping', () => {
     expect(info.paywall_price_sats).toBeNull();
   });
 });
+
+describe('ViewerApiClient X-MM-Client (ADR-0011)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('identifies the viewer on its same-origin requests', async () => {
+    mockFetch(stageWire);
+    await new ViewerApiClient().getStream('s1');
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0] ?? [];
+    const init = call[1] as RequestInit;
+    expect((init.headers as Record<string, string>)['X-MM-Client']).toMatch(
+      /^matrixmedia-web\/.+ \(viewer; build 0\)$/,
+    );
+  });
+});

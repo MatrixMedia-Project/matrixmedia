@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixmedia.dev/schemas/events/dev.matrixmedia.feed.recording.available.json",
+  "title": "dev.matrixmedia.feed.recording.available",
+  "description": "Timeline event the server's bot sends when a recording of a broadcast is ready to watch. Payload profile v1, identical to the legacy com.steegler.matrixmedia.feed.recording.available (ADR-0011); readers accept both names.",
+  "type": "object",
+  "required": [
+    "version",
+    "body",
+    "msgtype",
+    "stream_id",
+    "recording_id",
+    "host",
+    "duration_ms"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version."
+    },
+    "body": {
+      "type": "string",
+      "description": "Human-readable fallback. Starts with U+1F3AC; shipped apps match that prefix."
+    },
+    "msgtype": {
+      "type": "string",
+      "const": "m.notice",
+      "description": "Fallback msgtype so non-MatrixMedia clients render the event as a notice."
+    },
+    "stream_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "recording_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string",
+      "pattern": "^@[^:]+:.+$"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "thumbnail": {
+      "type": "object",
+      "required": [
+        "mxc",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "mxc": {
+          "type": "string",
+          "description": "Matrix media URI."
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blurhash": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "thumbnail_url_hint": {
+      "type": "string",
+      "pattern": "^https?://"
+    },
+    "playback_url_hint": {
+      "type": "string",
+      "pattern": "^https?://"
+    },
+    "caption_url_hint": {
+      "type": "string",
+      "pattern": "^https?://"
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "examples": [
+    {
+      "version": 1,
+      "body": "🎬 New recording: Morning Show (6m 0s)",
+      "msgtype": "m.notice",
+      "stream_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "recording_id": "rec-1",
+      "title": "Morning Show",
+      "host": "@alice:example.org",
+      "duration_ms": 360000,
+      "thumbnail_url_hint": "https://mm.example.org/_mm/recordings/rec-1.jpg"
+    }
+  ]
+}

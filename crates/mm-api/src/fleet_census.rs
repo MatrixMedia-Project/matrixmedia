@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use mm_core::switch_client::SwitchViewer;
+use mm_core::switch_client::{SwitchViewer, is_cascade_session};
 use mm_fleet::runner::{BroadcastCensus, LiveBroadcast};
 use sqlx::PgPool;
 use tokio::task::JoinSet;
@@ -43,6 +43,13 @@ fn programme_source_id(broadcast_id: &str) -> String {
 /// a single unreachable relay could stall the whole pass for up to a minute while seeding,
 /// right next to it in `sync_once`, was already concurrent with an 8 s budget.
 const CENSUS_BUDGET_PER_NODE: Duration = Duration::from_secs(8);
+
+/// Whether a listed session is a person watching: connected, and not a relay node
+/// pulling a stream through a cascade session ([`is_cascade_session`]). The switch lists
+/// both the same way; only people are audience, for the planner and for node fill alike.
+fn is_audience(v: &SwitchViewer) -> bool {
+    v.connected && !is_cascade_session(&v.id)
+}
 
 /// None (identifies the origin, which has no `mm_fleet_nodes` row) or a fan-out node's id.
 type CensusTarget = Option<mm_core::fleet::NodeId>;
@@ -132,7 +139,7 @@ impl SwitchCensus {
     async fn viewers_by_source(&self) -> HashMap<String, u32> {
         let mut counts: HashMap<String, u32> = HashMap::new();
         for (_, viewers) in self.gather().await {
-            for v in viewers.iter().filter(|v| v.connected) {
+            for v in viewers.iter().filter(|v| is_audience(v)) {
                 // An ad viewer is attributed to nothing here; the caller
                 // adds them per broadcast, because only it knows which
                 // programme the ad interrupted.
@@ -155,7 +162,7 @@ impl SwitchCensus {
             .into_iter()
             .filter_map(|(target, viewers)| {
                 let node_id = target?;
-                let n = viewers.iter().filter(|v| v.connected).count() as i64;
+                let n = viewers.iter().filter(|v| is_audience(v)).count() as i64;
                 Some((node_id, n))
             })
             .collect()
@@ -189,11 +196,11 @@ impl SwitchCensus {
         let mut per_node_per_broadcast: HashMap<(mm_core::fleet::NodeId, String), i64> =
             HashMap::new();
         for (target, viewers) in &gathered {
-            let connected: Vec<_> = viewers.iter().filter(|v| v.connected).collect();
+            let audience: Vec<_> = viewers.iter().filter(|v| is_audience(v)).collect();
             if let Some(node_id) = target {
-                per_node.insert(node_id.clone(), connected.len() as i64);
+                per_node.insert(node_id.clone(), audience.len() as i64);
             }
-            for v in &connected {
+            for v in &audience {
                 *by_source.entry(v.current_source.clone()).or_insert(0) += 1;
                 if let Some(node_id) = target {
                     if let Some(broadcast_id) = v.current_source.strip_prefix("stream-") {

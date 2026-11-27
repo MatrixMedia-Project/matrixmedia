@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use mm_core::error::{ErrorCode, ErrorResponse, MMError};
+use mm_core::switch_client::{SwitchViewer, is_cascade_session};
 use mm_core::types::{StreamId, UserId};
 use mm_db::models::Stream;
 
@@ -620,14 +621,7 @@ async fn proxy_viewer_count(
     let mut viewers: u32 = 0;
     for client in clients {
         match client.list_viewers().await {
-            Ok(list) => {
-                viewers += list
-                    .iter()
-                    .filter(|v| v.connected)
-                    // Mid ad-break still counts, as the shipped client counts it.
-                    .filter(|v| v.current_source == want || v.current_source.starts_with("ad-"))
-                    .count() as u32;
-            }
+            Ok(list) => viewers += stream_viewer_count(&list, &want),
             Err(e) => tracing::warn!(
                 node = client.base_url(),
                 error = %e,
@@ -640,6 +634,18 @@ async fn proxy_viewer_count(
         stream_id: id,
         viewers,
     }))
+}
+
+/// People watching `source_id` in one switch's viewer list: connected, on the stream or
+/// mid ad-break (the shipped client counts those too), and not a relay node pulling the
+/// stream through a cascade session — the census counts the same way.
+fn stream_viewer_count(viewers: &[SwitchViewer], source_id: &str) -> u32 {
+    viewers
+        .iter()
+        .filter(|v| v.connected)
+        .filter(|v| !is_cascade_session(&v.id))
+        .filter(|v| v.current_source == source_id || v.current_source.starts_with("ad-"))
+        .count() as u32
 }
 
 fn api_router() -> utoipa_axum::router::OpenApiRouter<SharedState> {
@@ -779,5 +785,25 @@ mod tests {
         // The token is minted and used inside one request. A long TTL would turn a
         // logged or cached header into a reusable credential for that viewer id.
         assert!(VIEWER_TOKEN_TTL_SECS <= 300);
+    }
+
+    /// The count the apps show must agree with the census: a relay pulling the
+    /// stream (`cascade-…`) is not a viewer, while a real viewer, one mid ad-break,
+    /// is. Disconnected viewers and other streams' viewers are not counted either.
+    #[test]
+    fn a_relay_pulling_the_stream_is_not_in_the_viewer_count() {
+        let viewer = |id: &str, source: &str, connected: bool| SwitchViewer {
+            id: id.to_string(),
+            current_source: source.to_string(),
+            connected,
+        };
+        let list = vec![
+            viewer("viewer-b1--alice-example.org", "stream-b1", true),
+            viewer("cascade-stream-b1-lease-1-0", "stream-b1", true),
+            viewer("viewer-b1--bob-example.org", "ad-bob", true),
+            viewer("viewer-b1--carol-example.org", "stream-b1", false),
+            viewer("viewer-b2--dave-example.org", "stream-b2", true),
+        ];
+        assert_eq!(stream_viewer_count(&list, "stream-b1"), 2);
     }
 }

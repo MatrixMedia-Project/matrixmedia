@@ -9,7 +9,8 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 
 use crate::Database;
 use crate::models::{
-    CaptionTrack, ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation,
+    CaptionTrack, ContentCategory, ContentGate, CreatorBlock, CreatorFollow, CreatorProfile,
+    Donation, FollowRoom,
     DonationStatus, InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
     ServerConfigEntry, Stream, Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry,
     UserInteraction,
@@ -1461,6 +1462,88 @@ impl Database for SqliteDatabase {
     async fn get_followed_creators(&self, _user_id: &str) -> Result<Vec<CreatorFollow>, MMError> {
         Err(MMError::Internal(
             "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_creator_followers(
+        &self,
+        _creator_user_id: &str,
+    ) -> Result<Vec<CreatorFollow>, MMError> {
+        Err(MMError::Internal(
+            "Discovery not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn upsert_follow_room(
+        &self,
+        _follower_user_id: &str,
+        _creator_user_id: &str,
+        _room_id: &str,
+    ) -> Result<FollowRoom, MMError> {
+        Err(MMError::Internal(
+            "Follow rooms not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_follow_room(
+        &self,
+        _follower_user_id: &str,
+        _creator_user_id: &str,
+    ) -> Result<Option<FollowRoom>, MMError> {
+        Err(MMError::Internal(
+            "Follow rooms not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn delete_follow_room(
+        &self,
+        _follower_user_id: &str,
+        _creator_user_id: &str,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Follow rooms not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn block_user(
+        &self,
+        _creator_user_id: &str,
+        _blocked_user_id: &str,
+    ) -> Result<CreatorBlock, MMError> {
+        Err(MMError::Internal(
+            "Creator blocks not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn unblock_user(
+        &self,
+        _creator_user_id: &str,
+        _blocked_user_id: &str,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Creator blocks not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn is_blocked_by(&self, _creator_user_id: &str, _user_id: &str) -> Result<bool, MMError> {
+        Err(MMError::Internal(
+            "Creator blocks not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn get_notify_history_visible(&self, _creator_user_id: &str) -> Result<bool, MMError> {
+        Err(MMError::Internal(
+            "Notify prefs not available in SQLite mode".into(),
+        ))
+    }
+
+    async fn set_notify_history_visible(
+        &self,
+        _creator_user_id: &str,
+        _history_visible: bool,
+    ) -> Result<(), MMError> {
+        Err(MMError::Internal(
+            "Notify prefs not available in SQLite mode".into(),
         ))
     }
 

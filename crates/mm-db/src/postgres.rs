@@ -8,8 +8,9 @@ use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamSta
 
 use crate::Database;
 use crate::models::{
-    CaptionTrack, ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation,
-    DonationStatus, InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
+    CaptionTrack, ContentCategory, ContentGate, CreatorBlock, CreatorFollow, CreatorProfile,
+    Donation, DonationStatus, FollowRoom, InteractionSummary, MockUser, Participant, Recording,
+    RecordingStatus, Room,
     ServerConfigEntry, Stream, SubscriptionTier, TrendingEntry, UserInteraction,
 };
 use crate::models::{Subscription, SubscriptionStatus};
@@ -1937,6 +1938,158 @@ impl Database for PgDatabase {
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)
+    }
+
+    async fn get_creator_followers(
+        &self,
+        creator_user_id: &str,
+    ) -> Result<Vec<CreatorFollow>, MMError> {
+        sqlx::query_as::<_, CreatorFollow>(
+            "SELECT id, user_id, creator_user_id, created_at
+             FROM mm_creator_follows
+             WHERE creator_user_id = $1
+             ORDER BY created_at ASC
+             LIMIT 5000",
+        )
+        .bind(creator_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn upsert_follow_room(
+        &self,
+        follower_user_id: &str,
+        creator_user_id: &str,
+        room_id: &str,
+    ) -> Result<FollowRoom, MMError> {
+        sqlx::query_as::<_, FollowRoom>(
+            "INSERT INTO mm_follow_rooms (follower_user_id, creator_user_id, room_id)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (follower_user_id, creator_user_id)
+             DO UPDATE SET room_id = EXCLUDED.room_id
+             RETURNING follower_user_id, creator_user_id, room_id, created_at",
+        )
+        .bind(follower_user_id)
+        .bind(creator_user_id)
+        .bind(room_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn get_follow_room(
+        &self,
+        follower_user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<Option<FollowRoom>, MMError> {
+        sqlx::query_as::<_, FollowRoom>(
+            "SELECT follower_user_id, creator_user_id, room_id, created_at
+             FROM mm_follow_rooms
+             WHERE follower_user_id = $1 AND creator_user_id = $2",
+        )
+        .bind(follower_user_id)
+        .bind(creator_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn delete_follow_room(
+        &self,
+        follower_user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "DELETE FROM mm_follow_rooms
+             WHERE follower_user_id = $1 AND creator_user_id = $2",
+        )
+        .bind(follower_user_id)
+        .bind(creator_user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn block_user(
+        &self,
+        creator_user_id: &str,
+        blocked_user_id: &str,
+    ) -> Result<CreatorBlock, MMError> {
+        sqlx::query_as::<_, CreatorBlock>(
+            "INSERT INTO mm_creator_blocks (creator_user_id, blocked_user_id)
+             VALUES ($1, $2)
+             ON CONFLICT (creator_user_id, blocked_user_id)
+             DO UPDATE SET creator_user_id = EXCLUDED.creator_user_id
+             RETURNING creator_user_id, blocked_user_id, created_at",
+        )
+        .bind(creator_user_id)
+        .bind(blocked_user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn unblock_user(
+        &self,
+        creator_user_id: &str,
+        blocked_user_id: &str,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "DELETE FROM mm_creator_blocks
+             WHERE creator_user_id = $1 AND blocked_user_id = $2",
+        )
+        .bind(creator_user_id)
+        .bind(blocked_user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn is_blocked_by(&self, creator_user_id: &str, user_id: &str) -> Result<bool, MMError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT TRUE FROM mm_creator_blocks
+             WHERE creator_user_id = $1 AND blocked_user_id = $2",
+        )
+        .bind(creator_user_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.is_some())
+    }
+
+    async fn get_notify_history_visible(&self, creator_user_id: &str) -> Result<bool, MMError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT history_visible FROM mm_creator_notify_prefs
+             WHERE creator_user_id = $1",
+        )
+        .bind(creator_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.0).unwrap_or(true))
+    }
+
+    async fn set_notify_history_visible(
+        &self,
+        creator_user_id: &str,
+        history_visible: bool,
+    ) -> Result<(), MMError> {
+        sqlx::query(
+            "INSERT INTO mm_creator_notify_prefs (creator_user_id, history_visible)
+             VALUES ($1, $2)
+             ON CONFLICT (creator_user_id)
+             DO UPDATE SET history_visible = EXCLUDED.history_visible, updated_at = now()",
+        )
+        .bind(creator_user_id)
+        .bind(history_visible)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     async fn update_trending_cache(

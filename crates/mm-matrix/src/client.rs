@@ -537,6 +537,131 @@ impl HomeserverClient {
     }
 
     // ---------------------------------------------------------------
+    // Room lifecycle as the bot (follow rooms, V065)
+    // ---------------------------------------------------------------
+
+    /// Create a room as the bot user and return its room id.
+    ///
+    /// `POST /_matrix/client/v3/createRoom`
+    ///
+    /// `body` is the raw createRoom request (visibility, creation_content,
+    /// initial_state, invite, power_level_content_override, ...), so the
+    /// caller owns the room shape. Uses appservice impersonation so the
+    /// bot is the room creator.
+    pub async fn create_room(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<String, mm_core::error::MMError> {
+        let url = format!("{}/_matrix/client/v3/createRoom", self.homeserver_url);
+        debug!("POST {url}");
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .json(body)
+            .send_timed(mm_core::http::DEP_SYNAPSE)
+            .await
+            .map_err(|e| mm_core::error::MMError::Homeserver(format!("create room failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "create room returned {status}: {body}"
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CreateRoomResponse {
+            room_id: String,
+        }
+        let parsed: CreateRoomResponse = resp.json().await.map_err(|e| {
+            mm_core::error::MMError::Homeserver(format!("create room parse failed: {e}"))
+        })?;
+        Ok(parsed.room_id)
+    }
+
+    /// Shared helper for the bot room-membership mutations below.
+    async fn room_member_action(
+        &self,
+        room_id: &str,
+        action: &str,
+        user_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), mm_core::error::MMError> {
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/{action}",
+            self.homeserver_url, room_id
+        );
+        debug!("POST {url} ({action} {user_id})");
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.as_token)
+            .query(&[("user_id", &self.bot_user_id)])
+            .json(&serde_json::json!({ "user_id": user_id, "reason": reason }))
+            .send_timed(mm_core::http::DEP_SYNAPSE)
+            .await
+            .map_err(|e| {
+                mm_core::error::MMError::Homeserver(format!("room {action} failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(mm_core::error::MMError::Homeserver(format!(
+                "room {action} returned {status}: {body}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Invite a user to a room as the bot.
+    /// `POST /_matrix/client/v3/rooms/{room_id}/invite`
+    pub async fn invite_user(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<(), mm_core::error::MMError> {
+        self.room_member_action(room_id, "invite", user_id, None).await
+    }
+
+    /// Kick a user from a room as the bot (bot needs sufficient power).
+    /// `POST /_matrix/client/v3/rooms/{room_id}/kick`
+    pub async fn kick_user(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), mm_core::error::MMError> {
+        self.room_member_action(room_id, "kick", user_id, reason).await
+    }
+
+    /// Ban a user from a room as the bot (also drops any pending invite).
+    /// `POST /_matrix/client/v3/rooms/{room_id}/ban`
+    pub async fn ban_user(
+        &self,
+        room_id: &str,
+        user_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), mm_core::error::MMError> {
+        self.room_member_action(room_id, "ban", user_id, reason).await
+    }
+
+    /// Unban a user from a room as the bot.
+    /// `POST /_matrix/client/v3/rooms/{room_id}/unban`
+    pub async fn unban_user(
+        &self,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<(), mm_core::error::MMError> {
+        self.room_member_action(room_id, "unban", user_id, None).await
+    }
+
+    // ---------------------------------------------------------------
     // get_power_levels
     // ---------------------------------------------------------------
 

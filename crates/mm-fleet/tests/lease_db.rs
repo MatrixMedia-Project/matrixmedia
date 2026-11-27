@@ -331,6 +331,35 @@ async fn a_pool_lease_is_released_only_with_force() {
     assert_eq!(lease_release_of(&pool, id).await.as_deref(), Some("force"));
 }
 
+/// A node whose desired row is not a lease at all (`lease_source` NULL: a planner row) is
+/// released without force as any node is: marked draining.
+#[tokio::test]
+async fn a_node_that_is_not_a_lease_is_drained_without_force() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_node_that_is_not_a_lease_is_drained_without_force"
+        );
+        return;
+    };
+    let id = NodeId::new("planned-not-a-lease");
+    sqlx::query(
+        "INSERT INTO mm_fleet_desired
+             (mm_node_id, flavor, ownership, region, size, destroy_deadline, purpose)
+         VALUES ($1, 'fanout', 'rented', 'eu', 'planned', now() + interval '1 hour', 'broadcast')",
+    )
+    .bind(id.as_str())
+    .execute(&pool)
+    .await
+    .expect("planner row");
+    seed_node(&pool, id.as_str(), "healthy").await;
+
+    let state = lease_db::release(&pool, &id, false)
+        .await
+        .expect("a planner row is released as before");
+    assert_eq!(state, ReleaseState::Draining);
+    assert_eq!(node_state(&pool, id.as_str()).await, "draining");
+}
+
 #[tokio::test]
 async fn forced_release_pulls_the_deadline_to_now_and_stays_evicted() {
     let Some((pool, _g)) = setup().await else {

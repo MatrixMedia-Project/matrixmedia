@@ -301,12 +301,15 @@ pub async fn release(
     let mut tx = pool.begin().await?;
 
     if !force {
-        let source: Option<String> = sqlx::query_scalar(
-            "SELECT lease_source FROM mm_fleet_desired WHERE mm_node_id = $1 FOR UPDATE",
+        // NULL (a desired row that is not a lease) or no desired row: not a pool lease. No
+        // lock: `lease_source` never changes once the row is written.
+        let source: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT lease_source FROM mm_fleet_desired WHERE mm_node_id = $1",
         )
         .bind(node_id.as_str())
         .fetch_optional(&mut *tx)
-        .await?;
+        .await?
+        .flatten();
         if source.as_deref() == Some("autoscale") {
             return Err(LeaseError::InSharedPool(node_id.clone()));
         }

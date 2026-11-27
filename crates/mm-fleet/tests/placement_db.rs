@@ -478,6 +478,44 @@ async fn terraform_needs_an_enabled_provider_with_a_module_and_a_size_for_the_ro
 }
 
 #[tokio::test]
+async fn relays_need_an_enabled_provider_with_a_fan_out_size_and_no_module() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    pdb::insert(&pool, &input("gpu", "scaleway", &[("z-a", "GPU-S")]))
+        .await
+        .unwrap();
+    assert!(
+        !placement_db::relay_capable(&pool).await.unwrap(),
+        "a transcode size does not serve relays"
+    );
+    let mut relay = input("relay", "hetzner", &[]);
+    relay.purpose = "relay".into();
+    relay.enabled = false;
+    relay.zones = vec![NewZone {
+        zone: "fsn1".into(),
+        region: "eu".into(),
+        sizes: BTreeMap::from([("fanout".to_string(), "cx23".to_string())]),
+    }];
+    let id = pdb::insert(&pool, &relay).await.unwrap();
+    assert!(
+        !placement_db::relay_capable(&pool).await.unwrap(),
+        "disabled"
+    );
+    relay.enabled = true;
+    pdb::update(&pool, &id, &relay).await.unwrap();
+    assert!(
+        placement_db::relay_capable(&pool).await.unwrap(),
+        "a provider without a Terraform module serves relays"
+    );
+    assert!(pdb::soft_delete(&pool, &id).await.unwrap());
+    assert!(
+        !placement_db::relay_capable(&pool).await.unwrap(),
+        "deleted"
+    );
+}
+
+#[tokio::test]
 async fn transcode_supply_needs_an_eligible_provider_with_software() {
     let Some((pool, _g)) = setup().await else {
         return;

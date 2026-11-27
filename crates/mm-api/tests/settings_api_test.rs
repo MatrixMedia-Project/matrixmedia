@@ -521,11 +521,19 @@ fn different(key: &str, kind: ValueKind, current: &Value) -> Value {
 async fn every_live_setting_takes_effect_without_a_restart() {
     let _g = lock().lock().await;
     let Some(pool) = fresh_pool().await else { return };
-    let api = start(&pool, base(), KeyRing::from_values(Some(K1), None).unwrap()).await;
+    // The media path guard refuses relay_after_threshold unless fleet.mode is on, a switch
+    // secret is set, fleet.max_relay_nodes is at least 1 and a provider has a fan-out size; the
+    // loop sets that path (before it lowers fleet.max_relay_nodes), so all four are in place.
+    let mut b = base();
+    b.fleet.mode = mm_core::config::FleetMode::On;
+    b.advertising.switch_auth_secret = SECRET.into();
+    b.fleet.max_relay_nodes = 1;
+    let api = start(&pool, b, KeyRing::from_values(Some(K1), None).unwrap()).await;
     // The terraform guard refuses a transcode backend with no Terraform-capable provider, and
     // this loop sets one, so the loop needs such a provider in place.
     let mut sizes = std::collections::BTreeMap::new();
     sizes.insert("transcode".to_string(), "L4-1-24G".to_string());
+    sizes.insert("fanout".to_string(), "DEV1-S".to_string());
     mm_fleet::providers_db::insert(
         &pool,
         &mm_fleet::providers_db::ProviderInput {
@@ -728,4 +736,136 @@ async fn terraform_is_refused_for_a_role_no_provider_can_serve() {
         .patch(json!({"fleet.create_backend_transcode": "api"}), json!({}))
         .await;
     assert_eq!(s, StatusCode::OK, "back to api is always allowed");
+}
+
+/// An enabled provider with no Terraform module whose one zone has a fan-out size.
+fn relay_provider() -> mm_fleet::providers_db::ProviderInput {
+    let mut sizes = std::collections::BTreeMap::new();
+    sizes.insert("fanout".to_string(), "cx23".to_string());
+    mm_fleet::providers_db::ProviderInput {
+        label: "relays".into(),
+        kind: "hetzner".into(),
+        purpose: "relay".into(),
+        enabled: true,
+        endpoint_display: "https://api.hetzner.cloud".into(),
+        account_display: None,
+        image: "i".into(),
+        gpu_image: "g".into(),
+        transcode_image: None,
+        max_gpu_nodes: 1,
+        zones: vec![mm_fleet::providers_db::NewZone {
+            zone: "fsn1".into(),
+            region: "eu".into(),
+            sizes,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn a_relay_media_path_is_refused_without_its_prerequisites() {
+    let _g = lock().lock().await;
+    let Some(pool) = fresh_pool().await else {
+        return;
+    };
+    for t in [
+        "mm_fleet_requests",
+        "mm_fleet_provider_status",
+        "mm_fleet_provider_credentials",
+        "mm_fleet_provider_sizes",
+        "mm_fleet_provider_zones",
+        "mm_fleet_providers",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Nothing in place (fleet.mode frozen by default, a blank secret, no relay nodes allowed,
+    // no provider): every prerequisite is named, in order.
+    let mut bare = base();
+    bare.advertising.switch_auth_secret = "  ".into();
+    let api = start(&pool, bare, None).await;
+    let (s, body) = api
+        .patch(
+            json!({"fleet.media_path": "relay_after_threshold"}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        (s, body["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("MM_INVALID_REQUEST")),
+        "{body}"
+    );
+    assert_eq!(
+        body["message"],
+        "fleet.media_path = relay_after_threshold needs: fleet.mode must be on; \
+         a switch auth secret must be set (MM_SWITCH_AUTH_SECRET); \
+         fleet.max_relay_nodes must be at least 1; \
+         an enabled VPS provider with a relay size is required"
+    );
+
+    // fleet.mode and the secret come from the environment (neither is a dashboard setting).
+    let mut ready = base();
+    ready.fleet.mode = mm_core::config::FleetMode::On;
+    ready.advertising.switch_auth_secret = SECRET.into();
+    let api = start(&pool, ready, None).await;
+    let (s, body) = api
+        .patch(
+            json!({"fleet.media_path": "relay_after_threshold"}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("an enabled VPS provider with a relay size is required"),
+        "{body}"
+    );
+
+    mm_fleet::providers_db::insert(&pool, &relay_provider())
+        .await
+        .unwrap();
+    let (s, body) = api
+        .patch(
+            json!({"fleet.media_path": "relay_after_threshold", "fleet.max_relay_nodes": 1}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the request's own fleet.max_relay_nodes counts: {body}"
+    );
+    assert_eq!(
+        api.svc.handle().load().fleet.media_path,
+        mm_core::config::MediaPath::RelayAfterThreshold
+    );
+
+    // fleet.mode is read-only here, so lowering fleet.max_relay_nodes stands in for taking a
+    // prerequisite away: a request that leaves the path out is never refused by the check.
+    let (s, body) = api
+        .patch(json!({"fleet.max_relay_nodes": 0}), json!({}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    assert_eq!(api.svc.handle().load().fleet.max_relay_nodes, 0);
+
+    let (s, body) = api
+        .patch(
+            json!({"fleet.media_path": "relay_entry", "fleet.max_relay_nodes": 2}),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["message"],
+        "fleet.media_path = relay_entry needs: relay_entry is not available in this version"
+    );
+
+    let (s, body) = api
+        .patch(json!({"fleet.media_path": "core"}), json!({}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "back to core is always allowed: {body}");
 }

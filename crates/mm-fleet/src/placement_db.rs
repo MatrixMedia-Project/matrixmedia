@@ -210,6 +210,20 @@ pub async fn terraform_capable(pool: &PgPool, role: Role) -> sqlx::Result<bool> 
     }))
 }
 
+/// Could a relay media path get any relay node at all: an enabled provider one of whose zones
+/// has a fan-out size. The provider filter of `terraform_capable` for the fan-out role, without
+/// its Terraform-module condition.
+pub async fn relay_capable(pool: &PgPool) -> sqlx::Result<bool> {
+    Ok(pdb::list(pool).await?.iter().any(|p| {
+        p.row.enabled
+            && p.zones.iter().any(|z| {
+                z.sizes
+                    .get(Role::Fanout.as_str())
+                    .is_some_and(|s| !s.trim().is_empty())
+            })
+    }))
+}
+
 /// Transcode supply from the providers' configuration (spec §6.4 gate b), for mm-core's planner.
 pub struct PgTranscodeSupply {
     pool: PgPool,

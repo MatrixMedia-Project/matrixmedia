@@ -1009,10 +1009,11 @@ pub async fn run(
 
     // GPU rental planning (spec §6.4). The census, the wallet and the opt-in live here, so the
     // plan is made here; every teardown it decides is only ORDERED (deferred destroy) and the
-    // fleet runner, the one process holding provider tokens, completes it. Transcoders only: no
-    // fan-out size exists yet, so the fan-out ceiling is 0. Under `frozen` it only releases the
-    // machines of ended broadcasts. A transcoder is planned only where some provider has
-    // transcode software (`PgTranscodeSupply`).
+    // fleet runner, the one process holding provider tokens, completes it. Transcoders only:
+    // the per-broadcast fan-out ceiling is 0, and relays are ordered by the pool tick that runs
+    // after each planner tick. Under `frozen` it only releases the machines of ended broadcasts.
+    // A transcoder is planned only where some provider has transcode software
+    // (`PgTranscodeSupply`).
     match (
         shared_state.switch_pool.as_ref(),
         shared_state.pg_pool.as_ref(),
@@ -1024,13 +1025,12 @@ pub async fn run(
                 "chosen-at-rent",
             )
             .with_billing_increment(mm_core::fleet::billing::BillingIncrement::PerMinute);
-            // Operator-wired ceiling (fleet.max_fanout_nodes_per_broadcast, default 0).
-            // This replaces the hardcoded 0 this line shipped with: fan-out stays OFF
-            // until an operator raises it, and even then only a broadcast whose wallet
-            // covers the projection is ever grown (planner gate 2). Transcoders are
-            // unaffected either way.
-            policy.max_fanout_nodes_per_broadcast =
-                live_config.load().fleet.max_fanout_nodes_per_broadcast;
+            // Per-broadcast fan-out is off: relays now come from the operator-paid pool
+            // (`pool_autoscale`, sized by fleet.media_path below), which replaces the
+            // wallet-gated per-broadcast ceiling fleet.max_fanout_nodes_per_broadcast.
+            // Transcoders are unaffected.
+            policy.max_fanout_nodes_per_broadcast = 0;
+            let pool_capacity_per_node = policy.viewer_capacity_per_node;
             let planner = Arc::new(
                 mm_fleet::runner::FleetRunner::new(
                     mm_fleet::desired::DesiredStore::new(pg.clone()),
@@ -1058,9 +1058,14 @@ pub async fn run(
                 "Fleet planner running (tick 10 s, transcoders only; teardowns are completed by mm-fleet-runner)"
             );
             let planner_cancel = cancel.clone();
+            let pool_db = pg.clone();
             supervise("fleet_planner", cancel.clone(), move || {
-                let (planner, token, live) =
-                    (planner.clone(), planner_cancel.clone(), live_config.clone());
+                let (planner, token, live, pool_db) = (
+                    planner.clone(),
+                    planner_cancel.clone(),
+                    live_config.clone(),
+                    pool_db.clone(),
+                );
                 async move {
                     // Beats on entry, so the series exists before the first tick: a planner
                     // that fails every tick then goes stale (`MMBackgroundTaskStalled`), where
@@ -1076,11 +1081,15 @@ pub async fn run(
                                 // and the mode is mm-core's own.
                                 let cfg = live.load();
                                 planner.set_region(&cfg.fleet.default_region);
+                                // The census the planner read, for the pool below. None when
+                                // it was not read (`off`, a census or planner failure).
+                                let mut census: Option<Vec<mm_fleet::runner::LiveBroadcast>> = None;
                                 match planner
                                     .tick(&mm_fleet::provider::NoProvider, cfg.fleet.mode, chrono::Utc::now())
                                     .await
                                 {
-                                    Ok(r) => {
+                                    Ok(mut r) => {
+                                        census = r.live.take();
                                         if !r.planned.is_empty()
                                             || !r.torn_down.is_empty()
                                             || !r.not_promoted.is_empty()
@@ -1100,6 +1109,40 @@ pub async fn run(
                                         mm_core::metrics_global::heartbeat("fleet_planner");
                                     }
                                     Err(e) => tracing::error!("fleet planner: {e}"),
+                                }
+                                // The relay pool, from the same snapshot. It runs whatever the
+                                // planner did: its first step keeps relays with viewers alive.
+                                // With no census it sizes from no demand, which orders nothing
+                                // and retires nothing a previous tick wanted (those were just
+                                // extended a full lease window ahead); only growth waits.
+                                let pool_inputs = mm_fleet::pool_autoscale::PoolInputs {
+                                    path: cfg.fleet.media_path,
+                                    mode: cfg.fleet.mode,
+                                    threshold: cfg.fleet.relay_viewer_threshold,
+                                    ceiling: cfg.fleet.max_relay_nodes,
+                                    capacity_per_node: pool_capacity_per_node,
+                                    region: cfg.fleet.default_region.clone(),
+                                    stream_viewers: census
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .map(|b| b.viewers)
+                                        .collect(),
+                                };
+                                match mm_fleet::pool_autoscale::tick(&pool_db, &pool_inputs, chrono::Utc::now())
+                                    .await
+                                {
+                                    Ok(p) => {
+                                        if !p.created.is_empty() || !p.retired.is_empty() {
+                                            info!(
+                                                wanted = p.wanted,
+                                                created = p.created.len(),
+                                                extended = p.extended.len(),
+                                                retired = p.retired.len(),
+                                                "relay pool tick"
+                                            )
+                                        }
+                                    }
+                                    Err(e) => tracing::error!("relay pool: {e}"),
                                 }
                             }
                         }

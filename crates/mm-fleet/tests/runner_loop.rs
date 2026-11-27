@@ -213,6 +213,14 @@ async fn frozen_observes_and_publishes_but_provisions_nothing() {
         "frozen must not touch the provider: {:?}",
         provider.intents()
     );
+    // The census it read is handed on (the relay pool sizes from it).
+    assert_eq!(
+        report.live,
+        Some(vec![LiveBroadcast {
+            broadcast_id: "b1".into(),
+            viewers: 1_500,
+        }])
+    );
 
     // 1,500 viewers over 250-per-node would be six nodes on `on`.
     let store = DesiredStore::new(pool.clone());
@@ -641,6 +649,7 @@ async fn a_census_failure_tears_nothing_down() {
     assert!(provider.intents().is_empty());
     assert_eq!(report.skipped.len(), 1);
     assert!(report.skipped[0].1.contains("census unavailable"));
+    assert_eq!(report.live, None, "a failed census is not handed on as an empty one");
 }
 
 /// A census failure stops the tick from deciding anything — but not from telling

@@ -124,7 +124,6 @@ fn request(id: &NodeId) -> RentRequest<'_> {
         probe: None,
         ssh_key: None,
         image: ImageFor::TestBoot,
-        viewer_capacity: None,
     }
 }
 
@@ -594,7 +593,6 @@ async fn a_hetzner_fanout_node_is_stamped_with_the_capacity_guess() {
             probe: None,
             ssh_key: None,
             image: ImageFor::Fanout,
-            viewer_capacity: Some(80),
         };
         let out = rent_one(
             &ctx,

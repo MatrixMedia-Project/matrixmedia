@@ -210,18 +210,31 @@ pub async fn terraform_capable(pool: &PgPool, role: Role) -> sqlx::Result<bool> 
     }))
 }
 
-/// Could a relay media path get any relay node at all: an enabled provider one of whose zones
-/// has a fan-out size. The provider filter of `terraform_capable` for the fan-out role, without
-/// its Terraform-module condition.
+/// Could a relay media path get any relay node viewers can be placed on: an enabled provider
+/// one of whose zones has a fan-out size and whose relays carry a viewer capacity
+/// ([`crate::rent::relay_viewer_capacity`]; Hetzner today). The provider filter of
+/// `terraform_capable` for the fan-out role, without its Terraform-module condition.
 pub async fn relay_capable(pool: &PgPool) -> sqlx::Result<bool> {
-    Ok(pdb::list(pool).await?.iter().any(|p| {
-        p.row.enabled
-            && p.zones.iter().any(|z| {
-                z.sizes
-                    .get(Role::Fanout.as_str())
-                    .is_some_and(|s| !s.trim().is_empty())
-            })
-    }))
+    Ok(relay_capacity(pool).await?.is_some())
+}
+
+/// The viewer capacity the relay pool is sized with: the smallest a relay of any provider
+/// [`relay_capable`] counts would be stamped with, so the pool never counts on more than the
+/// relay it actually gets can serve. `None` when no such provider is enabled.
+pub async fn relay_capacity(pool: &PgPool) -> sqlx::Result<Option<u32>> {
+    Ok(pdb::list(pool)
+        .await?
+        .iter()
+        .filter(|p| {
+            p.row.enabled
+                && p.zones.iter().any(|z| {
+                    z.sizes
+                        .get(Role::Fanout.as_str())
+                        .is_some_and(|s| !s.trim().is_empty())
+                })
+        })
+        .filter_map(|p| crate::rent::relay_viewer_capacity(&p.row.kind))
+        .min())
 }
 
 /// Transcode supply from the providers' configuration (spec §6.4 gate b), for mm-core's planner.

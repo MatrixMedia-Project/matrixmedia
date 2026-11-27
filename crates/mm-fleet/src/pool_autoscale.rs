@@ -36,8 +36,10 @@ pub struct PoolInputs {
     pub threshold: u32,
     /// `fleet.max_relay_nodes`.
     pub ceiling: u32,
-    /// Viewers one pool node serves.
-    pub capacity_per_node: u32,
+    /// Viewers one pool node serves: the capacity its relays are stamped with when rented
+    /// ([`crate::placement_db::relay_capacity`]). `None` when no enabled provider's relays can
+    /// serve viewers: nothing is ordered then.
+    pub capacity_per_node: Option<u32>,
     /// Where new pool leases are rented.
     pub region: String,
     /// The viewer counts of the live broadcasts whose stored state sends viewers to relays
@@ -66,7 +68,9 @@ pub struct PoolReport {
 /// setting moved to `core` (the setting decides what NEW streams do). `stream_viewers` holds
 /// only streams stored in a relay state ([`relay_stream_viewers`]), so with none live the
 /// demand is empty and `wanted` is 0. What stops spending at once is the ceiling
-/// (`fleet.max_relay_nodes`) and the kill switch (`fleet.mode`).
+/// (`fleet.max_relay_nodes`) and the kill switch (`fleet.mode`). With no relay capacity
+/// (no enabled provider whose relays can serve viewers) `wanted` is 0 as well: no relay that
+/// could be rented would take a viewer.
 /// All three steps run in every state, so with `wanted` 0 nothing is ordered and idle leases are
 /// let go, while a relay that still serves sessions keeps being extended: a node with viewers
 /// is never destroyed, also under `frozen`, `off` or `core`. Extension goes first because it
@@ -77,14 +81,17 @@ pub async fn tick(
     inputs: &PoolInputs,
     now: DateTime<Utc>,
 ) -> Result<PoolReport, LeaseError> {
-    let wanted = match effective(MediaPath::RelayAfterThreshold, inputs.mode) {
-        MediaPath::RelayAfterThreshold => pool_nodes_wanted(
+    let wanted = match (
+        effective(MediaPath::RelayAfterThreshold, inputs.mode),
+        inputs.capacity_per_node,
+    ) {
+        (MediaPath::RelayAfterThreshold, Some(capacity)) => pool_nodes_wanted(
             &inputs.stream_viewers,
             inputs.threshold,
-            inputs.capacity_per_node,
+            capacity,
             inputs.ceiling,
         ),
-        MediaPath::Core | MediaPath::RelayEntry => 0,
+        (MediaPath::RelayAfterThreshold, None) | (MediaPath::Core | MediaPath::RelayEntry, _) => 0,
     };
     let extended = extend_autoscale(pool, wanted, DEFAULT_DURATION_HINT, now).await?;
     let retired = retire_idle_autoscale(pool, RETIRE_MARGIN, now).await?;

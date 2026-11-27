@@ -522,8 +522,9 @@ async fn every_live_setting_takes_effect_without_a_restart() {
     let _g = lock().lock().await;
     let Some(pool) = fresh_pool().await else { return };
     // The media path guard refuses relay_after_threshold unless fleet.mode is on, a switch
-    // secret is set, fleet.max_relay_nodes is at least 1 and a provider has a fan-out size; the
-    // loop sets that path (before it lowers fleet.max_relay_nodes), so all four are in place.
+    // secret is set, fleet.max_relay_nodes is at least 1 and a provider's relays can serve
+    // viewers; the loop sets that path (before it lowers fleet.max_relay_nodes), so all four
+    // are in place.
     let mut b = base();
     b.fleet.mode = mm_core::config::FleetMode::On;
     b.advertising.switch_auth_secret = SECRET.into();
@@ -738,7 +739,8 @@ async fn terraform_is_refused_for_a_role_no_provider_can_serve() {
     assert_eq!(s, StatusCode::OK, "back to api is always allowed");
 }
 
-/// An enabled provider with no Terraform module whose one zone has a fan-out size.
+/// An enabled Hetzner provider (its relays carry a viewer capacity), with no Terraform module,
+/// whose one zone has a fan-out size.
 fn relay_provider() -> mm_fleet::providers_db::ProviderInput {
     let mut sizes = std::collections::BTreeMap::new();
     sizes.insert("fanout".to_string(), "cx23".to_string());
@@ -802,7 +804,7 @@ async fn a_relay_media_path_is_refused_without_its_prerequisites() {
         "fleet.media_path = relay_after_threshold needs: fleet.mode must be on; \
          a switch auth secret must be set (MM_SWITCH_AUTH_SECRET); \
          fleet.max_relay_nodes must be at least 1; \
-         an enabled VPS provider with a relay size is required"
+         an enabled VPS provider whose relays can serve viewers is required (Hetzner today)"
     );
 
     // fleet.mode and the secret come from the environment (neither is a dashboard setting).
@@ -818,10 +820,9 @@ async fn a_relay_media_path_is_refused_without_its_prerequisites() {
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        body["message"]
-            .as_str()
-            .unwrap()
-            .contains("an enabled VPS provider with a relay size is required"),
+        body["message"].as_str().unwrap().contains(
+            "an enabled VPS provider whose relays can serve viewers is required (Hetzner today)"
+        ),
         "{body}"
     );
 

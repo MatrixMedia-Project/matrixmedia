@@ -293,7 +293,7 @@ fn media_path_blockers(
             ),
             (
                 !relay_capable,
-                "an enabled VPS provider with a relay size is required",
+                "an enabled VPS provider whose relays can serve viewers is required (Hetzner today)",
             ),
         ]
         .into_iter()
@@ -404,7 +404,7 @@ mod tests {
                 "fleet.mode must be on",
                 "a switch auth secret must be set (MM_SWITCH_AUTH_SECRET)",
                 "fleet.max_relay_nodes must be at least 1",
-                "an enabled VPS provider with a relay size is required"
+                "an enabled VPS provider whose relays can serve viewers is required (Hetzner today)"
             ]
         );
     }

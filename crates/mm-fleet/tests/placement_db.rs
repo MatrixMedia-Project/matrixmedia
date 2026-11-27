@@ -515,6 +515,44 @@ async fn relays_need_an_enabled_provider_with_a_fan_out_size_and_no_module() {
     );
 }
 
+/// A relay is placeable only with a viewer capacity, and only some providers' relays are
+/// stamped with one when rented (Hetzner today). A provider of any other kind with a fan-out
+/// size would be paid for and fed a copy of the stream, and never take a viewer.
+#[tokio::test]
+async fn only_a_provider_whose_relays_can_serve_viewers_makes_relays_possible() {
+    let Some((pool, _g)) = setup().await else {
+        return;
+    };
+    let mut other = input("other", "scaleway", &[]);
+    other.purpose = "relay".into();
+    other.zones = vec![NewZone {
+        zone: "fr-par-1".into(),
+        region: "eu".into(),
+        sizes: BTreeMap::from([("fanout".to_string(), "DEV1-S".to_string())]),
+    }];
+    pdb::insert(&pool, &other).await.unwrap();
+    assert!(
+        !placement_db::relay_capable(&pool).await.unwrap(),
+        "a scaleway relay would carry no viewer capacity"
+    );
+    assert_eq!(placement_db::relay_capacity(&pool).await.unwrap(), None);
+
+    let mut relay = input("relay", "hetzner", &[]);
+    relay.purpose = "relay".into();
+    relay.zones = vec![NewZone {
+        zone: "fsn1".into(),
+        region: "eu".into(),
+        sizes: BTreeMap::from([("fanout".to_string(), "cx23".to_string())]),
+    }];
+    pdb::insert(&pool, &relay).await.unwrap();
+    assert!(placement_db::relay_capable(&pool).await.unwrap());
+    assert_eq!(
+        placement_db::relay_capacity(&pool).await.unwrap(),
+        Some(80),
+        "the capacity a Hetzner relay is stamped with"
+    );
+}
+
 #[tokio::test]
 async fn transcode_supply_needs_an_eligible_provider_with_software() {
     let Some((pool, _g)) = setup().await else {

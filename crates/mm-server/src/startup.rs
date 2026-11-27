@@ -1036,7 +1036,6 @@ pub async fn run(
             // wallet-gated per-broadcast ceiling fleet.max_fanout_nodes_per_broadcast.
             // Transcoders are unaffected.
             policy.max_fanout_nodes_per_broadcast = 0;
-            let pool_capacity_per_node = policy.viewer_capacity_per_node;
             let planner = Arc::new(
                 mm_fleet::runner::FleetRunner::new(
                     mm_fleet::desired::DesiredStore::new(pg.clone()),
@@ -1077,6 +1076,9 @@ pub async fn run(
                     // that fails every tick then goes stale (`MMBackgroundTaskStalled`), where
                     // one that never beat would have no series to go stale.
                     mm_core::metrics_global::heartbeat("fleet_planner");
+                    // Whether the warning that no relay could serve viewers was given since
+                    // it last became true: once, not on every tick.
+                    let mut no_relay_capacity_warned = false;
                     let mut ticker = tokio::time::interval(Duration::from_secs(10));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
@@ -1140,11 +1142,38 @@ pub async fn run(
                                     }
                                     None => Vec::new(),
                                 };
+                                // Sized with the capacity the relays are stamped with when
+                                // rented. With none (no enabled provider whose relays can
+                                // serve viewers) nothing is ordered; extension and
+                                // retirement go on.
+                                let capacity_per_node =
+                                    match mm_fleet::placement_db::relay_capacity(&pool_db).await {
+                                        Ok(Some(capacity)) => {
+                                            no_relay_capacity_warned = false;
+                                            Some(capacity)
+                                        }
+                                        Ok(None) => {
+                                            if !no_relay_capacity_warned {
+                                                no_relay_capacity_warned = true;
+                                                tracing::warn!(
+                                                    "relay pool: no enabled provider's relays can serve \
+                                                     viewers (Hetzner today), so no relay is ordered"
+                                                );
+                                            }
+                                            None
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "relay pool: reading the relay providers failed: {e}"
+                                            );
+                                            None
+                                        }
+                                    };
                                 let pool_inputs = mm_fleet::pool_autoscale::PoolInputs {
                                     mode: cfg.fleet.mode,
                                     threshold: cfg.fleet.relay_viewer_threshold,
                                     ceiling: cfg.fleet.max_relay_nodes,
-                                    capacity_per_node: pool_capacity_per_node,
+                                    capacity_per_node,
                                     region: cfg.fleet.default_region.clone(),
                                     stream_viewers,
                                 };

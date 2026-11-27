@@ -43,7 +43,7 @@ fn inputs(mode: FleetMode, ceiling: u32, stream_viewers: Vec<u32>) -> PoolInputs
         mode,
         threshold: 50,
         ceiling,
-        capacity_per_node: 250,
+        capacity_per_node: Some(250),
         region: "eu".into(),
         stream_viewers,
     }
@@ -346,5 +346,58 @@ async fn two_concurrent_ticks_order_what_one_tick_would() {
             .expect("autoscale_live")
             .len(),
         3
+    );
+}
+
+/// The pool is sized with the capacity its relays are stamped with when rented (80 for a
+/// Hetzner relay), not a general guess: 350 viewers past the threshold need 5 relays of 80,
+/// where 250 a node would have ordered 2 and left about 190 people on the main server.
+#[tokio::test]
+async fn the_pool_is_sized_with_the_capacity_its_relays_are_stamped_with() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping the_pool_is_sized_with_the_capacity_its_relays_are_stamped_with"
+        );
+        return;
+    };
+    let ins = PoolInputs {
+        capacity_per_node: mm_fleet::rent::relay_viewer_capacity("hetzner"),
+        ..inputs(FleetMode::On, 8, vec![400])
+    };
+    let report = pool_autoscale::tick(&pool, &ins, db_now())
+        .await
+        .expect("tick");
+    assert_eq!(report.wanted, 5);
+    assert_eq!(report.created.len(), 5);
+}
+
+/// With no enabled provider whose relays can serve viewers there is no capacity to size the
+/// pool with: the tick orders nothing, and still extends a relay people watch through.
+#[tokio::test]
+async fn with_no_relay_capacity_the_tick_orders_nothing_and_still_extends_a_busy_lease() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping with_no_relay_capacity_the_tick_orders_nothing_and_still_extends_a_busy_lease"
+        );
+        return;
+    };
+    let created = db_now();
+    let id = one_pool_lease(&pool, created).await;
+    seed_healthy(&pool, &id, 5, created + Duration::hours(1)).await;
+    let now = created + Duration::minutes(10);
+    let ins = PoolInputs {
+        capacity_per_node: None,
+        ..inputs(FleetMode::On, 8, vec![400])
+    };
+
+    let report = pool_autoscale::tick(&pool, &ins, now).await.expect("tick");
+
+    assert_eq!(report.wanted, 0);
+    assert!(report.created.is_empty(), "nothing is ordered");
+    assert_eq!(report.extended, vec![id.clone()]);
+    assert_eq!(desired_count(&pool).await, 1);
+    assert_eq!(
+        desired_deadline(&pool, &id).await,
+        now + lease_db::DEFAULT_DURATION_HINT
     );
 }

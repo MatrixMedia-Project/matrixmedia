@@ -75,10 +75,6 @@ pub struct RentRequest<'a> {
     /// `Some` only on the test boot's request; every other rental passes `None`.
     pub probe: Option<&'a BootProbe>,
     pub image: ImageFor,
-    /// How many viewers this node is sized to carry (§8.2 R6), or `None` when
-    /// nothing is rented this is capacity-aware for (a transcoder, say).
-    /// Copied onto the node row at insert, same as everything else here.
-    pub viewer_capacity: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,22 +187,12 @@ async fn rent_within(
             destroy_deadline: req.destroy_deadline,
             created_by: req.created_by,
             funding: req.funding,
-            // m3: `req.viewer_capacity` is, in practice, `hetzner_fanout_capacity()` — a
-            // guess scoped to Hetzner's specific "no published NIC field" catalogue gap
-            // (see fleet_loop.rs's comment on that constant). `rent_within` tries MULTIPLE
-            // candidates, possibly across different providers, for the SAME request; a
-            // single `req.viewer_capacity` stamped onto whichever one happens to win would
-            // apply Hetzner's guess to a machine that actually landed on Scaleway (which
-            // publishes a real, measured NIC speed — `scaleway.rs::sum_internet_bandwidth`
-            // — even though nothing calls it yet) or any other provider. Gated here, at the
-            // one place that knows which candidate is about to be asked to create: only a
-            // Hetzner candidate gets it. Every other provider's node is inserted with `None`
-            // until it has its own measured-or-guessed figure, per the "measured-where-
-            // exposed, else none" rule — not a borrowed one from a different provider's catalogue.
-            // NOTE: this compares the provider KIND, not its row id: `provider_id` is the
-            // `mm_fleet_providers` key (`p-…`), which never equals a kind name — comparing
-            // it left every fan-out relay at capacity `None` (headroom 0, never placeable).
-            viewer_capacity: (c.kind == "hetzner").then_some(req.viewer_capacity).flatten(),
+            // The capacity is the candidate's, not the request's: one request may try
+            // candidates of several providers, and each kind has its own figure, or none
+            // ([`relay_viewer_capacity`] compares the provider KIND, never its row id).
+            viewer_capacity: (req.flavor == NodeFlavor::Fanout)
+                .then(|| relay_viewer_capacity(&c.kind))
+                .flatten(),
         };
         match nodes_db::insert_for_create(ctx.pool, &node, ctx.global_cap).await {
             Ok(()) => {}
@@ -569,11 +555,64 @@ async fn destroy_half_made(
     }
 }
 
+/// The bitrate and derate `viewers_for_bandwidth` uses when sizing a fan-out relay at rent
+/// time, mirroring `FleetPolicy::default()` (`crates/mm-core/src/fleet/planner.rs`): 2.5 Mbps
+/// per viewer, 80% of the port usable.
+const FANOUT_VIEWER_BITRATE_KBPS: u32 = 2_500;
+const FANOUT_PORT_DERATE: f64 = 0.8;
+
+/// A Hetzner Cloud fan-out relay's usable NIC speed. Hetzner's `/server_types` catalogue
+/// (`crates/mm-fleet/src/hetzner.rs::server_types`) answers only `{name, deprecated,
+/// prices}` — no bandwidth field — unlike Scaleway's `sum_internet_bandwidth`
+/// (`crates/mm-fleet/src/scaleway.rs::sku_bandwidth_mbps`). With no measured cap to derive
+/// from, this is the configured guess the spec's capacity-truth fallback calls for: a
+/// conservative reading of Hetzner's published "up to 1 Gbit/s, unmetered" shared-vCPU
+/// network, derated the same way a measured cap would be. Replace this constant with a real
+/// per-SKU lookup if Hetzner ever starts publishing one.
+const HETZNER_FANOUT_PORT_MBPS: u32 = 250;
+
+/// How many viewers a fan-out relay of provider kind `kind` serves (§8.2 R6): the capacity
+/// its node row is stamped with when it is rented, or `None` when this kind has no figure
+/// yet. A relay with no capacity has no headroom, so no viewer is ever placed on it. The one
+/// definition: the rent path stamps it, [`crate::placement_db::relay_capable`] asks whether
+/// any enabled provider has one, and the relay pool is sized with it.
+///
+/// Hetzner only, today, by the configured guess above. Every other kind is `None` until it
+/// has its own measured-or-guessed figure, per the "measured-where-exposed, else none" rule:
+/// never a figure borrowed from another provider's catalogue.
+pub fn relay_viewer_capacity(kind: &str) -> Option<u32> {
+    match kind {
+        "hetzner" => Some(mm_core::fleet::planner::viewers_for_bandwidth(
+            HETZNER_FANOUT_PORT_MBPS,
+            FANOUT_VIEWER_BITRATE_KBPS,
+            FANOUT_PORT_DERATE,
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    /// Rent-time capacity for a Hetzner fan-out relay (§8.2 R6): until Hetzner's catalogue
+    /// publishes a per-SKU NIC speed, this is `viewers_for_bandwidth` fed the configured
+    /// guess and the policy defaults — never a number invented ad hoc. No other kind has one.
+    #[test]
+    fn only_a_hetzner_relay_has_a_viewer_capacity() {
+        assert_eq!(
+            relay_viewer_capacity("hetzner"),
+            Some(mm_core::fleet::planner::viewers_for_bandwidth(
+                250, 2_500, 0.8
+            ))
+        );
+        assert_eq!(relay_viewer_capacity("hetzner"), Some(80));
+        for kind in ["scaleway", "ovh", "itldc", "runpod", "p-hetzner"] {
+            assert_eq!(relay_viewer_capacity(kind), None, "{kind}");
+        }
+    }
 
     struct Slow;
 

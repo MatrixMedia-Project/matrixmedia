@@ -40,6 +40,8 @@ struct Calls {
     written_elsewhere: Option<(sqlx::PgPool, String, String, Option<String>, i16)>,
     /// List every source it holds as inactive: no picture (its feeder is gone).
     dead: bool,
+    /// Answer the viewer list (the census) with a 500.
+    silent: bool,
 }
 
 type Recorder = Arc<Mutex<Calls>>;
@@ -86,9 +88,14 @@ async fn fake_relay(viewers: Value) -> (String, Recorder) {
         )
         .route(
             "/api/viewers",
-            get(move || {
+            get(move |State(calls): State<Recorder>| {
                 let v = viewers.clone();
-                async move { Json(json!({ "viewers": v })) }
+                async move {
+                    if calls.lock().await.silent {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "boom" })));
+                    }
+                    (StatusCode::OK, Json(json!({ "viewers": v })))
+                }
             }),
         )
         .route(
@@ -843,6 +850,97 @@ async fn a_relay_that_does_not_answer_the_census_keeps_its_count() {
     );
 
     cleanup(&db, &b1, &[&silent, &answering], &provider).await;
+}
+
+/// A relay that stops answering keeps its count and what it carries only for a while: past
+/// the limit its count is written as 0 and it carries nothing, so it is neither kept alive
+/// nor offered to viewers on a count nobody can confirm. Once it answers again its real count
+/// is written and its silence starts over.
+#[tokio::test]
+async fn a_relay_silent_past_the_limit_is_counted_empty_and_carries_nothing() {
+    let _serial = SERIAL.lock().await;
+    let Some(db) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    mm_db::run_pg_migrations(&db)
+        .await
+        .expect("migrations should apply cleanly");
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let node = format!("0-feeds-{tag}-quiet");
+    let id = NodeId::new(&node);
+    let provider = format!("feeds-{tag}");
+    let b1 = seed_active_stream(&db).await;
+    let origin_url = fake_origin(json!(null), json!(null)).await;
+    let (url, calls) = fake_relay(json!([
+        { "id": switch_viewer_id(&b1, "@bob:example.org"), "current_source": switch_source_id(&b1), "connected": true }
+    ]))
+    .await;
+    seed_provider_zone(&db, &provider, "ams-1").await;
+    seed_relay(&db, &node, "192.0.2.30", &provider, "ams-1").await;
+
+    let limit = Duration::from_millis(300);
+    let ctx = context(HashMap::from([("192.0.2.30".to_string(), url)])).with_silence_limit(limit);
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin_url),
+    )));
+    let count = || {
+        let db = db.clone();
+        let node = node.clone();
+        async move {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT viewers_current FROM mm_fleet_nodes WHERE mm_node_id = $1",
+            )
+            .bind(node)
+            .fetch_one(&db)
+            .await
+            .expect("read count")
+        }
+    };
+    let set_count = |n: i32| {
+        let db = db.clone();
+        let node = node.clone();
+        async move {
+            sqlx::query("UPDATE mm_fleet_nodes SET viewers_current = $2 WHERE mm_node_id = $1")
+                .bind(node)
+                .bind(n)
+                .execute(&db)
+                .await
+                .expect("set count");
+        }
+    };
+
+    // It answers: in the pool, its count written.
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(count().await, 1);
+    set_count(5).await;
+    pool.set_carried(&id, HashSet::from([b1.clone()])).await;
+
+    // Silent, under the limit: its count and what it carries stay.
+    calls.lock().await.silent = true;
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(count().await, 5);
+    assert_eq!(pool.carried_by(&id).await, HashSet::from([b1.clone()]));
+
+    // Silent past the limit: 0, and it carries nothing.
+    tokio::time::sleep(limit + Duration::from_millis(100)).await;
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(count().await, 0);
+    assert!(pool.carried_by(&id).await.is_empty());
+
+    // It answers again: its real count.
+    calls.lock().await.silent = false;
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(count().await, 1);
+
+    // Silent again: its silence starts over, so it keeps its count.
+    set_count(5).await;
+    calls.lock().await.silent = true;
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(count().await, 5, "the earlier silence no longer counts");
+
+    cleanup(&db, &b1, &[&node], &provider).await;
 }
 
 async fn seed_provider_zone(db: &sqlx::PgPool, provider: &str, zone: &str) {

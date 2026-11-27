@@ -64,6 +64,13 @@ const SEED_BUDGET_PER_RELAY: StdDuration = StdDuration::from_secs(8);
 /// dead cascade does not sit silently black for minutes.
 const INACTIVE_GRACE: StdDuration = StdDuration::from_secs(30);
 
+/// How long a relay that does not answer the census keeps its stored session count and what
+/// it carries. Under it, a missed census or two leaves both alone (its zero means "unknown",
+/// not "empty"). From it on, its count is written as 0 on every tick and it carries nothing,
+/// so a relay that never answers again is neither kept alive by an old count nor offered to
+/// new viewers.
+const SILENCE_LIMIT: StdDuration = StdDuration::from_secs(5 * 60);
+
 /// Diff output: what [`run_pool_sync`] must do to the pool this tick.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncActions {
@@ -886,6 +893,37 @@ fn pool_sync_dead_cascade_sources_total() -> &'static prometheus::IntCounter {
     })
 }
 
+/// Since when each relay has gone unanswered by the census, across ticks.
+type UnansweredTracker = AsyncMutex<HashMap<NodeId, Instant>>;
+
+/// The process-wide [`UnansweredTracker`].
+fn unanswered_tracker() -> &'static UnansweredTracker {
+    use std::sync::OnceLock;
+    static TRACKER: OnceLock<UnansweredTracker> = OnceLock::new();
+    TRACKER.get_or_init(|| AsyncMutex::new(HashMap::new()))
+}
+
+/// Record this census's unanswered relays in `tracker` and return those unanswered for
+/// `limit` or longer at `now`. A relay that answered (or is no longer polled) leaves the
+/// tracker, so its silence starts over the next time.
+async fn silent_past_limit(
+    tracker: &UnansweredTracker,
+    unanswered: &HashSet<NodeId>,
+    limit: StdDuration,
+    now: Instant,
+) -> HashSet<NodeId> {
+    let mut since = tracker.lock().await;
+    since.retain(|node, _| unanswered.contains(node));
+    unanswered
+        .iter()
+        .filter(|node| {
+            let first = *since.entry((*node).clone()).or_insert(now);
+            now.duration_since(first) >= limit
+        })
+        .cloned()
+        .collect()
+}
+
 /// M2's cross-tick state: one process-wide tracker, not per-call, because the grace
 /// period it enforces (`INACTIVE_GRACE`) only means anything measured across ticks.
 fn inactive_tracker() -> &'static InactiveTracker {
@@ -912,6 +950,8 @@ pub struct PoolSyncContext {
     /// How long a relay's source may read dead before it is replaced
     /// ([`INACTIVE_GRACE`]).
     inactive_grace: StdDuration,
+    /// How long a relay that does not answer the census keeps its count ([`SILENCE_LIMIT`]).
+    silence_limit: StdDuration,
 }
 
 impl PoolSyncContext {
@@ -927,7 +967,15 @@ impl PoolSyncContext {
             relay_base_url: Arc::new(|ip| format!("http://{ip}:{SWITCH_PORT}")),
             tick: StdDuration::from_secs(10),
             inactive_grace: INACTIVE_GRACE,
+            silence_limit: SILENCE_LIMIT,
         }
+    }
+
+    /// Set how long a relay that does not answer the census keeps its count and what it
+    /// carries. For tests, which cannot wait out [`SILENCE_LIMIT`].
+    pub fn with_silence_limit(mut self, limit: StdDuration) -> Self {
+        self.silence_limit = limit;
+        self
     }
 
     /// Set how long a relay's source may read dead before it is replaced. For tests, which
@@ -1021,12 +1069,23 @@ pub async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, ctx: &PoolSyncContex
             return;
         }
     };
-    // A relay that did not answer keeps the count it had: its zero means "unknown", and
-    // writing it would make a relay people may be on look empty.
+    // A relay that did not answer keeps the count it had, for a while: its zero means
+    // "unknown", and writing it would make a relay people may be on look empty. Silent for
+    // `silence_limit` or longer, it is written as 0 (its census count) and carries nothing.
+    let silent = silent_past_limit(
+        unanswered_tracker(),
+        &pass.unanswered,
+        ctx.silence_limit,
+        Instant::now(),
+    )
+    .await;
+    for node in &silent {
+        pool.set_carried(node, HashSet::new()).await;
+    }
     let viewer_counts: Vec<(NodeId, i64)> = pass
         .per_node
         .iter()
-        .filter(|(n, _)| !pass.unanswered.contains(*n))
+        .filter(|(n, _)| !pass.unanswered.contains(*n) || silent.contains(*n))
         .map(|(n, c)| (n.clone(), *c))
         .collect();
     if let Err(e) = nodes_db::update_viewers_current(db, &viewer_counts).await {
@@ -1180,7 +1239,8 @@ async fn feed_relays(
     }
 
     // Which streams each relay now has the picture of. A relay the census could not reach
-    // keeps what it had: one timeout does not take it away from viewer placement.
+    // keeps what it had: one timeout does not take it away from viewer placement (one silent
+    // past the limit was already left carrying nothing, in `sync_once`).
     let seeded = std::mem::take(&mut *seeded.lock().unwrap_or_else(|e| e.into_inner()));
     for relay in relays {
         if pass.unanswered.contains(&relay.id) {

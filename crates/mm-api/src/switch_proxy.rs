@@ -758,10 +758,12 @@ async fn proxy_viewer_offer(
     // its stale entry until that node is destroyed. Worse, the ad binding would
     // move while the viewer's existing PeerConnection did not.
     //
-    // So: reuse the node this viewer is already on, and pick a new one only when
-    // they have none. Deliberately moving a viewer between nodes is
-    // make-before-break (FR-322), an explicit mechanism, not a side effect of
-    // re-offering.
+    // So: reuse the node this viewer is already on while that relay still carries
+    // the stream, and pick a new one only when they have none. A relay that no longer
+    // carries it (the viewer dropped and the sync removed its source there) would answer
+    // with no picture: that binding is dropped and the viewer placed fresh. Deliberately
+    // moving a viewer between nodes is make-before-break (FR-322), an explicit
+    // mechanism, not a side effect of re-offering.
     //
     // A viewer with no node is placed by the stream's stored media path state.
     let stream_path = MediaPath::parse(&stream.media_path).unwrap_or(MediaPath::Core);

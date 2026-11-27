@@ -69,6 +69,14 @@ pub enum LeaseError {
     /// [`release`] was asked for a node whose teardown is already underway or done.
     #[error("node {node} is already {state}; its release is already settled")]
     AlreadyGone { node: NodeId, state: String },
+    /// [`release`] without force was asked for a lease of the shared relay pool. Draining one
+    /// relay takes it out of the pool while its lease stays paid (it keeps being extended on
+    /// its last count) and the pool rents a replacement on top; the pool is shrunk by its
+    /// ceiling instead, or a relay is evicted with force.
+    #[error(
+        "this relay belongs to the shared pool: lower fleet.max_relay_nodes to shrink the pool, or release it with force"
+    )]
+    InSharedPool(NodeId),
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -282,12 +290,27 @@ pub async fn create(pool: &PgPool, req: &LeaseCreate) -> Result<Vec<NodeId>, Lea
 /// A node with no row is [`LeaseError::NotFound`]; one already `destroying` or `gone` is
 /// [`LeaseError::AlreadyGone`] — in both cases nothing is written, so the caller can tell a
 /// typo from a release that simply lost a race with the teardown it wanted.
+///
+/// A lease of the shared relay pool (`lease_source = 'autoscale'`) is released only with
+/// force; without it the call is [`LeaseError::InSharedPool`] and nothing is written.
 pub async fn release(
     pool: &PgPool,
     node_id: &NodeId,
     force: bool,
 ) -> Result<ReleaseState, LeaseError> {
     let mut tx = pool.begin().await?;
+
+    if !force {
+        let source: Option<String> = sqlx::query_scalar(
+            "SELECT lease_source FROM mm_fleet_desired WHERE mm_node_id = $1 FOR UPDATE",
+        )
+        .bind(node_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if source.as_deref() == Some("autoscale") {
+            return Err(LeaseError::InSharedPool(node_id.clone()));
+        }
+    }
 
     let marked = if force {
         sqlx::query(

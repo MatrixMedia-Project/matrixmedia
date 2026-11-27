@@ -414,6 +414,64 @@ async fn release_with_force_evicts() {
     assert_eq!(v["state"], json!("evicted"));
 }
 
+/// A relay of the shared pool is not drained through this route: the answer says how to
+/// shrink the pool instead, and nothing is written. With force it is evicted as before.
+#[tokio::test]
+async fn releasing_a_pool_relay_without_force_is_a_conflict() {
+    let Some((pool, _g)) = fresh().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping releasing_a_pool_relay_without_force_is_a_conflict"
+        );
+        return;
+    };
+    let id = "lease-pool-release-test-0";
+    seed_leased_node(&pool, id, "healthy", 7).await;
+    sqlx::query("UPDATE mm_fleet_desired SET lease_source = 'autoscale' WHERE mm_node_id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = app(pool.clone());
+
+    let (status, v) = call(
+        &app,
+        "DELETE",
+        &format!("{BASE}/leases/{id}?force=false"),
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_eq!(
+        v["message"],
+        json!(
+            "this relay belongs to the shared pool: lower fleet.max_relay_nodes to shrink the pool, or release it with force"
+        )
+    );
+    let (state, release): (String, Option<String>) = sqlx::query_as(
+        "SELECT n.state, d.lease_release FROM mm_fleet_nodes n
+           JOIN mm_fleet_desired d ON d.mm_node_id = n.mm_node_id
+          WHERE n.mm_node_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((state.as_str(), release), ("healthy", None));
+    assert!(audit_rows(&pool, "lease.release").await.is_empty());
+
+    let (status, v) = call(
+        &app,
+        "DELETE",
+        &format!("{BASE}/leases/{id}?force=true"),
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+    assert_eq!(v["state"], json!("evicted"));
+}
+
 #[tokio::test]
 async fn release_of_an_unknown_node_is_404() {
     let Some((pool, _g)) = fresh().await else {

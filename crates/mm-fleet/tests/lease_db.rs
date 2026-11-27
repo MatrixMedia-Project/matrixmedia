@@ -292,6 +292,45 @@ async fn release_marks_draining_without_forcing() {
     assert_eq!(lease_release_of(&pool, id).await.as_deref(), Some("drain"));
 }
 
+/// A pool relay is not drained one at a time: a drained relay leaves the pool while its lease
+/// stays paid, and the pool rents a replacement on top. Releasing one without force is
+/// refused and changes nothing; with force it is evicted as any lease.
+#[tokio::test]
+async fn a_pool_lease_is_released_only_with_force() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_pool_lease_is_released_only_with_force");
+        return;
+    };
+    let now = db_now();
+    let ids = lease_db::create_autoscale(&pool, "eu", 1, Duration::hours(1), now)
+        .await
+        .expect("create_autoscale");
+    let id = &ids[0];
+    seed_node(&pool, id.as_str(), "healthy").await;
+    set_viewers(&pool, id, 3).await;
+    let deadline = node_deadline(&pool, id).await;
+
+    let err = lease_db::release(&pool, id, false)
+        .await
+        .expect_err("a pool lease is not drained");
+    assert!(
+        matches!(err, LeaseError::InSharedPool(ref n) if n == id),
+        "got: {err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "this relay belongs to the shared pool: lower fleet.max_relay_nodes to shrink the pool, or release it with force"
+    );
+    assert_eq!(node_state(&pool, id.as_str()).await, "healthy");
+    assert_eq!(lease_release_of(&pool, id).await, None);
+    assert_eq!(node_deadline(&pool, id).await, deadline);
+
+    let state = lease_db::release(&pool, id, true).await.expect("forced");
+    assert_eq!(state, ReleaseState::Evicted);
+    assert_eq!(node_state(&pool, id.as_str()).await, "draining");
+    assert_eq!(lease_release_of(&pool, id).await.as_deref(), Some("force"));
+}
+
 #[tokio::test]
 async fn forced_release_pulls_the_deadline_to_now_and_stays_evicted() {
     let Some((pool, _g)) = setup().await else {
@@ -365,6 +404,23 @@ async fn set_viewers(pool: &PgPool, id: &NodeId, viewers: i32) {
         .execute(pool)
         .await
         .expect("set viewers");
+}
+
+/// Drain-release a pool lease the way a drain release marks a manual one: its node
+/// `draining`, its row `lease_release = 'drain'`. [`lease_db::release`] refuses this for a pool
+/// lease, but the pool's passes still honour a drain marker on its row, so it is written
+/// directly.
+async fn mark_drain_released(pool: &PgPool, id: &NodeId) {
+    sqlx::query("UPDATE mm_fleet_nodes SET state = 'draining' WHERE mm_node_id = $1")
+        .bind(id.as_str())
+        .execute(pool)
+        .await
+        .expect("drain the node");
+    sqlx::query("UPDATE mm_fleet_desired SET lease_release = 'drain' WHERE mm_node_id = $1")
+        .bind(id.as_str())
+        .execute(pool)
+        .await
+        .expect("mark the drain release");
 }
 
 async fn desired_deadline(pool: &PgPool, id: &NodeId) -> DateTime<Utc> {
@@ -485,9 +541,7 @@ async fn the_live_pool_counts_a_lease_with_no_node_yet_as_idle_and_skips_release
     seed_node(&pool, ids[1].as_str(), "healthy").await;
     set_viewers(&pool, &ids[1], 4).await;
     seed_node(&pool, ids[2].as_str(), "healthy").await;
-    lease_db::release(&pool, &ids[2], false)
-        .await
-        .expect("release");
+    mark_drain_released(&pool, &ids[2]).await;
     // A manual lease is not part of the pool.
     lease_db::create(&pool, &req(Uuid::new_v4(), 1))
         .await
@@ -671,9 +725,7 @@ async fn a_drained_lease_and_two_idle_ones(pool: &PgPool, now: DateTime<Utc>) ->
         .expect("create_autoscale");
     seed_node(pool, ids[0].as_str(), "healthy").await;
     seed_node(pool, ids[1].as_str(), "healthy").await;
-    lease_db::release(pool, &ids[0], false)
-        .await
-        .expect("drain release");
+    mark_drain_released(pool, &ids[0]).await;
     ids
 }
 
@@ -1107,9 +1159,7 @@ async fn manual_extension_does_not_touch_autoscale_leases() {
         .expect("create_autoscale");
     seed_node(&pool, drained[0].as_str(), "healthy").await;
     set_viewers(&pool, &drained[0], 4).await;
-    lease_db::release(&pool, &drained[0], false)
-        .await
-        .expect("drain release");
+    mark_drain_released(&pool, &drained[0]).await;
     let manual = lease_db::create(&pool, &req(Uuid::new_v4(), 1))
         .await
         .expect("manual");

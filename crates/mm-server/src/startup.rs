@@ -389,11 +389,17 @@ pub async fn run(
     // The rule itself is `switch_proxy::proxy_enabled`, applied where the join
     // reads the config: `config` here is a copy, so clearing a flag on it would
     // change nothing a handler sees.
-    if config.fleet.proxy_viewers && !mm_api::switch_proxy::proxy_enabled(&config) {
+    // The proxy is wanted with its flag or with a relay media path (relays are reached only
+    // through it).
+    let relay_path =
+        mm_core::fleet::media_path::effective(config.fleet.media_path, config.fleet.mode)
+            != mm_core::config::MediaPath::Core;
+    if (config.fleet.proxy_viewers || relay_path) && !mm_api::switch_proxy::proxy_enabled(&config) {
         tracing::error!(
-            "fleet.proxy_viewers is on but MM_SWITCH_AUTH_SECRET is unset — the S1 \
-             proxy cannot mint a bound viewer token, so it stays OFF and clients \
-             will keep talking to the switch directly. Set the secret to enable it."
+            "fleet.proxy_viewers or a relay fleet.media_path is set but \
+             MM_SWITCH_AUTH_SECRET is unset — the S1 proxy cannot mint a bound viewer \
+             token, so it stays OFF, clients keep talking to the switch directly and no \
+             viewer reaches a relay. Set the secret to enable it."
         );
     }
     if mm_api::switch_proxy::proxy_enabled(&config) {

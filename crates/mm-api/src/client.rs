@@ -2383,10 +2383,15 @@ async fn issue_viewer_join(
         // forwards to whichever node holds the viewer — which is what lets a
         // multi-node fleet serve the apps already in both stores with no update.
         // Off by default: this is the code path every viewer join traverses.
-        let switch_base = crate::switch_proxy::switch_base_url(
+        // Decided per stream: one that started in a relay state keeps the proxy
+        // (where its relays are) after the setting moved. The stored state is on
+        // the row already in hand, so this costs no extra read.
+        let switch_base = crate::switch_proxy::viewer_switch_url(
             public,
             &stream.id,
-            crate::switch_proxy::proxy_enabled(cfg),
+            mm_core::config::MediaPath::parse(&stream.media_path)
+                .unwrap_or(mm_core::config::MediaPath::Core),
+            cfg,
         );
         (
             Some(switch_base),

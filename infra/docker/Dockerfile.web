@@ -10,8 +10,9 @@
 #
 # WHAT IS AND ISN'T BAKED
 # -----------------------
-# Baked: the two SPAs that are buildable from this repository —
+# Baked: the SPAs that are buildable from this repository —
 #   @matrixmedia/dashboard -> /_mm/dashboard/   (Creator Studio + Operator Console)
+#   @matrixmedia/dashboard -> /_mm/studio/      (studio-only build: Creator Studio only)
 #   @matrixmedia/viewer    -> /_mm/viewer/
 #
 # NOT baked: nginx.conf. deploy/templates/nginx.tmpl.conf is a real template
@@ -48,12 +49,16 @@ RUN npm run build --workspace @matrixmedia/client
 ARG MM_BUILD_COMMIT=
 
 # Vite needs the public base path at build time so hashed asset URLs resolve
-# under the /_mm/<app>/ prefixes nginx serves them from.
+# under the /_mm/<app>/ prefixes nginx serves them from. The dashboard is
+# built twice: the full app for /_mm/dashboard/ and the studio-only build
+# (Creator Studio routes only, mode `studio`) for /_mm/studio/.
 RUN npm run build --workspace @matrixmedia/dashboard -- --base=/_mm/dashboard/ \
+ && npm run build:studio --workspace @matrixmedia/dashboard \
  && npm run build --workspace @matrixmedia/viewer    -- --base=/_mm/viewer/
 
 # ---- stage 2: serve ---------------------------------------------------------
 FROM nginx:alpine
 COPY --from=build /src/packages/mm-dashboard/dist /usr/share/nginx/html/dashboard
+COPY --from=build /src/packages/mm-dashboard/dist-studio /usr/share/nginx/html/studio
 COPY --from=build /src/packages/mm-viewer/dist    /usr/share/nginx/html/viewer
 EXPOSE 80

@@ -28,7 +28,7 @@ vi.mock('./pages/settings/Banners', () => ({ SettingsBanners: () => null }));
 vi.mock('./components/BuildInfo', () => ({ BuildInfo: () => null }));
 
 import * as creatorApi from './api/CreatorApiClient';
-import { AppRoutes } from './App';
+import { AppRoutes, StudioRoutes } from './App';
 import { ROUTES, fillParams, routeForPath, type RouteDef } from './routes/manifest';
 import { ROLE_MATRIX_GOLDEN, type GoldenRow } from './routes/roleMatrix.golden';
 
@@ -89,6 +89,44 @@ const COMBOS: readonly { key: keyof Omit<GoldenRow, 'url' | 'target'>; role: 'ad
 ];
 
 const CASES = ROLE_MATRIX_GOLDEN.flatMap((g) => COMBOS.map((c) => [g.url, c.key, g, c] as const));
+
+function openStudio(url: string, creator: boolean) {
+  sessionStorage.setItem('mm_admin_token', 'test-token');
+  sessionStorage.setItem('mm_admin_role', 'admin');
+  sessionStorage.setItem('mm_admin_user', '@someone:example.org');
+  if (creator) {
+    m.getCreatorProfile.mockResolvedValue({} as Awaited<ReturnType<typeof creatorApi.getCreatorProfile>>);
+  } else {
+    m.getCreatorProfile.mockRejectedValue(new Error('not a creator'));
+  }
+  render(
+    <MemoryRouter initialEntries={[url]}>
+      <Where />
+      <StudioRoutes />
+    </MemoryRouter>,
+  );
+}
+
+describe('StudioRoutes serves only the Creator Studio', () => {
+  it('the bare root lands on the Studio home', async () => {
+    openStudio('/', true);
+    await waitFor(() => expect(mounted).toHaveBeenCalledWith('creator-home'));
+    expect(where()).toBe('/creator');
+  });
+
+  it('an operator path cannot be reached and lands on the Studio home', async () => {
+    openStudio('/streams', true);
+    await waitFor(() => expect(mounted).toHaveBeenCalledWith('creator-home'));
+    expect(mounted).not.toHaveBeenCalledWith('streams');
+    expect(where()).toBe('/creator');
+  });
+
+  it('a creator page mounts on its own path', async () => {
+    openStudio('/creator/earnings', true);
+    await waitFor(() => expect(mounted).toHaveBeenCalledWith('creator-earnings'));
+    expect(where()).toBe('/creator/earnings');
+  });
+});
 
 describe('the golden role matrix holds through the real router and Layout guard', () => {
   it.each(CASES)('%s as %s', async (_url, _who, g, c) => {

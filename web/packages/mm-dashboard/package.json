@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:studio": "tsc -b && vite build --mode studio --base=/_mm/studio/ --outDir dist-studio",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"

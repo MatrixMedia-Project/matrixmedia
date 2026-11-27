@@ -6,6 +6,7 @@ import { navForRole } from './nav';
 import { RoleSwitcher } from './RoleSwitcher';
 import { resolvePathMode } from '../auth/routeMode';
 import { canViewRoute, getStoredMode, type DashboardMode } from '../auth/roles';
+import { STUDIO_ONLY } from '../appFlavor';
 import { SettingsBanners } from '../pages/settings/Banners';
 import { BuildInfo } from './BuildInfo';
 
@@ -40,7 +41,7 @@ export function Layout() {
   const navigate = useNavigate();
   const role = getRole();
   const userId = getUserId();
-  const items = navForRole(mode, role);
+  const items = navForRole(STUDIO_ONLY ? 'creator' : mode, role);
   // A route this user may not open is not rendered at all while the effect below
   // redirects: mounting it would let the page fire its requests (and real data
   // reach the client unrendered) before the redirect lands. Mode-agnostic routes
@@ -105,7 +106,7 @@ export function Layout() {
       <aside className={`sidebar${sidebarOpen ? ' open' : ''}${railCollapsed ? ' mm-rail-collapsed' : ''}`}>
         <div className="sidebar-brand">MatrixMedia</div>
 
-        {canSwitch && (
+        {canSwitch && !STUDIO_ONLY && (
           <div className="sidebar-switcher">
             <RoleSwitcher mode={mode} onChange={handleSwitch} />
           </div>
@@ -160,6 +161,12 @@ export function Layout() {
         </div>
         {!loading && mode === 'operator' && <SettingsBanners />}
         {!loading && !blocked && <Outlet />}
+        {!loading && blocked && STUDIO_ONLY && (
+          <div className="mm-page-fallback">
+            Creator Studio needs a creator account. Ask an operator to enable Creator Studio for
+            your account, or open the full dashboard instead.
+          </div>
+        )}
         {loading && <div className="mm-page-fallback">Loading…</div>}
       </main>
     </div>

@@ -34,6 +34,10 @@ struct Calls {
     held: HashSet<String>,
     /// Answer every removal with a 500 and keep the source.
     fail_removals: bool,
+    /// A feed row another server instance records for this relay while a seed is in
+    /// flight: inserted just before the seed is answered. (database, stream, node,
+    /// feeder, depth).
+    written_elsewhere: Option<(sqlx::PgPool, String, String, Option<String>, i16)>,
 }
 
 type Recorder = Arc<Mutex<Calls>>;
@@ -92,6 +96,19 @@ async fn fake_relay(viewers: Value) -> (String, Recorder) {
                 let id = body["id"].as_str().unwrap_or_default().to_string();
                 let mut calls = calls.lock().await;
                 calls.seeds.push(body);
+                if let Some((db, stream, node, feeder, depth)) = calls.written_elsewhere.take() {
+                    sqlx::query(
+                        "INSERT INTO mm_fleet_relay_feeds (stream_id, node_id, feeder_node_id, depth)
+                         VALUES ($1, $2, $3, $4)",
+                    )
+                    .bind(stream)
+                    .bind(node)
+                    .bind(feeder)
+                    .bind(depth)
+                    .execute(&db)
+                    .await
+                    .expect("insert the other instance's row");
+                }
                 if calls.held.insert(id.clone()) {
                     (StatusCode::CREATED, Json(json!({ "id": id, "status": "pending" })))
                 } else {
@@ -510,6 +527,72 @@ async fn a_source_found_with_no_row_is_adopted_as_a_leaf() {
     mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
     assert_eq!(removals_of(&calls, &source).await, 1, "an adopted leaf is removed like any row");
     assert!(feeds(&db, &b1).await.is_empty());
+
+    cleanup(&db, &b1, &[&node], &provider).await;
+}
+
+/// Two server instances: this one planned to add the relay (no row when it read them),
+/// and while its seed is in flight the other instance's seed creates the source and
+/// records where it pulls from. This one's seed then finds the source already there. Its
+/// adoption must not overwrite the confirmed row: that row is what holds the feeder.
+#[tokio::test]
+async fn an_adoption_never_overwrites_a_row_written_meanwhile() {
+    let _serial = SERIAL.lock().await;
+    let Some(db) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    mm_db::run_pg_migrations(&db)
+        .await
+        .expect("migrations should apply cleanly");
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let node = format!("0-feeds-{tag}-raced");
+    let feeder = format!("0-feeds-{tag}-feeder");
+    let provider = format!("feeds-{tag}");
+    let zone = "ams-1";
+
+    let b1 = seed_active_stream(&db).await;
+    sqlx::query("UPDATE mm_streams SET media_path = 'relay_after_threshold' WHERE id = $1")
+        .bind(&b1)
+        .execute(&db)
+        .await
+        .expect("set media_path");
+    let source = switch_source_id(&b1);
+    let origin_url = fake_origin(
+        json!([{ "id": source, "type": "webrtc", "active": true }]),
+        json!([{ "id": switch_viewer_id(&b1, "@alice:example.org"), "current_source": source, "connected": true }]),
+    )
+    .await;
+    let (url, calls) = fake_relay(json!(null)).await;
+    {
+        let mut calls = calls.lock().await;
+        // The other instance's seed got there first: the source exists...
+        calls.held.insert(source.clone());
+        // ...and its row is written while this instance's seed is in flight.
+        calls.written_elsewhere = Some((
+            db.clone(),
+            b1.clone(),
+            node.clone(),
+            Some(feeder.clone()),
+            2,
+        ));
+    }
+
+    seed_provider_zone(&db, &provider, zone).await;
+    seed_relay(&db, &node, "192.0.2.5", &provider, zone).await;
+    let ctx = context(HashMap::from([("192.0.2.5".to_string(), url)]));
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin_url),
+    )));
+
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(seeded_from(&calls, &source).await, vec![json!(origin_url)]);
+    assert_eq!(
+        feeds(&db, &b1).await,
+        vec![(node.clone(), Some(feeder.clone()), 2)],
+        "the confirmed row is left exactly as it was"
+    );
 
     cleanup(&db, &b1, &[&node], &provider).await;
 }

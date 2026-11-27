@@ -499,7 +499,8 @@ enum Ensure {
 /// keep its feeder looking busy. So it is adopted as a leaf of unknown origin: feeder
 /// unknown (`None`, so it is ensured against the entry and re-created from there if it
 /// dies), depth `MAX_RELAY_DEPTH`. That is safe: a recorded depth is an upper bound, and
-/// at the limit the row is never a carrier, so it can never be anyone's ancestor.
+/// at the limit the row is never a carrier, so it can never be anyone's ancestor. An
+/// adopted row is recorded only where no row exists ([`adopt_feed_row`]).
 fn row_to_write(kind: Ensure, planned: &FeedRow, seeded: Seeded) -> Option<FeedRow> {
     match seeded {
         Seeded::Created | Seeded::Recreated => Some(FeedRow {
@@ -1210,7 +1211,11 @@ impl NodeFeedWork {
             )
             .await;
             if let Some(written) = row_to_write(kind, &row, seeded) {
-                write_feed_row(db, &written).await;
+                if matches!(seeded, Seeded::AlreadyThere(_)) {
+                    adopt_feed_row(db, &written).await;
+                } else {
+                    write_feed_row(db, &written).await;
+                }
             }
             reports
                 .lock()
@@ -1250,7 +1255,7 @@ async fn load_live_media_paths(db: &PgPool) -> Result<HashMap<String, MediaPath>
 /// Record where a relay's source now pulls from, after a seed created or re-created it.
 /// Overwrites a stored row for the same relay: the seed that just ran is the truth. Two
 /// server instances seeding the same relay at once cannot both create the source (the
-/// second gets 409 and writes nothing).
+/// second gets 409, and at most adopts where no row exists).
 async fn write_feed_row(db: &PgPool, row: &FeedRow) {
     if let Err(e) = sqlx::query(
         "INSERT INTO mm_fleet_relay_feeds (stream_id, node_id, feeder_node_id, depth)
@@ -1270,6 +1275,32 @@ async fn write_feed_row(db: &PgPool, row: &FeedRow) {
             broadcast = %row.stream_id,
             error = %e,
             "relay feeding: recording a feed failed"
+        );
+    }
+}
+
+/// Record an adopted leaf (see [`row_to_write`]), only where no row exists. A row that
+/// is there was written by a seed that created the source (another server instance's,
+/// between this tick's read of the rows and its seed), so it names where the source
+/// really pulls from and must not be replaced by "origin unknown".
+async fn adopt_feed_row(db: &PgPool, row: &FeedRow) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO mm_fleet_relay_feeds (stream_id, node_id, feeder_node_id, depth)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (stream_id, node_id) DO NOTHING",
+    )
+    .bind(&row.stream_id)
+    .bind(row.node_id.as_str())
+    .bind(row.feeder.as_ref().map(NodeId::as_str))
+    .bind(i16::from(row.depth))
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            relay = %row.node_id,
+            broadcast = %row.stream_id,
+            error = %e,
+            "relay feeding: recording an adopted feed failed"
         );
     }
 }

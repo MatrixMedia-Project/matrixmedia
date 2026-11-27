@@ -1796,7 +1796,7 @@ async fn a_host_end_never_announces_a_hidden_recording() {
     assert_eq!(hidden_state(&pool, &open).await, (false, false));
 }
 
-/// Review Focus 1: a stream keeps the media path state it started in. The state is read
+/// A stream keeps the media path state it started in. The state is read
 /// from the live settings when the stream starts (`starting_media_path`, what stream
 /// creation stores) and written on the row; changing the setting afterwards changes the
 /// state of new streams only.

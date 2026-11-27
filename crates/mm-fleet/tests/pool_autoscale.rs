@@ -283,10 +283,10 @@ async fn a_frozen_fleet_still_extends_a_relay_with_viewers() {
 }
 
 #[tokio::test]
-async fn the_core_state_retires_an_idle_lease_near_its_deadline() {
+async fn with_nothing_wanted_an_idle_lease_near_its_deadline_is_retired() {
     let Some((pool, _g)) = setup().await else {
         eprintln!(
-            "MM_DATABASE_URL not set — skipping the_core_state_retires_an_idle_lease_near_its_deadline"
+            "MM_DATABASE_URL not set — skipping with_nothing_wanted_an_idle_lease_near_its_deadline_is_retired"
         );
         return;
     };

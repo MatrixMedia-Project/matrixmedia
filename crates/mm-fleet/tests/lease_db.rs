@@ -834,7 +834,7 @@ async fn a_lease_whose_node_is_destroying_or_gone_is_not_extended() {
     }
 }
 
-// ── fix round 1: eligibility (finding 1) ──────────────────────────────────────
+// ── Which pool leases are eligible for extension ──────────────────────────────
 
 /// A node stuck in boot runs on its first deadline like a manual one, and takes no keep slot.
 #[tokio::test]
@@ -928,7 +928,7 @@ async fn equal_busy_leases_are_all_extended_and_equal_idle_ones_go_by_id() {
     );
 }
 
-// ── fix round 1: sizing the pool (finding 2) ──────────────────────────────────
+// ── Sizing the pool ───────────────────────────────────────────────────────────
 
 async fn autoscale_ids(pool: &PgPool) -> Vec<String> {
     sqlx::query_scalar(
@@ -1031,7 +1031,7 @@ async fn a_top_up_writes_at_most_a_hundred_rows_per_call() {
     assert_eq!(autoscale_ids(&pool).await.len(), 100);
 }
 
-// ── fix round 1: retiring idle leases (finding 3) ─────────────────────────────
+// ── Retiring idle leases ──────────────────────────────────────────────────────
 
 fn deadline_kills() -> u64 {
     mm_core::metrics_global::FLEET_REAPER_DEADLINE_KILLS

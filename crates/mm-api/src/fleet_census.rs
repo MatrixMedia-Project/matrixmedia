@@ -67,7 +67,7 @@ struct Tally {
     /// People per source ([`is_audience`]), across the origin and every node.
     by_source: HashMap<String, u32>,
     /// (node, broadcast) connected sessions on `stream-<broadcast>` sources, relay links
-    /// included, for the relay-hour meter's samples (Task 9, §8.2 R4): a relay link costs
+    /// included, for the relay-hour meter's samples (§8.2 R4): a relay link costs
     /// the node one stream's egress, like a person. The origin is never a key.
     per_node_per_broadcast: HashMap<(mm_core::fleet::NodeId, String), i64>,
     /// Fan-out nodes with at least one person listed on an `ad-…` source, connected or

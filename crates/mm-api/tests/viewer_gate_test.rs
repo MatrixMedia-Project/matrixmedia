@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 
 use mm_api::client::{ViewerGate, authorize_viewer};
 use mm_api::error::ApiError;
-use mm_api::switch_proxy::admit_offer;
+use mm_api::switch_proxy::{admit_member_offer, admit_offer};
 use mm_core::permissions::TierPermissions;
 use mm_core::switch_client::switch_source_id;
 use mm_core::types::{ParticipantRole, RoomId, StreamId, UserId};
@@ -376,7 +376,8 @@ async fn the_proxy_refuses_every_offer_while_it_is_off() {
         let answer = outcome(admit_offer(&f.gate(), false, &stream.id, caller, Some(&source)).await).await;
         assert_eq!(refused(&answer), (StatusCode::NOT_IMPLEMENTED, "MM_FEATURE_DISABLED"));
     }
-    // Refused before any lookup, so a disabled route says nothing about the stream.
+    // Told the proxy is off, the gate refuses before any lookup. (The route itself always
+    // passes `true` and decides the proxy after the gate.)
     assert_eq!(f.requests(), 0);
     // /join is not the proxy and is unaffected by its flag.
     assert_eq!(f.via_join(&stream, &member).await, Outcome::Admitted);
@@ -467,4 +468,63 @@ async fn an_ended_stream_is_gone_on_both() {
 
     let answer = f.both(&stream, &member).await;
     assert_eq!(refused(&answer), (StatusCode::GONE, "MM_STREAM_ENDED"));
+}
+
+/// A signed-in member the gate refuses gets the same answer from the proxy whatever state the
+/// stream was stored in: the proxy is decided after the gate, so a refusal says nothing about
+/// whether the stream uses relays.
+#[tokio::test]
+async fn an_unauthorized_member_gets_the_same_answer_whatever_the_streams_state() {
+    let pool =
+        pool_or_skip!("an_unauthorized_member_gets_the_same_answer_whatever_the_streams_state");
+    let f = fixture(&pool, "state-blind").await;
+    let mut cfg = mm_core::config::Config::default();
+    cfg.fleet.mode = mm_core::config::FleetMode::On;
+    cfg.fleet.proxy_viewers = false;
+    cfg.fleet.media_path = mm_core::config::MediaPath::Core;
+    cfg.advertising.switch_auth_secret = "s3cret".into();
+    let stranger = someone("stranger");
+    let member = f.member("viewer");
+
+    let mut answers = Vec::new();
+    for path in ["core", "relay_after_threshold"] {
+        let stream =
+            f.db.create_stream(
+                f.room_row,
+                &f.host,
+                Some("broadcast"),
+                "video",
+                None,
+                None,
+                path,
+            )
+            .await
+            .expect("create stream");
+        let source = switch_source_id(&stream.id);
+        let answer = outcome(
+            admit_member_offer(&f.gate(), &cfg, None, &stream.id, &stranger, Some(&source))
+                .await
+                .map(|(stream, _)| stream),
+        )
+        .await;
+        answers.push(refused(&answer).0);
+
+        // A member the gate admits is then told whether the proxy serves the stream: not a
+        // core stream with the proxy off server-wide, yes one stored in a relay state.
+        let admitted = outcome(
+            admit_member_offer(&f.gate(), &cfg, None, &stream.id, &member, Some(&source))
+                .await
+                .map(|(stream, _)| stream),
+        )
+        .await;
+        if path == "core" {
+            assert_eq!(
+                refused(&admitted),
+                (StatusCode::NOT_IMPLEMENTED, "MM_FEATURE_DISABLED")
+            );
+        } else {
+            assert_eq!(admitted, Outcome::Admitted);
+        }
+    }
+    assert_eq!(answers, vec![StatusCode::NOT_FOUND, StatusCode::NOT_FOUND]);
 }

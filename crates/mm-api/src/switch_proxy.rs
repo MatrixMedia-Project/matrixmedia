@@ -118,35 +118,6 @@ fn proxy_off() -> ApiError {
     .into()
 }
 
-/// [`proxy_serves_offer`] for stream `id`, reading only what it needs: nothing when the
-/// proxy is on server-wide or off for want of the secret, then the viewer's binding, then
-/// the stream's stored state (one row read; no membership lookup, so a refusal here says
-/// nothing about who may watch).
-async fn proxy_serves(
-    state: &SharedState,
-    cfg: &mm_core::config::Config,
-    id: &str,
-    viewer: Option<&mm_core::fleet::ViewerId>,
-) -> Result<bool, ApiError> {
-    if !secret_set(cfg) {
-        return Ok(false);
-    }
-    if proxy_enabled(cfg) {
-        return Ok(true);
-    }
-    if let (Some(pool), Some(viewer)) = (state.switch_pool.as_deref(), viewer)
-        && on_a_relay(pool, viewer).await
-    {
-        return Ok(true);
-    }
-    let stored = state
-        .db
-        .get_stream(&StreamId(id.to_string()))
-        .await?
-        .map(|s| MediaPath::parse(&s.media_path).unwrap_or(MediaPath::Core));
-    Ok(proxy_serves_offer(cfg, stored, false))
-}
-
 /// Is `viewer` bound to a relay the pool still holds? Bindings exist only for relays: a
 /// viewer on the origin is unbound.
 pub async fn on_a_relay(pool: &SwitchPool, viewer: &mm_core::fleet::ViewerId) -> bool {
@@ -432,12 +403,13 @@ fn unwrap_node_answer(body: serde_json::Value) -> serde_json::Value {
 /// node is touched. Factored over its dependencies like
 /// [`crate::client::authorize_viewer`] so tests can drive it. In order:
 ///
-/// 1. The proxy serves this offer (`proxy_on`, decided by the caller from
-///    [`proxy_serves_offer`]: for the stream, or because the viewer is already on a
-///    relay). Off, it is the route's 501, before any membership lookup, so it says
-///    nothing about who may watch the stream. The route is mounted whatever the flag says: the settings live in
-///    the database and can change while mm-core runs, so the flag is read per
-///    request rather than when the router is built.
+/// 1. `proxy_on`: off, it is the route's 501, before any lookup. The handler passes `true`
+///    on every path and decides whether the proxy serves the stream and viewer only AFTER
+///    this gate ([`admit_member_offer`], and the same check for the token and share-link
+///    paths), so the answer to a caller the gate refuses never depends on the state the
+///    stream was stored in. The route is mounted whatever the settings say: they live in
+///    the database and can change while mm-core runs, so they are read per request rather
+///    than when the router is built.
 /// 2. `/join`'s viewer gate, the same function: membership, ended, the content
 ///    and tier gates, capacity. Minting a viewer token is handing out the
 ///    stream, so the proxy must refuse whoever `/join` refuses, with the same
@@ -467,6 +439,51 @@ pub async fn admit_offer(
         .into());
     }
     Ok(stream)
+}
+
+/// Admit a member who presents an MM JWT. In order: the secret (without it nothing can be
+/// served, refused before any lookup); [`admit_offer`], `/join`'s gate; then whether the
+/// proxy serves this stream and viewer ([`proxy_serves_admitted`]). The proxy is decided
+/// after the gate, as for the token and share-link paths, so the answer to a caller the gate
+/// refuses never depends on the state the stream was stored in. Returns the stream and the
+/// viewer id derived from the caller.
+pub async fn admit_member_offer(
+    gate: &ViewerGate<'_>,
+    cfg: &mm_core::config::Config,
+    pool: Option<&SwitchPool>,
+    id: &str,
+    caller: &UserId,
+    requested_source: Option<&str>,
+) -> Result<(Stream, String), ApiError> {
+    if !secret_set(cfg) {
+        return Err(proxy_off());
+    }
+    let stream = admit_offer(gate, true, id, caller, requested_source).await?;
+    // Derived, never taken from the body.
+    let viewer_id = mm_core::switch_client::switch_viewer_id(&stream.id, &caller.0);
+    proxy_serves_admitted(cfg, pool, &stream, &viewer_id).await?;
+    Ok((stream, viewer_id))
+}
+
+/// For a viewer the gate admitted: does the proxy serve this stream and viewer
+/// ([`proxy_serves_offer`]: the stream's stored state, or the viewer already on a relay)?
+/// Refused with the proxy's 501 otherwise.
+async fn proxy_serves_admitted(
+    cfg: &mm_core::config::Config,
+    pool: Option<&SwitchPool>,
+    stream: &Stream,
+    viewer_id: &str,
+) -> Result<(), ApiError> {
+    let bound = match pool {
+        Some(pool) => on_a_relay(pool, &mm_core::fleet::ViewerId::new(viewer_id)).await,
+        None => false,
+    };
+    let stored = MediaPath::parse(&stream.media_path).unwrap_or(MediaPath::Core);
+    if proxy_serves_offer(cfg, Some(stored), bound) {
+        Ok(())
+    } else {
+        Err(proxy_off())
+    }
 }
 
 /// The member seat a verified switch viewer token names, if any: the
@@ -578,31 +595,25 @@ async fn proxy_viewer_offer(
 ) -> Result<Json<ProxyOfferResponse>, ApiError> {
     let cfg = state.config();
     let gate = ViewerGate::from_state(&state, &cfg);
-    // Members first, exactly as before: a valid JWT takes the member gate and
+    // Members first: a valid JWT takes the member gate and
     // derives the viewer id from the Matrix user. Without one the caller must
     // be an anonymous share-link viewer, whose credential rides in the body.
     // These requests carry no `Authorization` header, so the `None` case costs
     // no Matrix-bearer fallback round-trip inside the extractor.
     let member_jwt = auth.is_some();
     let (stream, viewer_id) = match auth {
+        // The gate, then the proxy for this stream and viewer. `req.id` is accepted and
+        // dropped: the viewer id is derived from the Matrix user.
         Some(auth) => {
-            // Decided for this stream and this viewer before any membership lookup.
-            let viewer = mm_core::fleet::ViewerId::new(mm_core::switch_client::switch_viewer_id(
-                &id,
-                &auth.user_id.0,
-            ));
-            let stream = admit_offer(
+            admit_member_offer(
                 &gate,
-                proxy_serves(&state, &cfg, &id, Some(&viewer)).await?,
+                &cfg,
+                state.switch_pool.as_deref(),
                 &id,
                 &auth.user_id,
                 req.source_id.as_deref(),
             )
-            .await?;
-            // Derived, never taken from the body. `req.id` is accepted and dropped.
-            let viewer_id =
-                mm_core::switch_client::switch_viewer_id(&stream.id, &auth.user_id.0);
-            (stream, viewer_id)
+            .await?
         }
         None => {
             // Without the secret nothing here can work; refuse before any lookup. Whether
@@ -716,18 +727,10 @@ async fn proxy_viewer_offer(
     let stream_id = StreamId(stream.id.clone());
 
     // A viewer admitted by a switch viewer token or a share link: whether the proxy serves
-    // this stream and viewer, now that both are known (members were decided before their
-    // gate).
+    // this stream and viewer, now that both are known (members were decided the same way,
+    // after their gate, in `admit_member_offer`).
     if !member_jwt {
-        let viewer = mm_core::fleet::ViewerId::new(&viewer_id);
-        let bound = match state.switch_pool.as_deref() {
-            Some(pool) => on_a_relay(pool, &viewer).await,
-            None => false,
-        };
-        let stored = MediaPath::parse(&stream.media_path).unwrap_or(MediaPath::Core);
-        if !proxy_serves_offer(&cfg, Some(stored), bound) {
-            return Err(proxy_off());
-        }
+        proxy_serves_admitted(&cfg, state.switch_pool.as_deref(), &stream, &viewer_id).await?;
     }
 
     let (Some(pool), Some(secret)) = (

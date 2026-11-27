@@ -417,10 +417,10 @@ pub fn plan_feeds(
         // Which relay takes the entry ROTATES with `turn`: a relay that is in the pool
         // but cannot be seeded would otherwise take the slot on every tick, and every
         // other relay of the stream would wait behind it for good. `turn` comes from the
-        // wall clock (see `sync_once`), not a per-process counter, because two server
-        // instances that picked different relays would each send one a copy from the
-        // entry. With a stored carrier present nobody needs the entry, so the rotation
-        // changes nothing.
+        // wall clock (`feed_relays` computes it with `PoolSyncContext::turn`), not a
+        // per-process counter, because two server instances that picked different relays
+        // would each send one a copy from the entry. With a stored carrier present nobody
+        // needs the entry, so the rotation changes nothing.
         let mut adds: Vec<FeedRow> = Vec::new();
         let mut entry_only: Vec<FeedRow> = Vec::new();
         for place in &relays_in_order {
@@ -1892,11 +1892,11 @@ mod tests {
         assert_eq!(plan.add, vec![feed("n", None, 1)], "neither a nor b may feed n");
     }
 
-    /// Review finding 1, replayed. Rows A←X, B←A (B sorts before A); X drains; later Y
-    /// (a candidate fallback) leaves; then X is destroyed and A's source is re-created.
+    /// Rows A←X, B←A (B sorts before A); X drains; later Y (a candidate fallback) leaves;
+    /// then X is destroyed and A's source is re-created.
     /// A row changes only where a step says a source was re-created.
     #[test]
-    fn the_reviewers_sequence_cannot_form_a_loop() {
+    fn a_drained_feeder_and_a_lost_fallback_cannot_form_a_loop() {
         let all = |ids: &[&str]| -> Vec<RelayPlace> { ids.iter().map(|i| relay(i, "ams", 0)).collect() };
         let mut rows = vec![
             feed("A", Some("X"), 2),
@@ -2054,7 +2054,7 @@ mod tests {
         assert_eq!(plan.add, vec![feed("a", Some("c"), 2), feed("b", Some("c"), 2)]);
     }
 
-    /// Re-review finding: X was added as X←Q (3) and its seed created the source, but the
+    /// X was added as X←Q (3) and its seed created the source, but the
     /// row write was lost. On the next tick X is planned again and a new relay Y arrives.
     #[test]
     fn the_lost_row_sequence_cannot_reach_depth_four() {
@@ -2172,10 +2172,10 @@ mod tests {
         assert!(plan.keep.is_empty() && plan.fallback.is_empty());
     }
 
-    /// Re-review finding: rows C1←E, A←E, B←A. The stream drops under the line, B is held,
+    /// Rows C1←E, A←E, B←A. The stream drops under the line, B is held,
     /// and A's census misses B's link. Then the stream is wanted again.
     #[test]
-    fn the_re_reviewers_sequence_keeps_depth_within_three() {
+    fn a_stream_that_drops_under_the_line_and_returns_keeps_depth_within_three() {
         let relays = [relay("A", "ams", 0), relay("B", "ams", 3), relay("C1", "ams", 0)];
         let mut rows = vec![
             feed("A", None, 1),

@@ -578,7 +578,7 @@ mod tests {
         }
     }
 
-    /// Review Focus 5: a relay without the picture of a stream would hand its viewer
+    /// A relay without the picture of a stream would hand its viewer
     /// black video, so only a relay that carries the stream is offered.
     #[tokio::test]
     async fn a_viewer_is_only_sent_to_a_relay_that_carries_the_stream() {

@@ -154,8 +154,8 @@ mod tests {
         for (path, mode, viewers, want_relay) in [
             (RelayAfterThreshold, On, Some(50), true),
             (RelayAfterThreshold, On, Some(49), false),
-            (RelayAfterThreshold, On, None, false), // Review Focus 4
-            (RelayAfterThreshold, Frozen, Some(500), false), // Review Focus 2
+            (RelayAfterThreshold, On, None, false), // an unknown audience: the core
+            (RelayAfterThreshold, Frozen, Some(500), false), // frozen behaves as core
             (RelayAfterThreshold, Off, Some(500), false),
             (Core, On, Some(500), false),
             (RelayEntry, On, Some(50), true),

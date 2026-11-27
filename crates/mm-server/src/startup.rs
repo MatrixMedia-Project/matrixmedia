@@ -1060,7 +1060,7 @@ pub async fn run(
             );
             info!(
                 region = %live_config.load().fleet.default_region,
-                "Fleet planner running (tick 10 s, transcoders only; teardowns are completed by mm-fleet-runner)"
+                "Fleet planner running (tick 10 s: transcoders, and the relay pool sized in the same loop; teardowns are completed by mm-fleet-runner)"
             );
             let planner_cancel = cancel.clone();
             let pool_db = pg.clone();

@@ -38,6 +38,23 @@ async fn fresh_pool() -> Option<PgPool> {
     Some(pool)
 }
 
+/// Remove every fleet provider, so a test sees only the providers it inserts itself.
+async fn clear_providers(pool: &PgPool) {
+    for t in [
+        "mm_fleet_requests",
+        "mm_fleet_provider_status",
+        "mm_fleet_provider_credentials",
+        "mm_fleet_provider_sizes",
+        "mm_fleet_provider_zones",
+        "mm_fleet_providers",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
 fn base() -> Config {
     let mut c = Config::default();
     c.server.cors_origins = vec!["https://a.example".into()];
@@ -521,10 +538,12 @@ fn different(key: &str, kind: ValueKind, current: &Value) -> Value {
 async fn every_live_setting_takes_effect_without_a_restart() {
     let _g = lock().lock().await;
     let Some(pool) = fresh_pool().await else { return };
+    // Only the providers inserted below: none another test left behind.
+    clear_providers(&pool).await;
     // The media path guard refuses relay_after_threshold unless fleet.mode is on, a switch
     // secret is set, fleet.max_relay_nodes is at least 1 and a provider's relays can serve
     // viewers; the loop sets that path (before it lowers fleet.max_relay_nodes), so all four
-    // are in place.
+    // are in place (the last is `relay_provider()`, inserted below).
     let mut b = base();
     b.fleet.mode = mm_core::config::FleetMode::On;
     b.advertising.switch_auth_secret = SECRET.into();
@@ -557,6 +576,9 @@ async fn every_live_setting_takes_effect_without_a_restart() {
     )
     .await
     .unwrap();
+    mm_fleet::providers_db::insert(&pool, &relay_provider())
+        .await
+        .unwrap();
     for def in registry().iter().filter(|d| d.class == ApplyClass::Live) {
         let current = (def.get)(&api.svc.handle().load());
         let value = different(def.key, def.kind, &current);
@@ -607,19 +629,7 @@ async fn terraform_is_refused_for_a_role_no_provider_can_serve() {
     let Some(pool) = fresh_pool().await else {
         return;
     };
-    for t in [
-        "mm_fleet_requests",
-        "mm_fleet_provider_status",
-        "mm_fleet_provider_credentials",
-        "mm_fleet_provider_sizes",
-        "mm_fleet_provider_zones",
-        "mm_fleet_providers",
-    ] {
-        sqlx::query(&format!("DELETE FROM {t}"))
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
+    clear_providers(&pool).await;
     let api = start(&pool, base(), KeyRing::from_values(Some(K1), None).unwrap()).await;
     let (s, body) = api
         .patch(
@@ -769,19 +779,7 @@ async fn a_relay_media_path_is_refused_without_its_prerequisites() {
     let Some(pool) = fresh_pool().await else {
         return;
     };
-    for t in [
-        "mm_fleet_requests",
-        "mm_fleet_provider_status",
-        "mm_fleet_provider_credentials",
-        "mm_fleet_provider_sizes",
-        "mm_fleet_provider_zones",
-        "mm_fleet_providers",
-    ] {
-        sqlx::query(&format!("DELETE FROM {t}"))
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
+    clear_providers(&pool).await;
 
     // Nothing in place (fleet.mode frozen by default, a blank secret, no relay nodes allowed,
     // no provider): every prerequisite is named, in order.

@@ -38,6 +38,8 @@ struct Calls {
     /// flight: inserted just before the seed is answered. (database, stream, node,
     /// feeder, depth).
     written_elsewhere: Option<(sqlx::PgPool, String, String, Option<String>, i16)>,
+    /// List every source it holds as inactive: no picture (its feeder is gone).
+    dead: bool,
 }
 
 type Recorder = Arc<Mutex<Calls>>;
@@ -73,12 +75,11 @@ async fn fake_relay(viewers: Value) -> (String, Recorder) {
         .route(
             "/api/sources",
             get(|State(calls): State<Recorder>| async move {
+                let calls = calls.lock().await;
                 let held: Vec<Value> = calls
-                    .lock()
-                    .await
                     .held
                     .iter()
-                    .map(|id| json!({ "id": id, "type": "cascade", "active": true }))
+                    .map(|id| json!({ "id": id, "type": "cascade", "active": !calls.dead }))
                     .collect();
                 Json(json!({ "sources": held }))
             }),
@@ -595,6 +596,185 @@ async fn an_adoption_never_overwrites_a_row_written_meanwhile() {
     );
 
     cleanup(&db, &b1, &[&node], &provider).await;
+}
+
+/// A stream's only first-level relay dies and its three children are orphans whose sources
+/// are dead. Re-creating every one of them from the entry would have the main server send
+/// three copies for the rest of the stream; one is re-created from the entry, and the others
+/// a tick later from that one. A row already recorded as fed by the entry is re-created from
+/// the entry at once, whoever took the stream's entry this tick.
+#[tokio::test]
+async fn one_orphan_per_stream_and_tick_is_re_created_from_the_entry() {
+    let _serial = SERIAL.lock().await;
+    let Some(db) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    mm_db::run_pg_migrations(&db)
+        .await
+        .expect("migrations should apply cleanly");
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    // The first-level relay that died: it has a row, and no node any more.
+    let dead_feeder = format!("0-feeds-{tag}-x");
+    let orphans: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|s| format!("0-feeds-{tag}-{s}"))
+        .collect();
+    // An adopted leaf, recorded as fed by the entry, in another zone so that it never
+    // feeds the orphans.
+    let leaf = format!("0-feeds-{tag}-leaf");
+    let (provider, provider_b) = (format!("feeds-{tag}"), format!("feeds-{tag}-b"));
+
+    let b1 = seed_active_stream(&db).await;
+    sqlx::query("UPDATE mm_streams SET media_path = 'relay_after_threshold' WHERE id = $1")
+        .bind(&b1)
+        .execute(&db)
+        .await
+        .expect("set media_path");
+    let source = switch_source_id(&b1);
+    let origin_url = fake_origin(
+        json!([{ "id": source, "type": "webrtc", "active": true }]),
+        json!([{ "id": switch_viewer_id(&b1, "@alice:example.org"), "current_source": source, "connected": true }]),
+    )
+    .await;
+
+    seed_provider_zone(&db, &provider, "ams-1").await;
+    seed_provider_zone(&db, &provider_b, "ams-2").await;
+    let mut addresses = HashMap::new();
+    let mut calls: HashMap<String, Recorder> = HashMap::new();
+    for (i, node) in orphans.iter().chain([&leaf]).enumerate() {
+        let ip = format!("192.0.2.{}", 10 + i);
+        let (url, recorder) = fake_relay(json!(null)).await;
+        {
+            let mut r = recorder.lock().await;
+            r.held.insert(source.clone());
+            r.dead = true;
+        }
+        let (prov, zone) = if *node == leaf {
+            (&provider_b, "ams-2")
+        } else {
+            (&provider, "ams-1")
+        };
+        seed_relay(&db, node, &ip, prov, zone).await;
+        addresses.insert(ip, url);
+        calls.insert(node.clone(), recorder);
+    }
+    for (node, feeder, depth) in orphans
+        .iter()
+        .map(|o| (o.as_str(), Some(dead_feeder.as_str()), 2_i16))
+        .chain([(dead_feeder.as_str(), None, 1), (leaf.as_str(), None, 3)])
+    {
+        sqlx::query(
+            "INSERT INTO mm_fleet_relay_feeds (stream_id, node_id, feeder_node_id, depth)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&b1)
+        .bind(node)
+        .bind(feeder)
+        .bind(depth)
+        .execute(&db)
+        .await
+        .expect("insert feed");
+    }
+
+    // Dead sources are replaced the first time they read dead.
+    let ctx = context(addresses.clone()).with_inactive_grace(Duration::ZERO);
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin_url),
+    )));
+
+    // Pass 1: every orphan's fallback is the entry, but only one is re-created from it.
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    let mut replaced = Vec::new();
+    for orphan in &orphans {
+        if removals_of(&calls[orphan], &source).await == 1 {
+            replaced.push(orphan.clone());
+        }
+    }
+    assert_eq!(
+        replaced.len(),
+        1,
+        "exactly one orphan is re-created: {replaced:?}"
+    );
+    let winner = replaced[0].clone();
+    assert_eq!(
+        seeded_from(&calls[&winner], &source).await.last(),
+        Some(&json!(origin_url))
+    );
+    for orphan in orphans.iter().filter(|o| **o != winner) {
+        assert_eq!(
+            removals_of(&calls[orphan], &source).await,
+            0,
+            "{orphan} is left as it is this tick"
+        );
+        assert!(calls[orphan].lock().await.held.contains(&source));
+    }
+    assert_eq!(
+        removals_of(&calls[&leaf], &source).await,
+        1,
+        "a row recorded as fed by the entry is re-created at once"
+    );
+    assert_eq!(
+        seeded_from(&calls[&leaf], &source).await.last(),
+        Some(&json!(origin_url))
+    );
+    let mut expected: Vec<(String, Option<String>, i16)> = orphans
+        .iter()
+        .filter(|o| **o != winner)
+        .map(|o| (o.clone(), Some(dead_feeder.clone()), 2))
+        .chain([(winner.clone(), None, 1), (leaf.clone(), None, 1)])
+        .collect();
+    expected.sort();
+    assert_eq!(feeds(&db, &b1).await, expected);
+
+    // The winner's new source has the picture.
+    calls[&winner].lock().await.dead = false;
+    calls[&leaf].lock().await.dead = false;
+
+    // Pass 2: the other two take the winner, now a stored first-level relay, as their
+    // fallback, and are re-created from it.
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    let winner_url = &addresses[&format!(
+        "192.0.2.{}",
+        10 + orphans
+            .iter()
+            .position(|o| *o == winner)
+            .expect("an orphan")
+    )];
+    for orphan in orphans.iter().filter(|o| **o != winner) {
+        assert_eq!(removals_of(&calls[orphan], &source).await, 1, "{orphan}");
+        assert_eq!(
+            seeded_from(&calls[orphan], &source).await.last(),
+            Some(&json!(winner_url)),
+            "{orphan} is re-created from the winner, not the entry"
+        );
+    }
+    let mut expected: Vec<(String, Option<String>, i16)> = orphans
+        .iter()
+        .filter(|o| **o != winner)
+        .map(|o| (o.clone(), Some(winner.clone()), 2))
+        .chain([(winner.clone(), None, 1), (leaf.clone(), None, 1)])
+        .collect();
+    expected.sort();
+    assert_eq!(feeds(&db, &b1).await, expected);
+
+    let nodes: Vec<&str> = orphans
+        .iter()
+        .map(String::as_str)
+        .chain([leaf.as_str(), dead_feeder.as_str()])
+        .collect();
+    cleanup(&db, &b1, &nodes, &provider).await;
+    sqlx::query("DELETE FROM mm_fleet_provider_zones WHERE provider_id = $1")
+        .bind(&provider_b)
+        .execute(&db)
+        .await
+        .expect("delete zone");
+    sqlx::query("DELETE FROM mm_fleet_providers WHERE id = $1")
+        .bind(&provider_b)
+        .execute(&db)
+        .await
+        .expect("delete provider");
 }
 
 async fn seed_provider_zone(db: &sqlx::PgPool, provider: &str, zone: &str) {

@@ -410,7 +410,9 @@ pub fn plan_feeds(
         // stream per plan may be fed by the entry; any other whose only choice is the
         // entry waits for the next tick, when it can pull from the one that went first.
         // The tree thus grows by one confirmed level per tick. The bounded add (a relay
-        // that rows still pull from) and orphan fallbacks are repairs, not limited.
+        // that rows still pull from) and orphan fallbacks are repairs, not limited here; an
+        // orphan whose fallback is the entry is limited where its dead source would be
+        // replaced, one per stream and tick ([`EntryClaims`]).
         //
         // Which relay takes the entry ROTATES with `turn`: a relay that is in the pool
         // but cannot be seeded would otherwise take the slot on every tick, and every
@@ -483,8 +485,12 @@ pub fn plan_feeds(
 enum Ensure {
     /// A row the plan adds: no stored row describes this relay's source.
     Add,
-    /// A stored row (kept), or an orphan's fallback.
+    /// A stored row (kept).
     Stored,
+    /// An orphan's fallback. Written like a stored row; when it is the entry, a dead source
+    /// is replaced from it only by the one orphan of the stream that claims the entry this
+    /// tick ([`EntryClaims`]).
+    Fallback,
 }
 
 /// The row to write after a seed, if any. `planned` names the feeder the seed used.
@@ -606,6 +612,8 @@ async fn seed_cascade_source(
     secret: &str,
     broadcast_id: &str,
     inactive: &InactiveTracker,
+    grace: StdDuration,
+    from_entry: Option<&EntryClaims>,
 ) -> Seeded {
     // B1: the claim's "broadcast id" field must be the EXACT string the origin derives
     // from the offer it receives after stripping "cascade-" and "-{relay_node_id}" —
@@ -641,6 +649,8 @@ async fn seed_cascade_source(
                     &source_id,
                     &token,
                     inactive,
+                    grace,
+                    from_entry,
                 )
                 .await;
             }
@@ -747,6 +757,8 @@ async fn reconcile_existing_cascade_source(
     source_id: &str,
     fresh_token: &str,
     inactive: &InactiveTracker,
+    grace: StdDuration,
+    from_entry: Option<&EntryClaims>,
 ) -> Seeded {
     let key = (relay_node_id.clone(), source_id.to_string());
 
@@ -793,7 +805,24 @@ async fn reconcile_existing_cascade_source(
     let dead_for = now.duration_since(since);
     drop(guard);
 
-    if dead_for < INACTIVE_GRACE {
+    if dead_for < grace {
+        return Seeded::AlreadyThere(Liveness::NotActive);
+    }
+
+    // An orphan replaced from the entry makes the main server send it a copy for the rest of
+    // the stream. One orphan per stream and tick may: the others are left exactly as they are,
+    // and on the next tick take that one, by then a stored first-level relay, as their
+    // fallback. Claimed only here, where the source is known to be dead and its removal is
+    // the next step.
+    if let Some(claims) = from_entry
+        && !claims.claim(source_id)
+    {
+        tracing::info!(
+            relay = %relay_node_id,
+            source = source_id,
+            "cascade seed: another relay of this stream is re-created from the entry this \
+             tick; this dead source waits for the next one"
+        );
         return Seeded::AlreadyThere(Liveness::NotActive);
     }
 
@@ -880,6 +909,9 @@ pub struct PoolSyncContext {
     relay_base_url: Arc<dyn Fn(&str) -> String + Send + Sync>,
     /// The sync interval, which numbers the turns of the relay tree's entry slot.
     tick: StdDuration,
+    /// How long a relay's source may read dead before it is replaced
+    /// ([`INACTIVE_GRACE`]).
+    inactive_grace: StdDuration,
 }
 
 impl PoolSyncContext {
@@ -894,7 +926,15 @@ impl PoolSyncContext {
             public_switch_base_url,
             relay_base_url: Arc::new(|ip| format!("http://{ip}:{SWITCH_PORT}")),
             tick: StdDuration::from_secs(10),
+            inactive_grace: INACTIVE_GRACE,
         }
+    }
+
+    /// Set how long a relay's source may read dead before it is replaced. For tests, which
+    /// cannot wait out [`INACTIVE_GRACE`].
+    pub fn with_inactive_grace(mut self, grace: StdDuration) -> Self {
+        self.inactive_grace = grace;
+        self
     }
 
     /// Set the sync interval the entry slot's turn counts. `run_pool_sync` sets it from
@@ -1079,8 +1119,9 @@ async fn feed_relays(
     // orphan against its fallback. Each carries the row to write if its seed creates or
     // re-creates the source: the row with the feeder that seed used.
     let adds = plan.add.iter().map(|r| (r, Ensure::Add));
-    let stored = plan.keep.iter().chain(&plan.fallback).map(|r| (r, Ensure::Stored));
-    for (row, kind) in adds.chain(stored) {
+    let stored = plan.keep.iter().map(|r| (r, Ensure::Stored));
+    let fallbacks = plan.fallback.iter().map(|r| (r, Ensure::Fallback));
+    for (row, kind) in adds.chain(stored).chain(fallbacks) {
         let Some(origin_url) = origin_of(&row.feeder) else {
             continue;
         };
@@ -1104,6 +1145,7 @@ async fn feed_relays(
         })
         .collect();
     let seeded: SeedReports = Arc::default();
+    let entry_claims = EntryClaims::default();
 
     let mut relay_jobs = Vec::new();
     for (node_id, job) in work {
@@ -1114,7 +1156,12 @@ async fn feed_relays(
         let secret = secret.to_string();
         let relay_id = node_id.clone();
         let reports = seeded.clone();
-        let fut = async move { job.run(&client, &db, &relay_id, &secret, &reports).await };
+        let claims = entry_claims.clone();
+        let grace = ctx.inactive_grace;
+        let fut = async move {
+            job.run(&client, &db, &relay_id, &secret, &reports, &claims, grace)
+                .await
+        };
         relay_jobs.push((node_id, fut));
     }
     for relay_id in seed_relays_within_budget(relay_jobs, SEED_BUDGET_PER_RELAY).await {
@@ -1144,6 +1191,22 @@ async fn feed_relays(
     }
 }
 
+/// The streams one of whose orphans took the entry this tick: at most one orphan per
+/// stream and tick has its dead source replaced from the entry. Shared by the tick's relay
+/// jobs, which run concurrently.
+#[derive(Clone, Default)]
+struct EntryClaims(Arc<std::sync::Mutex<HashSet<String>>>);
+
+impl EntryClaims {
+    /// Take `stream`'s entry for this tick: `true` for the first caller only.
+    fn claim(&self, stream: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(stream.to_string())
+    }
+}
+
 /// Each relay's seed reports this tick: (relay, stream) → what the seed did. Written as each
 /// seed returns, so a relay that runs out of budget still reports the seeds it finished.
 type SeedReports = Arc<std::sync::Mutex<HashMap<NodeId, HashMap<String, Seeded>>>>;
@@ -1166,6 +1229,7 @@ struct NodeFeedWork {
 }
 
 impl NodeFeedWork {
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         self,
         client: &SwitchClient,
@@ -1173,6 +1237,8 @@ impl NodeFeedWork {
         relay_id: &NodeId,
         secret: &str,
         reports: &SeedReports,
+        entry_claims: &EntryClaims,
+        grace: StdDuration,
     ) {
         let relay_base_url = client.base_url().to_string();
 
@@ -1208,6 +1274,8 @@ impl NodeFeedWork {
                 secret,
                 &row.stream_id,
                 inactive_tracker(),
+                grace,
+                (kind == Ensure::Fallback && row.feeder.is_none()).then_some(entry_claims),
             )
             .await;
             if let Some(written) = row_to_write(kind, &row, seeded) {
@@ -2388,17 +2456,50 @@ mod tests {
         // Nothing there: created.
         let (url, _) = seed_relay(&[], true).await;
         let client = SwitchClient::with_auth(&url, "s".to_string());
-        let got = seed_cascade_source(&client, &url, &relay_id, "http://feeder", "s", "b1", &tracker).await;
+        let got = seed_cascade_source(
+            &client,
+            &url,
+            &relay_id,
+            "http://feeder",
+            "s",
+            "b1",
+            &tracker,
+            INACTIVE_GRACE,
+            None,
+        )
+        .await;
         assert_eq!(got, Seeded::Created);
 
         // There and alive: already there, nothing replaced.
-        let got = seed_cascade_source(&client, &url, &relay_id, "http://fallback", "s", "b1", &tracker).await;
+        let got = seed_cascade_source(
+            &client,
+            &url,
+            &relay_id,
+            "http://fallback",
+            "s",
+            "b1",
+            &tracker,
+            INACTIVE_GRACE,
+            None,
+        )
+        .await;
         assert_eq!(got, Seeded::AlreadyThere(Liveness::Active));
 
         // There, inactive, but inside the grace period: already there, not active.
         let (url, origins) = seed_relay(&[&source], false).await;
         let client = SwitchClient::with_auth(&url, "s".to_string());
-        let got = seed_cascade_source(&client, &url, &relay_id, "http://fallback", "s", "b1", &tracker).await;
+        let got = seed_cascade_source(
+            &client,
+            &url,
+            &relay_id,
+            "http://fallback",
+            "s",
+            "b1",
+            &tracker,
+            INACTIVE_GRACE,
+            None,
+        )
+        .await;
         assert_eq!(got, Seeded::AlreadyThere(Liveness::NotActive));
 
         // Inactive past the grace period: removed and re-created from the URL passed in.
@@ -2406,7 +2507,18 @@ mod tests {
             (relay_id.clone(), source.clone()),
             Instant::now() - INACTIVE_GRACE - StdDuration::from_secs(1),
         );
-        let got = seed_cascade_source(&client, &url, &relay_id, "http://fallback", "s", "b1", &tracker).await;
+        let got = seed_cascade_source(
+            &client,
+            &url,
+            &relay_id,
+            "http://fallback",
+            "s",
+            "b1",
+            &tracker,
+            INACTIVE_GRACE,
+            None,
+        )
+        .await;
         assert_eq!(got, Seeded::Recreated);
         assert_eq!(
             origins.lock().await.last().map(String::as_str),
@@ -2453,6 +2565,8 @@ mod tests {
             "s",
             "b1",
             &tracker,
+            INACTIVE_GRACE,
+            None,
         )
         .await;
         assert_eq!(got, Seeded::AlreadyThere(Liveness::Unread));

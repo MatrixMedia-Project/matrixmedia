@@ -27,10 +27,10 @@ use mm_core::error::MMError;
 use mm_core::types::{ParticipantId, ParticipantRole, RoomId, StreamId, StreamStatus, UserId};
 
 use models::{
-    CaptionTrack, ContentCategory, ContentGate, CreatorFollow, CreatorProfile, Donation,
-    DonationStatus, InteractionSummary, MockUser, Participant, Recording, RecordingStatus, Room,
-    ServerConfigEntry, Stream, Subscription, SubscriptionStatus, SubscriptionTier, TrendingEntry,
-    UserInteraction,
+    CaptionTrack, ContentCategory, ContentGate, CreatorBlock, CreatorFollow, CreatorProfile,
+    Donation, DonationStatus, FollowRoom, InteractionSummary, MockUser, Participant, Recording,
+    RecordingStatus, Room, ServerConfigEntry, Stream, Subscription, SubscriptionStatus,
+    SubscriptionTier, TrendingEntry, UserInteraction,
 };
 
 // Re-export PgDatabase as the primary implementation.
@@ -351,6 +351,10 @@ async fn run_pg_migrations_locked(
             "V064_room_marker",
             include_str!("../migrations/V064__room_marker.sql"),
         ),
+        (
+            "V065_follow_rooms",
+            include_str!("../migrations/V065__follow_rooms.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -403,16 +407,16 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V064. (V064 creates the
-        // mm_room_marker table, its only statement; the table did not exist
-        // before V064, so its presence alone proves the migration ran to
-        // completion.)
+        // UPDATE THIS PROBE when adding a migration past V065. (V065 creates
+        // the mm_follow_rooms_migrated marker table in its LAST statement;
+        // the table did not exist before V065, so its presence alone proves
+        // the migration ran to completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_room_marker'",
+                AND tablename  = 'mm_follow_rooms_migrated'",
         )
         .fetch_optional(pool)
         .await
@@ -1259,6 +1263,65 @@ pub trait Database: Send + Sync + 'static {
 
     /// Get all creators a user follows.
     async fn get_followed_creators(&self, user_id: &str) -> Result<Vec<CreatorFollow>, MMError>;
+
+    /// Get all followers of a creator (reverse of [`Database::get_followed_creators`]).
+    async fn get_creator_followers(
+        &self,
+        creator_user_id: &str,
+    ) -> Result<Vec<CreatorFollow>, MMError>;
+
+    /// Record the hidden personal follow room for a (follower, creator)
+    /// pair, replacing any previous room id for the pair.
+    async fn upsert_follow_room(
+        &self,
+        follower_user_id: &str,
+        creator_user_id: &str,
+        room_id: &str,
+    ) -> Result<FollowRoom, MMError>;
+
+    /// Look up the hidden personal follow room for a pair, if one exists.
+    async fn get_follow_room(
+        &self,
+        follower_user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<Option<FollowRoom>, MMError>;
+
+    /// Forget the room mapping for a pair (the Matrix-side membership is
+    /// torn down separately by the caller).
+    async fn delete_follow_room(
+        &self,
+        follower_user_id: &str,
+        creator_user_id: &str,
+    ) -> Result<(), MMError>;
+
+    /// Block a user from following a creator (also checked at follow time).
+    async fn block_user(
+        &self,
+        creator_user_id: &str,
+        blocked_user_id: &str,
+    ) -> Result<CreatorBlock, MMError>;
+
+    /// Remove a creator-side block.
+    async fn unblock_user(
+        &self,
+        creator_user_id: &str,
+        blocked_user_id: &str,
+    ) -> Result<(), MMError>;
+
+    /// Whether a user is blocked by a creator.
+    async fn is_blocked_by(&self, creator_user_id: &str, user_id: &str) -> Result<bool, MMError>;
+
+    /// Streamer preference: may new followers read past notices in their
+    /// follow room? Defaults to `true` when no row exists.
+    async fn get_notify_history_visible(&self, creator_user_id: &str) -> Result<bool, MMError>;
+
+    /// Set the streamer history preference (applies to rooms created
+    /// after the change; existing rooms keep their creation-time setting).
+    async fn set_notify_history_visible(
+        &self,
+        creator_user_id: &str,
+        history_visible: bool,
+    ) -> Result<(), MMError>;
 
     /// Replace the trending cache for a given period with new entries.
     async fn update_trending_cache(

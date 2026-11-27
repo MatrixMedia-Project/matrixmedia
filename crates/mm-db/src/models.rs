@@ -742,6 +742,26 @@ pub struct CreatorFollow {
     pub created_at: DateTime<Utc>,
 }
 
+/// The hidden personal Matrix room for one (follower, creator) pair (V065).
+/// The user never sees this room in any UI; membership in it IS the follow
+/// for notification purposes (follow = join, unfollow = leave).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FollowRoom {
+    pub follower_user_id: String,
+    pub creator_user_id: String,
+    pub room_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A streamer-side block (V065): the blocked user cannot follow the
+/// creator and receives no follow-room updates.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct CreatorBlock {
+    pub creator_user_id: String,
+    pub blocked_user_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A cached trending entry (PostgreSQL).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TrendingEntry {

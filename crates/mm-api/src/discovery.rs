@@ -387,10 +387,41 @@ pub async fn follow_creator(
 ) -> Result<Json<FollowResponse>, ApiError> {
     require_monetization(&state)?;
 
+    // A blocked user cannot follow (the same check runs again in
+    // `ensure_follow_room`, here it refuses the follow itself).
+    if state
+        .db
+        .is_blocked_by(&creator_user_id, auth.user_id.0.as_str())
+        .await?
+    {
+        return Err(MMError::api(ErrorCode::Forbidden, "blocked by creator").into());
+    }
+
     let follow: CreatorFollow = state
         .db
         .follow_creator(auth.user_id.0.as_str(), &creator_user_id)
         .await?;
+
+    // Hidden follow room (V065): follow = join. Best-effort and spawned
+    // so the follow response never waits on the homeserver; the fan-out
+    // also ensures the room lazily before posting.
+    {
+        let state = state.clone();
+        let follower = follow.user_id.clone();
+        let creator = follow.creator_user_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::follow_rooms::ensure_follow_room(
+                state.db.as_ref(),
+                &state.hs_client,
+                &follower,
+                &creator,
+            )
+            .await
+            {
+                tracing::warn!(follower = %follower, creator = %creator, error = %e, "follow room ensure failed after follow");
+            }
+        });
+    }
 
     Ok(Json(FollowResponse {
         user_id: follow.user_id,
@@ -416,7 +447,155 @@ pub async fn unfollow_creator(
         .unfollow_creator(auth.user_id.0.as_str(), &creator_user_id)
         .await?;
 
+    // Hidden follow room (V065): unfollow = leave (bot kicks). Spawned,
+    // best-effort; the room itself is kept for a possible re-follow.
+    {
+        let state = state.clone();
+        let follower = auth.user_id.0.clone();
+        let creator = creator_user_id.clone();
+        tokio::spawn(async move {
+            crate::follow_rooms::teardown_follow_membership(
+                state.db.as_ref(),
+                &state.hs_client,
+                &follower,
+                &creator,
+                crate::follow_rooms::LeaveMode::Kick,
+            )
+            .await;
+        });
+    }
+
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Creator-side follower management (V065)
+// DELETE /discover/followers/{user_id}  — remove a follower
+// POST   /discover/block/{user_id}      — block (removes + bans)
+// DELETE /discover/block/{user_id}      — unblock
+// GET    /discover/notify-prefs         — read history preference
+// PUT    /discover/notify-prefs         — set history preference
+// ---------------------------------------------------------------------------
+
+/// Remove one of my followers (owner-side unfollow).
+pub async fn remove_follower(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(user_id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    require_monetization(&state)?;
+
+    state
+        .db
+        .unfollow_creator(&user_id, auth.user_id.0.as_str())
+        .await?;
+
+    let creator = auth.user_id.0.clone();
+    let state2 = state.clone();
+    tokio::spawn(async move {
+        crate::follow_rooms::teardown_follow_membership(
+            state2.db.as_ref(),
+            &state2.hs_client,
+            &user_id,
+            &creator,
+            crate::follow_rooms::LeaveMode::Kick,
+        )
+        .await;
+    });
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Block a user: drops their follow and bans them from my follow room,
+/// so they cannot re-follow until unblocked.
+pub async fn block_user(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(user_id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    require_monetization(&state)?;
+
+    state.db.block_user(auth.user_id.0.as_str(), &user_id).await?;
+    state
+        .db
+        .unfollow_creator(&user_id, auth.user_id.0.as_str())
+        .await?;
+
+    let creator = auth.user_id.0.clone();
+    let state2 = state.clone();
+    tokio::spawn(async move {
+        crate::follow_rooms::teardown_follow_membership(
+            state2.db.as_ref(),
+            &state2.hs_client,
+            &user_id,
+            &creator,
+            crate::follow_rooms::LeaveMode::Ban,
+        )
+        .await;
+    });
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Unblock a user (they may follow again; this does not re-add a follow).
+pub async fn unblock_user(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Path(user_id): Path<String>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    require_monetization(&state)?;
+
+    state
+        .db
+        .unblock_user(auth.user_id.0.as_str(), &user_id)
+        .await?;
+
+    // Lift the room ban too, so a re-follow can be invited back in.
+    if let Ok(Some(room)) = state.db.get_follow_room(&user_id, auth.user_id.0.as_str()).await {
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            let _ = state2.hs_client.unban_user(&room.room_id, &user_id).await;
+        });
+    }
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotifyPrefsRequest {
+    pub history_visible: bool,
+}
+
+/// Read my follow-notification history preference (default: visible).
+pub async fn get_notify_prefs(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+) -> Result<Json<NotifyPrefsRequest>, ApiError> {
+    require_monetization(&state)?;
+
+    let history_visible = state
+        .db
+        .get_notify_history_visible(auth.user_id.0.as_str())
+        .await?;
+
+    Ok(Json(NotifyPrefsRequest { history_visible }))
+}
+
+/// Set my follow-notification history preference (applies to follow
+/// rooms created after the change).
+pub async fn set_notify_prefs(
+    auth: AuthUser,
+    State(state): State<SharedState>,
+    Json(body): Json<NotifyPrefsRequest>,
+) -> Result<Json<NotifyPrefsRequest>, ApiError> {
+    require_monetization(&state)?;
+
+    state
+        .db
+        .set_notify_history_visible(auth.user_id.0.as_str(), body.history_visible)
+        .await?;
+
+    Ok(Json(body))
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +655,15 @@ pub fn routes(state: SharedState) -> axum::Router {
             delete(unfollow_creator),
         )
         .route("/discover/following", get(list_following))
+        // Creator-side follower management (V065)
+        .route("/discover/followers/{user_id}", delete(remove_follower))
+        .route("/discover/block/{user_id}", post(block_user))
+        .route("/discover/block/{user_id}", delete(unblock_user))
+        .route("/discover/notify-prefs", get(get_notify_prefs))
+        .route(
+            "/discover/notify-prefs",
+            axum::routing::put(set_notify_prefs),
+        )
         // Related streams (mounted at stream level)
         .route("/streams/{id}/related", get(get_related))
         .with_state(state)

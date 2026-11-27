@@ -547,6 +547,9 @@ async fn announce_ready_recordings(
             tracing::warn!(stream_id = %stream.id, recording_id = %rec_id, error = %e,
                 "Failed to emit feed recording.available event");
         }
+        // New-video follow fan-out (V065): same content into qualifying
+        // followers' personal rooms. Best-effort like the emit above.
+        crate::follow_rooms::notify_new_video(&ctx.marker, stream, &content).await;
     }
 }
 

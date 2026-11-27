@@ -156,6 +156,12 @@ pub async fn on_a_relay(pool: &SwitchPool, viewer: &mm_core::fleet::ViewerId) ->
     }
 }
 
+/// How long a relay has to answer a proxied offer before the viewer is sent to the origin
+/// instead. Well under the shared HTTP client's 60 s, which a relay that accepts the
+/// connection and never answers would otherwise hold the join for: a caller with a
+/// shorter timeout gives up first, and the join fails though the origin could serve it.
+const RELAY_OFFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Forward a viewer's offer to where [`place_viewer`] put it, and return the node's SDP
 /// answer (the inner `answer` object).
 ///
@@ -165,13 +171,15 @@ pub async fn on_a_relay(pool: &SwitchPool, viewer: &mm_core::fleet::ViewerId) ->
 /// none).
 ///
 /// A join never fails because a relay failed. When the relay refuses, cannot be reached,
-/// times out or answers with no usable SDP, the viewer's binding is removed and the same
-/// offer goes to the origin, once: a viewer whose relay has gone bad belongs on the main
-/// server, and a binding left in place would send every retry (the viewer id is
-/// deterministic) back to the same relay. If the origin fails too, its error is returned
-/// and the binding stays removed.
+/// does not answer within [`RELAY_OFFER_BUDGET`] or answers with no usable SDP, the
+/// viewer's binding is removed and the same offer goes to the origin, once: a viewer whose
+/// relay has gone bad belongs on the main server, and a binding left in place would send
+/// every retry (the viewer id is deterministic) back to the same relay. If the origin
+/// fails too, its error is returned and the binding stays removed. The binding is kept
+/// only when the relay answers: a request dropped while the relay is still being tried
+/// (its caller gave up) releases it too.
 pub async fn forward_offer(
-    pool: &SwitchPool,
+    pool: &Arc<SwitchPool>,
     stream: &StreamId,
     viewer: &mm_core::fleet::ViewerId,
     placed: (Option<NodeId>, Arc<SwitchClient>),
@@ -179,16 +187,59 @@ pub async fn forward_offer(
     offer: &serde_json::Value,
     source_id: &str,
 ) -> Result<serde_json::Value, MMError> {
+    forward_offer_within(
+        pool,
+        stream,
+        viewer,
+        placed,
+        token,
+        offer,
+        source_id,
+        RELAY_OFFER_BUDGET,
+    )
+    .await
+}
+
+/// [`forward_offer`] with the relay's budget given.
+#[allow(clippy::too_many_arguments)]
+async fn forward_offer_within(
+    pool: &Arc<SwitchPool>,
+    stream: &StreamId,
+    viewer: &mm_core::fleet::ViewerId,
+    placed: (Option<NodeId>, Arc<SwitchClient>),
+    token: &str,
+    offer: &serde_json::Value,
+    source_id: &str,
+    relay_budget: std::time::Duration,
+) -> Result<serde_json::Value, MMError> {
     let (node_id, client) = placed;
     let Some(node) = node_id else {
         pool.unbind_viewer(viewer).await;
-        return offer_to_node(&client, None, viewer, token, offer, source_id).await;
+        return offer_to_origin(&client, viewer, token, offer, source_id).await;
     };
     pool.bind_viewer(viewer.clone(), node.clone()).await;
-    match offer_to_node(&client, Some(&node), viewer, token, offer, source_id).await {
-        Ok(answer) => Ok(answer),
+    let binding = RelayBinding {
+        pool: pool.clone(),
+        viewer: Some(viewer.clone()),
+    };
+    let attempt = tokio::time::timeout(
+        relay_budget,
+        offer_to_node(&client, viewer, token, offer, source_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(MMError::Sfu(format!(
+            "the relay did not answer within {} ms",
+            relay_budget.as_millis()
+        )))
+    });
+    match attempt {
+        Ok(answer) => {
+            binding.keep();
+            Ok(answer)
+        }
         Err(e) => {
-            pool.unbind_viewer(viewer).await;
+            binding.release().await;
             tracing::warn!(
                 stream = %stream.0,
                 node = %node,
@@ -196,16 +247,61 @@ pub async fn forward_offer(
                 error = %e,
                 "proxied viewer offer: the relay failed, sending the viewer to the origin"
             );
-            offer_to_node(&pool.origin(), None, viewer, token, offer, source_id).await
+            offer_to_origin(&pool.origin(), viewer, token, offer, source_id).await
         }
     }
 }
 
-/// One offer to one switch, its answer checked for a usable SDP. `node` is `None` for the
-/// origin; it only names the node in the log.
+/// A viewer's binding to the relay its offer is being sent to. Kept only by
+/// [`Self::keep`], once the relay has answered; released by [`Self::release`] or, when the
+/// request is dropped mid-attempt, by `Drop`.
+struct RelayBinding {
+    pool: Arc<SwitchPool>,
+    /// `None` once kept or released.
+    viewer: Option<mm_core::fleet::ViewerId>,
+}
+
+impl RelayBinding {
+    fn keep(mut self) {
+        self.viewer = None;
+    }
+
+    async fn release(mut self) {
+        if let Some(viewer) = &self.viewer {
+            self.pool.unbind_viewer(viewer).await;
+        }
+        self.viewer = None;
+    }
+}
+
+impl Drop for RelayBinding {
+    fn drop(&mut self) {
+        if let Some(viewer) = self.viewer.take() {
+            self.pool.unbind_viewer_detached(viewer);
+        }
+    }
+}
+
+/// One offer to the origin. Its failure is the join's: logged here, then returned.
+async fn offer_to_origin(
+    client: &SwitchClient,
+    viewer: &mm_core::fleet::ViewerId,
+    token: &str,
+    offer: &serde_json::Value,
+    source_id: &str,
+) -> Result<serde_json::Value, MMError> {
+    offer_to_node(client, viewer, token, offer, source_id)
+        .await
+        .inspect_err(|e| {
+            tracing::error!(viewer = %viewer, error = %e, "proxied viewer offer: the origin failed");
+        })
+}
+
+/// One offer to one switch, its answer checked for a usable SDP. Logs nothing: the caller
+/// knows whether the switch was a relay (which the origin then stands in for) or the
+/// origin.
 async fn offer_to_node(
     client: &SwitchClient,
-    node: Option<&NodeId>,
     viewer: &mm_core::fleet::ViewerId,
     token: &str,
     offer: &serde_json::Value,
@@ -214,21 +310,9 @@ async fn offer_to_node(
     let forwarded = client
         .viewer_offer(viewer.as_str(), token, offer, Some(source_id))
         .await
-        .map_err(|e| {
-            // The binding rejecting us is our bug, not the caller's, and it must not be
-            // reported as a client error.
-            tracing::error!(viewer = %viewer, node = ?node, error = %e, "proxied viewer offer failed");
-            MMError::Sfu(format!("switch node rejected the offer: {e}"))
-        })?;
-    proxy_answer_of(&forwarded).map_err(|e| {
-        tracing::error!(
-            viewer = %viewer,
-            node = ?node,
-            error = %e,
-            "proxied viewer offer returned an unusable answer"
-        );
-        MMError::Sfu(format!("switch node returned an unusable answer: {e}"))
-    })
+        .map_err(|e| MMError::Sfu(format!("switch node rejected the offer: {e}")))?;
+    proxy_answer_of(&forwarded)
+        .map_err(|e| MMError::Sfu(format!("switch node returned an unusable answer: {e}")))
 }
 
 /// Where a new offer of `viewer` on `stream` goes: `Some(node)` for a relay, `None` for
@@ -1293,15 +1377,15 @@ mod tests {
     }
 
     /// A pool whose origin and relay `r1` are stand-ins.
-    async fn pool_of(origin_ok: bool, relay_ok: bool) -> (SwitchPool, Arc<SwitchClient>) {
-        let pool = SwitchPool::new(offer_switch("origin", origin_ok).await);
+    async fn pool_of(origin_ok: bool, relay_ok: bool) -> (Arc<SwitchPool>, Arc<SwitchClient>) {
+        let pool = Arc::new(SwitchPool::new(offer_switch("origin", origin_ok).await));
         let relay_client = offer_switch("relay", relay_ok).await;
         pool.upsert(&relay("r1"), relay_client.clone()).await;
         (pool, relay_client)
     }
 
     async fn offer_to(
-        pool: &SwitchPool,
+        pool: &Arc<SwitchPool>,
         node: Option<&str>,
         client: Arc<SwitchClient>,
     ) -> Result<serde_json::Value, MMError> {
@@ -1405,13 +1489,99 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
-        let pool = SwitchPool::new(offer_switch("origin", true).await);
+        let pool = Arc::new(SwitchPool::new(offer_switch("origin", true).await));
         let bad = Arc::new(SwitchClient::new(&url));
         pool.upsert(&relay("r1"), bad.clone()).await;
         let answer = offer_to(&pool, Some("r1"), bad)
             .await
             .expect("the origin answers");
         assert_eq!(answer["sdp"], "v=0 origin");
+    }
+
+    /// A stand-in relay that accepts the connection and never answers an offer.
+    async fn hung_relay() -> Arc<SwitchClient> {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/api/viewers/offer",
+            post(|| std::future::pending::<Json<serde_json::Value>>()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        Arc::new(SwitchClient::new(&url))
+    }
+
+    fn offer_within(
+        pool: &Arc<SwitchPool>,
+        client: Arc<SwitchClient>,
+        budget: std::time::Duration,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, MMError>> + '_ {
+        async move {
+            forward_offer_within(
+                pool,
+                &StreamId("s1".into()),
+                &mm_core::fleet::ViewerId::new("v1"),
+                (Some(NodeId::new("r1")), client),
+                "token",
+                &serde_json::json!({ "type": "offer", "sdp": "v=0" }),
+                "stream-s1",
+                budget,
+            )
+            .await
+        }
+    }
+
+    /// A relay that never answers has its own budget: once it runs out, the viewer's
+    /// binding goes and the same offer is answered by the origin.
+    #[tokio::test]
+    async fn a_relay_that_never_answers_gives_way_to_the_origin_within_its_budget() {
+        let pool = Arc::new(SwitchPool::new(offer_switch("origin", true).await));
+        let hung = hung_relay().await;
+        pool.upsert(&relay("r1"), hung.clone()).await;
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            offer_within(&pool, hung, std::time::Duration::from_millis(200)),
+        )
+        .await
+        .expect("answered within the relay's budget, not the client's")
+        .expect("the origin answers");
+        assert_eq!(answer["sdp"], "v=0 origin");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            pool.node_of_viewer(&mm_core::fleet::ViewerId::new("v1"))
+                .await,
+            None
+        );
+    }
+
+    /// A request dropped while its relay hangs (the caller gave up and the server dropped
+    /// the handler) leaves no binding: a retry with the same viewer id must not be sent
+    /// back to the relay that never answered.
+    #[tokio::test]
+    async fn a_request_dropped_while_its_relay_hangs_leaves_no_binding() {
+        let pool = Arc::new(SwitchPool::new(offer_switch("origin", true).await));
+        let hung = hung_relay().await;
+        pool.upsert(&relay("r1"), hung.clone()).await;
+        let viewer = mm_core::fleet::ViewerId::new("v1");
+        let cut_short = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            offer_within(&pool, hung, std::time::Duration::from_secs(60)),
+        )
+        .await;
+        assert!(cut_short.is_err(), "the request was dropped mid-attempt");
+        // The release may have to wait for the lock; give it a moment.
+        for _ in 0..50 {
+            if pool.node_of_viewer(&viewer).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.node_of_viewer(&viewer).await, None);
     }
 
     /// The count the apps show must agree with the census: a relay pulling the

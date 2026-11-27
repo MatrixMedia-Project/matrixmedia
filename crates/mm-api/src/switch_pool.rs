@@ -198,6 +198,19 @@ impl SwitchPool {
         self.viewers.write().await.remove(viewer);
     }
 
+    /// [`Self::unbind_viewer`] from code that cannot wait, such as a `Drop`: at once when
+    /// the binding table is free, else on a task of its own a moment later.
+    pub fn unbind_viewer_detached(self: &Arc<Self>, viewer: ViewerId) {
+        if let Ok(mut viewers) = self.viewers.try_write() {
+            viewers.remove(&viewer);
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let pool = self.clone();
+            runtime.spawn(async move { pool.unbind_viewer(&viewer).await });
+        }
+    }
+
     /// The node holding this viewer, or `None` when the viewer is unplaced (and
     /// therefore on the origin). Ad switches MUST target this (FR-405).
     pub async fn for_viewer(&self, viewer: &ViewerId) -> Option<Arc<SwitchClient>> {

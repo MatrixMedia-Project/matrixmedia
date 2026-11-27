@@ -247,17 +247,26 @@ pub(super) fn all() -> Vec<SettingDef> {
         setting!(fleet.default_region; Fleet, ValueKind::Choice { options: &["eu", "us", "asia"] }, LIVE,
             secret: false, env: None,
             "Region a rented server is placed in until host-proximity routing exists."),
+        setting!(fleet.media_path; Fleet, ValueKind::Choice { options: &["core", "relay_after_threshold", "relay_entry"] }, LIVE,
+            secret: false, env: Some("MM_FLEET_MEDIA_PATH"),
+            "Where live media flows. core (default): the core's own switch serves every viewer. relay_after_threshold: once a stream reaches the relay viewer threshold, its new viewers go to relay nodes. relay_entry: every viewer goes to a relay node from the start. A change applies to new streams only."),
+        setting!(fleet.relay_viewer_threshold; Fleet, int(1, 100_000), LIVE, secret: false,
+            env: Some("MM_FLEET_RELAY_VIEWER_THRESHOLD"),
+            "Under relay_after_threshold, the viewer count at which a stream's new viewers go to relay nodes instead of the core. Default 50."),
+        setting!(fleet.max_relay_nodes; Fleet, int(0, 100), LIVE, secret: false,
+            env: Some("MM_FLEET_MAX_RELAY_NODES"),
+            "The most relay nodes the media path may hold at once, across all streams. 0 (default) means none."),
         setting!(fleet.max_gpu_nodes; Fleet, int(0, 100), LIVE, secret: false, env: None,
             "Global cap on GPU servers rented at once, on top of each provider's own cap. 0 = rent none."),
         setting!(fleet.test_boots_per_day; Fleet, int(0, 100), LIVE, secret: false, env: None,
             "How many operator test boots may run per day. Each one rents a GPU for at most 15 minutes."),
         setting!(fleet.capacity_cooldown_secs; Fleet, int(0, 86_400), LIVE, secret: false, env: None,
             "After a zone reports no stock, how long it sits out before it is tried again, in seconds."),
-        // Bootstrap, not LIVE: mm-server reads it once when it builds the planner policy at
-        // boot, alongside fleet.mode/ladder_mode. A live toggle that silently did nothing
-        // would be worse than one that says restart. Stays 0 (off) unless raised.
+        // No longer read: mm-server builds the planner policy with no per-broadcast fan-out
+        // (relays come from the shared pool, bounded by fleet.max_relay_nodes). Kept, as a
+        // bootstrap setting, so a stored or environment value still loads.
         setting!(fleet.max_fanout_nodes_per_broadcast; Fleet, int(0, 100), bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_MAX_FANOUT_NODES_PER_BROADCAST"),
-            "Hard ceiling on fan-out feeder servers the planner may order for one broadcast. 0 (default) keeps fan-out provisioning off; a broadcast is only ever grown when its wallet also covers the projected cost. Raising it spends real money per rented hour, so set it as low as proves fan-out. Restart to change."),
+            "No longer read: relays no longer come from a per-broadcast ceiling, but from one shared pool the operator pays for, which fleet.max_relay_nodes bounds. Kept so an existing value still loads."),
         setting!(fleet.fanout_image; Fleet, Text, bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_FANOUT_IMAGE"),
             "Docker image the runner boots on API-rented fan-out nodes (the mm-switch image the deployment runs, e.g. ghcr.io/matrixmedia-project/matrixmedia-mm-switch:0.5.4). Empty (default) means the runner refuses to rent: a box without a switch image can never join the fleet, and renting one anyway just bills. Restart to change."),
         setting!(fleet.fanout_ssh_key; Fleet, Text, bootstrap(FLEET_AT_BOOT), secret: false, env: Some("MM_FLEET_FANOUT_SSH_KEY"),

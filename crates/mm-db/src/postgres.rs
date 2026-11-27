@@ -223,13 +223,14 @@ impl Database for PgDatabase {
         media_type: &str,
         sfu_room_id: Option<&str>,
         min_tier_level: Option<i32>,
+        media_path: &str,
     ) -> Result<Stream, MMError> {
         let id = Uuid::new_v4().to_string();
 
         // Single round-trip with RETURNING.
         let row = sqlx::query(
-            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, sfu_room_id, min_tier_level)
-             VALUES ($1, $2, $3, $4, $5, 'active', 0, $6, $7)
+            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, sfu_room_id, min_tier_level, media_path)
+             VALUES ($1, $2, $3, $4, $5, 'active', 0, $6, $7, $8)
              RETURNING *",
         )
         .bind(&id)
@@ -239,6 +240,7 @@ impl Database for PgDatabase {
         .bind(title)
         .bind(sfu_room_id)
         .bind(min_tier_level)
+        .bind(media_path)
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;

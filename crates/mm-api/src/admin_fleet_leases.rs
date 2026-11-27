@@ -83,6 +83,10 @@ impl From<LeaseError> for LeasesApiError {
                 code: "MM_LEASE_ALREADY_GONE",
                 message: e.to_string(),
             },
+            LeaseError::InSharedPool(_) => LeasesApiError::Conflict {
+                code: "MM_LEASE_IN_SHARED_POOL",
+                message: e.to_string(),
+            },
             LeaseError::Db(err) => LeasesApiError::Db(err),
         }
     }

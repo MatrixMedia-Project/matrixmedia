@@ -43,7 +43,7 @@ async fn live_stream(db: &PgDatabase, matrix_room_id: &str, host: &str) -> Strea
         .get_or_create_room(&RoomId(matrix_room_id.to_string()))
         .await
         .expect("create room");
-    db.create_stream(room.id, &UserId(host.to_string()), Some("live"), "video", None, None)
+    db.create_stream(room.id, &UserId(host.to_string()), Some("live"), "video", None, None, "core")
         .await
         .expect("create stream")
 }

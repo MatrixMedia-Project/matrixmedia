@@ -833,6 +833,7 @@ pub(crate) mod fixtures {
             marker_generation: 1,
             link_access: "members".into(),
             paywall_price_sats: None,
+            media_path: "core".into(),
         }
     }
 

@@ -77,6 +77,7 @@ async fn ingest_end_transitions_once_and_is_idempotent() {
             "video",
             None,
             None,
+            "core",
         )
         .await
         .expect("create stream");

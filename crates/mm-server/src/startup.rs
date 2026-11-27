@@ -389,11 +389,17 @@ pub async fn run(
     // The rule itself is `switch_proxy::proxy_enabled`, applied where the join
     // reads the config: `config` here is a copy, so clearing a flag on it would
     // change nothing a handler sees.
-    if config.fleet.proxy_viewers && !mm_api::switch_proxy::proxy_enabled(&config) {
+    // The proxy is wanted with its flag or with a relay media path (relays are reached only
+    // through it).
+    let relay_path =
+        mm_core::fleet::media_path::effective(config.fleet.media_path, config.fleet.mode)
+            != mm_core::config::MediaPath::Core;
+    if (config.fleet.proxy_viewers || relay_path) && !mm_api::switch_proxy::proxy_enabled(&config) {
         tracing::error!(
-            "fleet.proxy_viewers is on but MM_SWITCH_AUTH_SECRET is unset — the S1 \
-             proxy cannot mint a bound viewer token, so it stays OFF and clients \
-             will keep talking to the switch directly. Set the secret to enable it."
+            "fleet.proxy_viewers or a relay fleet.media_path is set but \
+             MM_SWITCH_AUTH_SECRET is unset — the S1 proxy cannot mint a bound viewer \
+             token, so it stays OFF, clients keep talking to the switch directly and no \
+             viewer reaches a relay. Set the secret to enable it."
         );
     }
     if mm_api::switch_proxy::proxy_enabled(&config) {
@@ -1009,10 +1015,11 @@ pub async fn run(
 
     // GPU rental planning (spec §6.4). The census, the wallet and the opt-in live here, so the
     // plan is made here; every teardown it decides is only ORDERED (deferred destroy) and the
-    // fleet runner, the one process holding provider tokens, completes it. Transcoders only: no
-    // fan-out size exists yet, so the fan-out ceiling is 0. Under `frozen` it only releases the
-    // machines of ended broadcasts. A transcoder is planned only where some provider has
-    // transcode software (`PgTranscodeSupply`).
+    // fleet runner, the one process holding provider tokens, completes it. Transcoders only:
+    // the per-broadcast fan-out ceiling is 0, and relays are ordered by the pool tick that runs
+    // after each planner tick. Under `frozen` it only releases the machines of ended broadcasts.
+    // A transcoder is planned only where some provider has transcode software
+    // (`PgTranscodeSupply`).
     match (
         shared_state.switch_pool.as_ref(),
         shared_state.pg_pool.as_ref(),
@@ -1024,13 +1031,11 @@ pub async fn run(
                 "chosen-at-rent",
             )
             .with_billing_increment(mm_core::fleet::billing::BillingIncrement::PerMinute);
-            // Operator-wired ceiling (fleet.max_fanout_nodes_per_broadcast, default 0).
-            // This replaces the hardcoded 0 this line shipped with: fan-out stays OFF
-            // until an operator raises it, and even then only a broadcast whose wallet
-            // covers the projection is ever grown (planner gate 2). Transcoders are
-            // unaffected either way.
-            policy.max_fanout_nodes_per_broadcast =
-                live_config.load().fleet.max_fanout_nodes_per_broadcast;
+            // Per-broadcast fan-out is off: relays now come from the operator-paid pool
+            // (`pool_autoscale`, sized by fleet.media_path below), which replaces the
+            // wallet-gated per-broadcast ceiling fleet.max_fanout_nodes_per_broadcast.
+            // Transcoders are unaffected.
+            policy.max_fanout_nodes_per_broadcast = 0;
             let planner = Arc::new(
                 mm_fleet::runner::FleetRunner::new(
                     mm_fleet::desired::DesiredStore::new(pg.clone()),
@@ -1055,17 +1060,25 @@ pub async fn run(
             );
             info!(
                 region = %live_config.load().fleet.default_region,
-                "Fleet planner running (tick 10 s, transcoders only; teardowns are completed by mm-fleet-runner)"
+                "Fleet planner running (tick 10 s: transcoders, and the relay pool sized in the same loop; teardowns are completed by mm-fleet-runner)"
             );
             let planner_cancel = cancel.clone();
+            let pool_db = pg.clone();
             supervise("fleet_planner", cancel.clone(), move || {
-                let (planner, token, live) =
-                    (planner.clone(), planner_cancel.clone(), live_config.clone());
+                let (planner, token, live, pool_db) = (
+                    planner.clone(),
+                    planner_cancel.clone(),
+                    live_config.clone(),
+                    pool_db.clone(),
+                );
                 async move {
                     // Beats on entry, so the series exists before the first tick: a planner
                     // that fails every tick then goes stale (`MMBackgroundTaskStalled`), where
                     // one that never beat would have no series to go stale.
                     mm_core::metrics_global::heartbeat("fleet_planner");
+                    // Whether the warning that no relay could serve viewers was given since
+                    // it last became true: once, not on every tick.
+                    let mut no_relay_capacity_warned = false;
                     let mut ticker = tokio::time::interval(Duration::from_secs(10));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
@@ -1076,11 +1089,15 @@ pub async fn run(
                                 // and the mode is mm-core's own.
                                 let cfg = live.load();
                                 planner.set_region(&cfg.fleet.default_region);
+                                // The census the planner read, for the pool below. None when
+                                // it was not read (`off`, a census or planner failure).
+                                let mut census: Option<Vec<mm_fleet::runner::LiveBroadcast>> = None;
                                 match planner
                                     .tick(&mm_fleet::provider::NoProvider, cfg.fleet.mode, chrono::Utc::now())
                                     .await
                                 {
-                                    Ok(r) => {
+                                    Ok(mut r) => {
+                                        census = r.live.take();
                                         if !r.planned.is_empty()
                                             || !r.torn_down.is_empty()
                                             || !r.not_promoted.is_empty()
@@ -1101,6 +1118,81 @@ pub async fn run(
                                     }
                                     Err(e) => tracing::error!("fleet planner: {e}"),
                                 }
+                                // The relay pool, from the same snapshot. It runs whatever the
+                                // planner did: its first step keeps relays with viewers alive.
+                                // With no census it sizes from no demand, which orders nothing
+                                // and retires nothing a previous tick wanted (those were just
+                                // extended a full lease window ahead); only growth waits.
+                                // Only streams whose stored state uses relays count, whatever
+                                // fleet.media_path says now (a stream keeps the state it started
+                                // in); with the states unreadable it sizes from no demand, the
+                                // same way.
+                                let stream_viewers = match census {
+                                    Some(live) => {
+                                        use mm_fleet::pool_autoscale::{live_media_paths, relay_stream_viewers};
+                                        match live_media_paths(&pool_db).await {
+                                            Ok(stored) => relay_stream_viewers(&live, &stored),
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "relay pool: reading the streams' media paths failed: {e}"
+                                                );
+                                                Vec::new()
+                                            }
+                                        }
+                                    }
+                                    None => Vec::new(),
+                                };
+                                // Sized with the capacity the relays are stamped with when
+                                // rented. With none (no enabled provider whose relays can
+                                // serve viewers) nothing is ordered; extension and
+                                // retirement go on.
+                                let capacity_per_node =
+                                    match mm_fleet::placement_db::relay_capacity(&pool_db).await {
+                                        Ok(Some(capacity)) => {
+                                            no_relay_capacity_warned = false;
+                                            Some(capacity)
+                                        }
+                                        Ok(None) => {
+                                            if !no_relay_capacity_warned {
+                                                no_relay_capacity_warned = true;
+                                                tracing::warn!(
+                                                    "relay pool: no enabled provider's relays can serve \
+                                                     viewers (Hetzner today), so no relay is ordered"
+                                                );
+                                            }
+                                            None
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "relay pool: reading the relay providers failed: {e}"
+                                            );
+                                            None
+                                        }
+                                    };
+                                let pool_inputs = mm_fleet::pool_autoscale::PoolInputs {
+                                    mode: cfg.fleet.mode,
+                                    threshold: cfg.fleet.relay_viewer_threshold,
+                                    ceiling: cfg.fleet.max_relay_nodes,
+                                    capacity_per_node,
+                                    region: cfg.fleet.default_region.clone(),
+                                    stream_viewers,
+                                };
+                                match mm_fleet::pool_autoscale::tick(&pool_db, &pool_inputs, chrono::Utc::now())
+                                    .await
+                                {
+                                    Ok(p) => {
+                                        if !p.created.is_empty() || !p.retired.is_empty() {
+                                            info!(
+                                                wanted = p.wanted,
+                                                created = p.created.len(),
+                                                extended = p.extended.len(),
+                                                retired = p.retired.len(),
+                                                "relay pool tick"
+                                            )
+                                        }
+                                    }
+                                    Err(e) => tracing::error!("relay pool: {e}"),
+                                }
                             }
                         }
                     }
@@ -1111,10 +1203,11 @@ pub async fn run(
     }
 
     // Pool-sync loop (relay fleet, WS-A Task 3): keeps `SwitchPool` in step with
-    // `mm_fleet_nodes` as the runner provisions and tears down relays, and seeds a
-    // cascade source on every healthy relay for every live broadcast that has
-    // viewers (R2). Same gating as the fleet planner above — both need a switch
-    // and Postgres to have anything to sync.
+    // `mm_fleet_nodes` as the runner provisions and tears down relays, and keeps the
+    // relay tree: a stream not in state `core` that nears its viewer threshold is
+    // seeded on the relays, each fed by the closest relay already carrying it (R2).
+    // Same gating as the fleet planner above — both need a switch and Postgres to
+    // have anything to sync.
     match (
         shared_state.switch_pool.as_ref(),
         shared_state.pg_pool.as_ref(),
@@ -1126,22 +1219,28 @@ pub async fn run(
                 .advertising
                 .switch_auth_secret_opt()
                 .map(|s| s.to_string());
+            // Live settings (fleet.mode, fleet.relay_viewer_threshold) are read from the
+            // handle on every tick.
+            let pool_sync_ctx = mm_api::pool_sync::PoolSyncContext::new(
+                shared_state.config_handle.clone(),
+                pool_sync_secret,
+                config
+                    .server
+                    .public_url
+                    .as_deref()
+                    .map(|public| format!("{public}/_mm/switch")),
+            );
             let pool_sync_cancel = cancel.clone();
             supervise("pool_sync", cancel.clone(), move || {
                 mm_api::pool_sync::run_pool_sync(
                     pool_sync_pool.clone(),
                     pool_sync_db.clone(),
-                    pool_sync_secret.clone(),
-                    config
-                        .server
-                        .public_url
-                        .as_deref()
-                        .map(|public| format!("{public}/_mm/switch")),
+                    pool_sync_ctx.clone(),
                     Duration::from_secs(10),
                     pool_sync_cancel.clone(),
                 )
             });
-            info!("Pool sync running (tick 10 s): mm_fleet_nodes -> SwitchPool, cascade seeding");
+            info!("Pool sync running (tick 10 s): mm_fleet_nodes -> SwitchPool, relay tree");
         }
         _ => info!("Pool sync off: it needs a switch and Postgres"),
     }

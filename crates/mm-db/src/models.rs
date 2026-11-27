@@ -89,6 +89,16 @@ pub struct Stream {
     /// pre-V059 behavior); `Some(n)` with `n > 0` = share-link viewers
     /// must pay `n` sats. Legacy rows read back as `None`.
     pub paywall_price_sats: Option<i64>,
+    /// The media path state the stream was fixed in when it started (V066):
+    /// `"core"`, `"relay_after_threshold"` or `"relay_entry"`. Written once, at
+    /// create; a later change of the `fleet.media_path` setting never touches it.
+    /// Legacy rows read back as `"core"`.
+    #[serde(default = "default_media_path")]
+    pub media_path: String,
+}
+
+fn default_media_path() -> String {
+    "core".to_string()
 }
 
 impl Stream {
@@ -127,6 +137,10 @@ impl Stream {
                 .unwrap_or(None)
                 .unwrap_or_else(|| "members".to_string()),
             paywall_price_sats: row.try_get("paywall_price_sats").unwrap_or(None),
+            media_path: row
+                .try_get("media_path")
+                .unwrap_or(None)
+                .unwrap_or_else(default_media_path),
         })
     }
 
@@ -159,6 +173,10 @@ impl Stream {
                 .unwrap_or(None)
                 .unwrap_or_else(|| "members".to_string()),
             paywall_price_sats: row.try_get("paywall_price_sats").unwrap_or(None),
+            media_path: row
+                .try_get("media_path")
+                .unwrap_or(None)
+                .unwrap_or_else(default_media_path),
         })
     }
 }

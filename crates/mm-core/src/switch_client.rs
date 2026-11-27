@@ -822,6 +822,16 @@ pub fn switch_viewer_id(stream_id: &str, user_id: &str) -> String {
     )
 }
 
+/// Whether a session a switch lists among its viewers is a relay node pulling a stream
+/// from it rather than a person. mm-switch's cascade source registers on the switch it
+/// feeds from as `cascade-{source id}-{relay node id}` (see `services/mm-switch/auth.go`),
+/// through the same viewer path a person uses, so `GET /api/viewers` lists both. Every
+/// viewer count leaves these out: a relay is a connection between switches, not
+/// audience.
+pub fn is_cascade_session(viewer_id: &str) -> bool {
+    viewer_id.starts_with("cascade-")
+}
+
 #[cfg(test)]
 mod id_tests {
     use super::*;
@@ -834,6 +844,20 @@ mod id_tests {
             "viewer-3f2a1c9e-0000-4000-8000-00000000000a--alice-example.org"
         );
         assert_eq!(switch_viewer_id("s", "@a!b:c"), "viewer-s--a-b-c");
+    }
+
+    #[test]
+    fn a_relay_cascade_session_is_told_apart_from_a_viewer() {
+        assert!(is_cascade_session("cascade-stream-b1-lease-1-0"));
+        assert!(!is_cascade_session(&switch_viewer_id(
+            "b1",
+            "@alice:example.org"
+        )));
+        // A user id that merely contains the word is still a person.
+        assert!(!is_cascade_session(&switch_viewer_id(
+            "b1",
+            "@cascade-:example.org"
+        )));
     }
 
     #[test]

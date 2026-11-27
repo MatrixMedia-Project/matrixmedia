@@ -1910,7 +1910,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '501':
-          description: The proxy is off (fleet.proxy_viewers), or the switch or its auth secret is not configured
+          description: The proxy is off for this stream (it needs the switch auth secret and fleet.proxy_viewers or a relay media path, now or the one the stream started in), or the switch or its auth secret is not configured
           content:
             application/json:
               schema:

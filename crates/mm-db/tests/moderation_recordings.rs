@@ -31,7 +31,15 @@ async fn seed_ready_recording(db: &SqliteDatabase) -> (i64, String) {
         .unwrap();
     let host = UserId("@host:example.com".to_string());
     let stream = db
-        .create_stream(room.id, &host, Some("Mod Stream"), "video", None, None)
+        .create_stream(
+            room.id,
+            &host,
+            Some("Mod Stream"),
+            "video",
+            None,
+            None,
+            "core",
+        )
         .await
         .unwrap();
 

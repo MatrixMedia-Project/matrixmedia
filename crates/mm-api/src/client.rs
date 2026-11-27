@@ -698,6 +698,13 @@ pub(crate) struct CreatedStreamRecord {
     pub has_video: bool,
 }
 
+/// The media path state a stream starting now is fixed in, stored on its row:
+/// `fleet.media_path` under `fleet.mode` ([`mm_core::fleet::media_path::effective`]), both
+/// read from `cfg`, the live configuration of the request that starts the stream.
+pub fn starting_media_path(cfg: &mm_core::config::Config) -> mm_core::config::MediaPath {
+    mm_core::fleet::media_path::effective(cfg.fleet.media_path, cfg.fleet.mode)
+}
+
 pub(crate) async fn create_stream_record(
     state: &SharedState,
     host_user_id: &mm_core::types::UserId,
@@ -798,6 +805,8 @@ pub(crate) async fn create_stream_record(
         .await
         .map_err(|e| MMError::Sfu(format!("{e}")))?;
 
+    // The media path state is fixed here, from the live settings at this moment; a later
+    // change of `fleet.media_path` (or `fleet.mode`) applies to new streams only.
     let stream = state
         .db
         .create_stream(
@@ -807,6 +816,7 @@ pub(crate) async fn create_stream_record(
             media_type,
             Some(&sfu_room.name),
             min_tier_level,
+            starting_media_path(&cfg).as_str(),
         )
         .await?;
 
@@ -2373,10 +2383,15 @@ async fn issue_viewer_join(
         // forwards to whichever node holds the viewer — which is what lets a
         // multi-node fleet serve the apps already in both stores with no update.
         // Off by default: this is the code path every viewer join traverses.
-        let switch_base = crate::switch_proxy::switch_base_url(
+        // Decided per stream: one that started in a relay state keeps the proxy
+        // (where its relays are) after the setting moved. The stored state is on
+        // the row already in hand, so this costs no extra read.
+        let switch_base = crate::switch_proxy::viewer_switch_url(
             public,
             &stream.id,
-            crate::switch_proxy::proxy_enabled(cfg),
+            mm_core::config::MediaPath::parse(&stream.media_path)
+                .unwrap_or(mm_core::config::MediaPath::Core),
+            cfg,
         );
         (
             Some(switch_base),

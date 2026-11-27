@@ -191,6 +191,7 @@ async fn seed_stream(db: &PgDatabase, tag: &str) -> Stream {
         "video",
         Some(&format!("sfu-bs-{tag}")),
         None,
+        "core",
     )
     .await
     .expect("create stream")

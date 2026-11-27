@@ -629,6 +629,7 @@ async fn seed_stream(db: &PgDatabase, tag: &str) -> (String, Stream) {
             "audio",
             Some(&format!("sfu-{tag}")),
             None,
+            "core",
         )
         .await
         .expect("create stream");
@@ -1793,4 +1794,94 @@ async fn a_host_end_never_announces_a_hidden_recording() {
     assert_eq!(announced_recordings(&stub), vec![open.clone()]);
     assert!(hidden_state(&pool, &moderated).await.0, "still hidden");
     assert_eq!(hidden_state(&pool, &open).await, (false, false));
+}
+
+/// A stream keeps the media path state it started in. The state is read
+/// from the live settings when the stream starts (`starting_media_path`, what stream
+/// creation stores) and written on the row; changing the setting afterwards changes the
+/// state of new streams only.
+#[tokio::test]
+async fn a_stream_keeps_the_state_it_started_in() {
+    use mm_core::config::{FleetMode, MediaPath};
+    use mm_core::config_handle::ConfigHandle;
+
+    let Some(pool) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&pool).await;
+    // The sweep tests count every active stream: start none while one runs.
+    let _guard = lifecycle_lock().lock().await;
+    let db = PgDatabase::from_pool(pool.clone());
+
+    let mut config = Config::default();
+    config.fleet.mode = FleetMode::On;
+    config.fleet.media_path = MediaPath::RelayAfterThreshold;
+    let live = ConfigHandle::new(config.clone());
+
+    let start = |tag: &'static str| {
+        let db = &db;
+        let live = &live;
+        async move {
+            let room = db
+                .get_or_create_room(&RoomId(format!(
+                    "!media-path-{tag}-{}:localhost",
+                    uuid::Uuid::new_v4()
+                )))
+                .await
+                .expect("create room");
+            db.create_stream(
+                room.id,
+                &UserId("@host:localhost".to_string()),
+                Some("Media path fixture"),
+                "video",
+                None,
+                None,
+                mm_api::client::starting_media_path(&live.load()).as_str(),
+            )
+            .await
+            .expect("create stream")
+        }
+    };
+    let stored = |id: String| {
+        let db = &db;
+        async move {
+            db.get_stream(&StreamId(id))
+                .await
+                .expect("read stream")
+                .expect("stream exists")
+                .media_path
+        }
+    };
+
+    let early = start("early").await;
+    assert_eq!(early.media_path, "relay_after_threshold");
+
+    // The setting goes back to core while the stream is live.
+    config.fleet.media_path = MediaPath::Core;
+    live.store(config.clone());
+    assert_eq!(
+        stored(early.id.clone()).await,
+        "relay_after_threshold",
+        "a change of fleet.media_path never touches a stream that already started"
+    );
+    let late = start("late").await;
+    assert_eq!(
+        stored(late.id.clone()).await,
+        "core",
+        "new streams take the new setting"
+    );
+
+    // Under a fleet that is not on, every state is core.
+    config.fleet.media_path = MediaPath::RelayAfterThreshold;
+    config.fleet.mode = FleetMode::Frozen;
+    live.store(config);
+    let frozen = start("frozen").await;
+    assert_eq!(stored(frozen.id.clone()).await, "core");
+
+    for id in [early.id, late.id, frozen.id] {
+        db.update_stream_status(&StreamId(id), StreamStatus::Ended)
+            .await
+            .expect("end stream");
+    }
 }

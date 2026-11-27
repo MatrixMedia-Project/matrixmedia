@@ -135,6 +135,7 @@ async fn ensure_stream_id(
             "video",
             None,
             None,
+            "core",
         )
         .await
         .expect("create stream");

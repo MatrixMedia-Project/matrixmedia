@@ -213,6 +213,14 @@ async fn frozen_observes_and_publishes_but_provisions_nothing() {
         "frozen must not touch the provider: {:?}",
         provider.intents()
     );
+    // The census it read is handed on (the relay pool sizes from it).
+    assert_eq!(
+        report.live,
+        Some(vec![LiveBroadcast {
+            broadcast_id: "b1".into(),
+            viewers: 1_500,
+        }])
+    );
 
     // 1,500 viewers over 250-per-node would be six nodes on `on`.
     let store = DesiredStore::new(pool.clone());
@@ -272,16 +280,160 @@ async fn frozen_still_releases_a_finished_broadcast() {
 /// reconcile withdraws the desired row; a fresh-deadline row is left alone
 /// so an in-flight create is never disturbed.
 async fn insert_desired_manual(pool: &PgPool, id: &str, deadline: chrono::DateTime<Utc>) {
+    insert_desired_lease(pool, id, "manual", deadline).await;
+}
+
+/// [`insert_desired_manual`] with the lease's source named: `'manual'` or `'autoscale'`.
+async fn insert_desired_lease(
+    pool: &PgPool,
+    id: &str,
+    lease_source: &str,
+    deadline: chrono::DateTime<Utc>,
+) {
     sqlx::query(
         "INSERT INTO mm_fleet_desired
              (mm_node_id, flavor, ownership, region, size, broadcast_id, lease_source, destroy_deadline)
-         VALUES ($1, 'fanout', 'rented', 'eu-ams', 'small', NULL, 'manual', $2)",
+         VALUES ($1, 'fanout', 'rented', 'eu-ams', 'small', NULL, $2, $3)",
     )
     .bind(id)
+    .bind(lease_source)
     .bind(deadline)
     .execute(pool)
     .await
-    .expect("insert manual desired");
+    .expect("insert lease desired");
+}
+
+/// An autoscale lease is rented like a manual one: a tick leaves a fresh one standing, renders
+/// it for Terraform (the Terraform backend's rent), and it is in the set the runner's API rent
+/// pass iterates (`pending_desired`, which reads no lease source).
+#[tokio::test]
+async fn an_autoscale_lease_is_rented_like_a_manual_one() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping an_autoscale_lease_is_rented_like_a_manual_one"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    insert_desired_lease(
+        &pool,
+        "lease-pool-0",
+        "autoscale",
+        Utc::now() + Duration::hours(1),
+    )
+    .await;
+
+    let dir = tf_tmpdir("autoscale-rent");
+    let runner = runner_rendering_to(&pool, &dir, FakeCensus::with(&[]), Box::new(NobodyOptedIn));
+    let report = runner
+        .tick(&DryRunProvider::default(), FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+
+    assert!(report.torn_down.is_empty(), "{:?}", report.torn_down);
+    assert_eq!(report.tfvars_nodes, Some(1));
+    assert_eq!(tf_keys(&dir), vec!["lease-pool-0"]);
+    let pending: Vec<String> = mm_fleet::nodes_db::pending_desired(&pool)
+        .await
+        .expect("pending")
+        .into_iter()
+        .map(|d| d.mm_node_id)
+        .collect();
+    assert_eq!(pending, vec!["lease-pool-0"]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An idle autoscale lease nobody extends lapses at its deadline by the manual lease's own
+/// paths: with no node row yet the tick withdraws it, and a rented one is reaped by the
+/// deadline sweeper.
+#[tokio::test]
+async fn an_unwanted_autoscale_lease_lapses_at_its_deadline() {
+    let Some(pool) = try_pool().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping an_unwanted_autoscale_lease_lapses_at_its_deadline"
+        );
+        return;
+    };
+    let _guard = runner_lock().lock().await;
+    ensure_migrations(&pool).await;
+    wipe(&pool).await;
+    let now = Utc::now();
+
+    // Not rented yet: an expired row is withdrawn, a fresh one is left alone.
+    insert_desired_lease(
+        &pool,
+        "lease-pool-old-0",
+        "autoscale",
+        now - Duration::hours(1),
+    )
+    .await;
+    insert_desired_lease(
+        &pool,
+        "lease-pool-fresh-0",
+        "autoscale",
+        now + Duration::hours(1),
+    )
+    .await;
+    // Rented, idle, and past its deadline (created two hours ago with a one-hour hint).
+    let rented = mm_fleet::lease_db::create_autoscale(
+        &pool,
+        "eu-ams",
+        1,
+        Duration::hours(1),
+        now - Duration::hours(2),
+    )
+    .await
+    .expect("create_autoscale");
+    let rented = rented[0].as_str();
+    insert_node(&pool, rented, Ownership::Rented, NodeState::Healthy).await;
+    sqlx::query("UPDATE mm_fleet_nodes SET destroy_deadline = $2 WHERE mm_node_id = $1")
+        .bind(rented)
+        .bind(now - Duration::hours(1))
+        .execute(&pool)
+        .await
+        .expect("expire the node");
+
+    // Nobody wants an idle lease: the pool's extension leaves it alone.
+    let extended = mm_fleet::lease_db::extend_autoscale(&pool, 0, Duration::hours(1), now)
+        .await
+        .expect("extend_autoscale");
+    assert!(extended.is_empty(), "{extended:?}");
+
+    let runner = FleetRunner::new(
+        DesiredStore::new(pool.clone()),
+        Box::new(FakeCensus::with(&[])),
+        Box::new(RichWallet),
+        Box::new(NobodyOptedIn),
+        policy(),
+    );
+    let provider = DryRunProvider::default();
+    let report = runner
+        .tick(&provider, FleetMode::On, Utc::now())
+        .await
+        .expect("tick");
+    assert_eq!(report.torn_down, vec!["lease-pool-old-0"]);
+
+    let swept = sweep_deadlines(
+        &DesiredStore::new(pool.clone()),
+        &provider,
+        BillingIncrement::PerHour,
+        Utc::now(),
+    )
+    .await
+    .expect("sweep");
+    assert_eq!(swept.reaped, vec![rented.to_string()]);
+    assert_eq!(
+        provider.intents(),
+        vec![Intent::Destroy(format!("prov-{rented}"))]
+    );
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT mm_node_id FROM mm_fleet_desired ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .expect("read desired");
+    assert_eq!(remaining, vec!["lease-pool-fresh-0".to_string()]);
 }
 
 /// Regression: expired handle-less manual leases used to sit in
@@ -497,6 +649,7 @@ async fn a_census_failure_tears_nothing_down() {
     assert!(provider.intents().is_empty());
     assert_eq!(report.skipped.len(), 1);
     assert!(report.skipped[0].1.contains("census unavailable"));
+    assert_eq!(report.live, None, "a failed census is not handed on as an empty one");
 }
 
 /// A census failure stops the tick from deciding anything — but not from telling

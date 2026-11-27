@@ -24,6 +24,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use mm_core::config::{FleetMode, MediaPath};
 use mm_core::settings::find;
 use mm_core::settings::overlay::Problem;
 use mm_db::settings_db::AuditRow;
@@ -217,6 +218,46 @@ async fn patch_settings(
         }
     }
 
+    // A relay media path is refused while anything it needs is missing, or new streams would
+    // count on relay nodes the fleet can never rent. Checked only when this request sets the
+    // path (to a valid value; an invalid one is the save's 422), against the configuration the
+    // request leaves behind. A request that leaves the path out is never refused here, so
+    // lowering fleet.max_relay_nodes (or turning fleet.mode down, once it is editable here)
+    // always goes through.
+    if let Some(new) = body.changes.get("fleet.media_path")
+        && find("fleet.media_path").is_some_and(|d| d.validate(new).is_ok())
+        && let Some(path) = new.as_str().and_then(MediaPath::parse)
+        && path != MediaPath::Core
+    {
+        let cfg = svc.handle().load();
+        let mode = body
+            .changes
+            .get("fleet.mode")
+            .and_then(|v| v.as_str())
+            .and_then(FleetMode::parse)
+            .unwrap_or(cfg.fleet.mode);
+        let max_relay_nodes = body
+            .changes
+            .get("fleet.max_relay_nodes")
+            .and_then(|v| v.as_u64())
+            .map_or(cfg.fleet.max_relay_nodes, |n| {
+                u32::try_from(n).unwrap_or(u32::MAX)
+            });
+        // The secret the switch client and the viewer proxy sign with (MM_SWITCH_AUTH_SECRET).
+        let has_secret = !cfg.advertising.switch_auth_secret.trim().is_empty();
+        let relay_capable = mm_fleet::placement_db::relay_capable(svc.pool())
+            .await
+            .map_err(internal)?;
+        let blockers = media_path_blockers(path, mode, has_secret, max_relay_nodes, relay_capable);
+        if !blockers.is_empty() {
+            return Err(SettingsApiError::BadRequest(format!(
+                "fleet.media_path = {} needs: {}",
+                path.as_str(),
+                blockers.join("; ")
+            )));
+        }
+    }
+
     match svc.save(&body.changes, body.expected_rev, &auth.actor()).await {
         // Committed: always answered as a success (never 500 if reading back fails).
         Ok(saved) => Ok(Json(svc.view_after_save(saved).await)),
@@ -224,6 +265,40 @@ async fn patch_settings(
             Err(SettingsApiError::Conflict(Some(Box::new(svc.view(false).await.map_err(internal)?))))
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// What a `fleet.media_path` value still needs before it can be saved, in a fixed order;
+/// empty when nothing is missing. `relay_entry` is refused outright in this version, so it
+/// reports only that, whatever else is missing.
+fn media_path_blockers(
+    value: MediaPath,
+    mode: FleetMode,
+    has_secret: bool,
+    max_relay_nodes: u32,
+    relay_capable: bool,
+) -> Vec<&'static str> {
+    match value {
+        MediaPath::Core => Vec::new(),
+        MediaPath::RelayEntry => vec!["relay_entry is not available in this version"],
+        MediaPath::RelayAfterThreshold => [
+            (mode != FleetMode::On, "fleet.mode must be on"),
+            (
+                !has_secret,
+                "a switch auth secret must be set (MM_SWITCH_AUTH_SECRET)",
+            ),
+            (
+                max_relay_nodes == 0,
+                "fleet.max_relay_nodes must be at least 1",
+            ),
+            (
+                !relay_capable,
+                "an enabled VPS provider whose relays can serve viewers is required (Hetzner today)",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(missing, need)| missing.then_some(need))
+        .collect(),
     }
 }
 
@@ -304,4 +379,41 @@ async fn test_connection(
     let values = body.map(|Json(b)| b.values).unwrap_or_default();
     let next = svc.next_run().await.map_err(internal)?;
     Ok(Json(settings_checks::run(check, &values, &next.config, &next.unsettled).await))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_is_never_blocked() {
+        assert!(media_path_blockers(MediaPath::Core, FleetMode::Off, false, 0, false).is_empty());
+    }
+
+    #[test]
+    fn every_missing_prerequisite_is_named() {
+        assert_eq!(
+            media_path_blockers(
+                MediaPath::RelayAfterThreshold,
+                FleetMode::Frozen,
+                false,
+                0,
+                false
+            ),
+            vec![
+                "fleet.mode must be on",
+                "a switch auth secret must be set (MM_SWITCH_AUTH_SECRET)",
+                "fleet.max_relay_nodes must be at least 1",
+                "an enabled VPS provider whose relays can serve viewers is required (Hetzner today)"
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_entry_is_refused_in_this_version() {
+        assert_eq!(
+            media_path_blockers(MediaPath::RelayEntry, FleetMode::On, true, 2, true),
+            vec!["relay_entry is not available in this version"]
+        );
+    }
 }

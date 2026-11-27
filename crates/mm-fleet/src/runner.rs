@@ -269,6 +269,9 @@ pub struct TickReport {
     /// is in `teardown_failures` only — not here, and not audited — and is retried next tick.
     pub released: Vec<(String, &'static str)>,
     pub nodes_observed: usize,
+    /// The census this tick planned from, for callers that size something else from the same
+    /// audience (the relay pool). `None` when the census was not read (`off`) or failed.
+    pub live: Option<Vec<LiveBroadcast>>,
     /// How many nodes the rendered tfvars file now names. `None` when no
     /// Terraform directory is configured, or when the render was refused or failed
     /// (logged at error) — either way different from `Some(0)`.
@@ -433,6 +436,7 @@ impl FleetRunner {
                 return Ok(report);
             }
         };
+        report.live = Some(live.clone());
         let live_ids: HashSet<&str> = live.iter().map(|b| b.broadcast_id.as_str()).collect();
         self.release_ended(provider, &nodes, &desired, &live_ids, now, &mut report)
             .await;

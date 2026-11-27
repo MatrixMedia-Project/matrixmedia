@@ -217,6 +217,12 @@ CREATE TABLE IF NOT EXISTS mm_room_marker (
 );
 "#;
 
+/// Media path state per stream (V066 parity for SQLite). Only the column:
+/// `mm_fleet_relay_feeds` is Postgres-only, like the rest of the fleet.
+pub const V066_MEDIA_PATH: &str = r#"
+ALTER TABLE mm_streams ADD COLUMN media_path TEXT NOT NULL DEFAULT 'core';
+"#;
+
 pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
     vec![
         ("V001_initial", V001_INITIAL),
@@ -230,5 +236,6 @@ pub fn all_migrations() -> Vec<(&'static str, &'static str)> {
         ("V059_paywall", V059_PAYWALL),
         ("V063_event_namespaces", V063_EVENT_NAMESPACES),
         ("V064_room_marker", V064_ROOM_MARKER),
+        ("V066_media_path", V066_MEDIA_PATH),
     ]
 }

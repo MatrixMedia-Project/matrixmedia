@@ -19,12 +19,21 @@
 //! `'force'` is durable eviction — the extension pass never extends a force-released lease
 //! again, whatever its viewer count, so the floored deadline a forced release writes cannot be
 //! undone by the next tick.
+//!
+//! Autoscale leases are the same row with `lease_source='autoscale'`, written by the media-path
+//! planner instead of an operator: one shared relay pool the operator pays for, tied to no
+//! stream. [`top_up_autoscale`] sizes the pool atomically, [`autoscale_live`] reads it,
+//! [`extend_autoscale`] keeps the wanted and the busy ones rolling, and
+//! [`retire_idle_autoscale`] sends unwanted idle ones down the ordered teardown before their
+//! deadline would (a deadline kill pages). The deadline sweeper stays the backstop.
 
 use chrono::{DateTime, Duration, Utc};
 use mm_core::fleet::funding::Funding;
 use mm_core::fleet::{NodeId, NodeState};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::desired::{order_teardown_statements, take_desired_write_lock};
 
 /// The rolling window's default size, when a [`LeaseCreate`] names none.
 pub const DEFAULT_DURATION_HINT: Duration = Duration::hours(1);
@@ -60,6 +69,14 @@ pub enum LeaseError {
     /// [`release`] was asked for a node whose teardown is already underway or done.
     #[error("node {node} is already {state}; its release is already settled")]
     AlreadyGone { node: NodeId, state: String },
+    /// [`release`] without force was asked for a lease of the shared relay pool. Draining one
+    /// relay takes it out of the pool while its lease stays paid (it keeps being extended on
+    /// its last count) and the pool rents a replacement on top; the pool is shrunk by its
+    /// ceiling instead, or a relay is evicted with force.
+    #[error(
+        "this relay belongs to the shared pool: lower fleet.max_relay_nodes to shrink the pool, or release it with force"
+    )]
+    InSharedPool(NodeId),
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -273,12 +290,30 @@ pub async fn create(pool: &PgPool, req: &LeaseCreate) -> Result<Vec<NodeId>, Lea
 /// A node with no row is [`LeaseError::NotFound`]; one already `destroying` or `gone` is
 /// [`LeaseError::AlreadyGone`] — in both cases nothing is written, so the caller can tell a
 /// typo from a release that simply lost a race with the teardown it wanted.
+///
+/// A lease of the shared relay pool (`lease_source = 'autoscale'`) is released only with
+/// force; without it the call is [`LeaseError::InSharedPool`] and nothing is written.
 pub async fn release(
     pool: &PgPool,
     node_id: &NodeId,
     force: bool,
 ) -> Result<ReleaseState, LeaseError> {
     let mut tx = pool.begin().await?;
+
+    if !force {
+        // NULL (a desired row that is not a lease) or no desired row: not a pool lease. No
+        // lock: `lease_source` never changes once the row is written.
+        let source: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT lease_source FROM mm_fleet_desired WHERE mm_node_id = $1",
+        )
+        .bind(node_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        if source.as_deref() == Some("autoscale") {
+            return Err(LeaseError::InSharedPool(node_id.clone()));
+        }
+    }
 
     let marked = if force {
         sqlx::query(
@@ -402,6 +437,296 @@ pub async fn extend_leases(pool: &PgPool, now: DateTime<Utc>) -> Result<Vec<Node
     }
     tx.commit().await?;
     Ok(keep.into_iter().map(|(id, _)| NodeId::new(id)).collect())
+}
+
+/// The most rows one [`create_autoscale`] or [`top_up_autoscale`] call may write. The manual
+/// form's limit of 5 is an operator's, not the pool's; this one only bounds a runaway caller.
+pub const AUTOSCALE_MAX_COUNT: u8 = 100;
+/// `created_by` on every autoscale row.
+pub const AUTOSCALE_CREATED_BY: &str = "media-path";
+
+/// One lease of the autoscale pool, as [`autoscale_live`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoscaleLease {
+    pub node_id: NodeId,
+    /// The node row's count (every session it serves, relay links included); 0 while the
+    /// lease has no node row yet.
+    pub viewers_current: i32,
+    pub destroy_deadline: DateTime<Utc>,
+}
+
+fn check_hint(hint: Duration) -> Result<(), LeaseError> {
+    if hint < MIN_DURATION_HINT || hint > MAX_DURATION_HINT {
+        return Err(LeaseError::InvalidDurationHint {
+            asked: hint.num_seconds(),
+        });
+    }
+    Ok(())
+}
+
+/// Insert `count` autoscale rows (1..=[`AUTOSCALE_MAX_COUNT`], checked by the callers) inside
+/// `tx`, which already holds the desired-set lock: the manual row with
+/// `lease_source='autoscale'`, `created_by='media-path'`, operator funding, no broadcast,
+/// deadline `now + hint`, ids `lease-{uuid}-{i}` from one fresh uuid.
+async fn insert_autoscale_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    region: &str,
+    count: u8,
+    hint: Duration,
+    now: DateTime<Utc>,
+) -> Result<Vec<NodeId>, LeaseError> {
+    let request_id = Uuid::new_v4();
+    let ids = lease_node_ids(request_id, count);
+    let deadline = now + hint;
+    for id in &ids {
+        sqlx::query(
+            "INSERT INTO mm_fleet_desired
+                 (mm_node_id, flavor, ownership, region, size, destroy_deadline, funding,
+                  purpose, created_by, pinned_provider_id, lease_source, lease_request_id,
+                  lease_duration_hint_secs)
+             VALUES ($1, 'fanout', 'rented', $2, 'planned', $3, $4,
+                     'broadcast', $5, NULL, 'autoscale', $6, $7)",
+        )
+        .bind(id.as_str())
+        .bind(region)
+        .bind(deadline)
+        .bind(Funding::Operator.as_str())
+        .bind(AUTOSCALE_CREATED_BY)
+        .bind(request_id)
+        .bind(hint.num_seconds() as i32)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(ids)
+}
+
+/// Write `count` autoscale rows for `region` in one transaction: all rows or none. The rent
+/// path picks them up exactly as it picks up a manual lease. Sizing the pool goes through
+/// [`top_up_autoscale`], which counts and inserts atomically; this writes unconditionally.
+///
+/// `count == 0` writes nothing; above [`AUTOSCALE_MAX_COUNT`] is [`LeaseError::InvalidCount`]. A
+/// `hint` outside [`MIN_DURATION_HINT`]..=[`MAX_DURATION_HINT`] is refused like a manual one.
+pub async fn create_autoscale(
+    pool: &PgPool,
+    region: &str,
+    count: u8,
+    hint: Duration,
+    now: DateTime<Utc>,
+) -> Result<Vec<NodeId>, LeaseError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > AUTOSCALE_MAX_COUNT {
+        return Err(LeaseError::InvalidCount(count));
+    }
+    check_hint(hint)?;
+    let mut tx = pool.begin().await?;
+    take_desired_write_lock(&mut tx).await?;
+    let ids = insert_autoscale_rows(&mut tx, region, count, hint, now).await?;
+    tx.commit().await?;
+    Ok(ids)
+}
+
+/// A lease is live when it is not released and its node, if it has one, is not being torn
+/// down. A lease with no node row yet is live: it is being rented. (An ordered teardown, the
+/// sweeper's included, deletes the desired row before the machine is destroyed, so a row
+/// normally never outlives its machine; the state filter covers one that does.)
+const AUTOSCALE_LIVE_WHERE: &str = "d.lease_source = 'autoscale' AND d.lease_release IS NULL
+        AND (n.state IS NULL OR n.state NOT IN ('destroying', 'gone'))";
+
+/// Brings the pool up to `target` live leases and returns the ids it created (empty when
+/// the pool already has that many). Never removes anything.
+///
+/// One transaction under the desired-set lock ([`crate::desired::DESIRED_WRITE_LOCK`]), so two
+/// callers (two server replicas, or a retry) serialize and the second sees what the first
+/// wrote: the count and the insert cannot race. At most [`AUTOSCALE_MAX_COUNT`] rows per call;
+/// the rest comes on a later call.
+pub async fn top_up_autoscale(
+    pool: &PgPool,
+    region: &str,
+    target: u32,
+    hint: Duration,
+    now: DateTime<Utc>,
+) -> Result<Vec<NodeId>, LeaseError> {
+    check_hint(hint)?;
+    let mut tx = pool.begin().await?;
+    take_desired_write_lock(&mut tx).await?;
+    let live: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM mm_fleet_desired d
+           LEFT JOIN mm_fleet_nodes n ON n.mm_node_id = d.mm_node_id
+          WHERE {AUTOSCALE_LIVE_WHERE}"
+    ))
+    .fetch_one(&mut *tx)
+    .await?;
+    let short = i64::from(target).saturating_sub(live).max(0);
+    let count =
+        u8::try_from(short.min(i64::from(AUTOSCALE_MAX_COUNT))).unwrap_or(AUTOSCALE_MAX_COUNT);
+    if count == 0 {
+        return Ok(Vec::new()); // the transaction rolls back; nothing was written
+    }
+    let ids = insert_autoscale_rows(&mut tx, region, count, hint, now).await?;
+    tx.commit().await?;
+    Ok(ids)
+}
+
+fn to_lease((id, viewers, deadline): (String, i32, DateTime<Utc>)) -> AutoscaleLease {
+    AutoscaleLease {
+        node_id: NodeId::new(id),
+        viewers_current: viewers,
+        destroy_deadline: deadline,
+    }
+}
+
+/// Every live autoscale lease (see [`top_up_autoscale`]), ordered by id.
+pub async fn autoscale_live(pool: &PgPool) -> Result<Vec<AutoscaleLease>, LeaseError> {
+    let rows: Vec<(String, i32, DateTime<Utc>)> = sqlx::query_as(&format!(
+        "SELECT d.mm_node_id, COALESCE(n.viewers_current, 0), d.destroy_deadline
+           FROM mm_fleet_desired d
+           LEFT JOIN mm_fleet_nodes n ON n.mm_node_id = d.mm_node_id
+          WHERE {AUTOSCALE_LIVE_WHERE} AND d.destroy_deadline IS NOT NULL
+          ORDER BY d.mm_node_id"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(to_lease).collect())
+}
+
+/// Roll the pool forward: set both deadlines (desired and node row) to `now + hint` for the
+/// leases [`should_extend`] makes ELIGIBLE, which needs a node row (unreleased: Healthy, or
+/// Draining with viewers; drain-released: serving with viewers; force-released: never):
+///
+/// * among the unreleased eligible leases, the `keep` with the most viewers (ties by id
+///   ascending), and every other one with `viewers_current > 0`;
+/// * every released eligible lease, which never takes a `keep` slot.
+///
+/// Anything else (no node row, Requested, Booting, Destroying, Gone, Draining with no viewers,
+/// force-released) is neither extended nor ranked: it runs on the deadline it has, exactly like
+/// a manual lease, and the sweeper stays its backstop. Returns the ids extended, by id.
+pub async fn extend_autoscale(
+    pool: &PgPool,
+    keep: u32,
+    hint: Duration,
+    now: DateTime<Utc>,
+) -> Result<Vec<NodeId>, LeaseError> {
+    check_hint(hint)?;
+    let deadline = now + hint;
+
+    let mut tx = pool.begin().await?;
+    // Only leases with a node row can be eligible, so the join is an inner one.
+    let rows: Vec<(String, i32, String, Option<String>)> = sqlx::query_as(
+        "SELECT d.mm_node_id, n.viewers_current, n.state, d.lease_release
+           FROM mm_fleet_desired d
+           JOIN mm_fleet_nodes n ON n.mm_node_id = d.mm_node_id
+          WHERE d.lease_source = 'autoscale'
+          ORDER BY d.mm_node_id
+            FOR UPDATE OF d",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut extend: Vec<NodeId> = Vec::new();
+    // (id, viewers) of the unreleased eligible leases, in id order.
+    let mut ranked: Vec<(NodeId, i32)> = Vec::new();
+    for (id, viewers, state, release) in rows {
+        // An unparseable state or release is never extended: the sweeper stays the backstop.
+        let Some(state) = NodeState::parse(&state) else {
+            continue;
+        };
+        let release = match release.as_deref() {
+            None => None,
+            Some(raw) => match LeaseRelease::parse(raw) {
+                Some(r) => Some(r),
+                None => continue,
+            },
+        };
+        let view = LeaseNodeView {
+            state,
+            viewers_current: viewers.max(0) as u32,
+            release,
+        };
+        if !should_extend(&view, now) {
+            continue;
+        }
+        match release {
+            Some(_) => extend.push(NodeId::new(id)),
+            None => ranked.push((NodeId::new(id), viewers)),
+        }
+    }
+    // Busiest first; the id order the query returned breaks ties (the sort is stable).
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    let keep = usize::try_from(keep).unwrap_or(usize::MAX);
+    extend.extend(
+        ranked
+            .into_iter()
+            .enumerate()
+            .filter(|(rank, (_, viewers))| *rank < keep || *viewers > 0)
+            .map(|(_, (id, _))| id),
+    );
+    extend.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+    for id in &extend {
+        sqlx::query("UPDATE mm_fleet_desired SET destroy_deadline = $2 WHERE mm_node_id = $1")
+            .bind(id.as_str())
+            .bind(deadline)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE mm_fleet_nodes SET destroy_deadline = $2 WHERE mm_node_id = $1")
+            .bind(id.as_str())
+            .bind(deadline)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(extend)
+}
+
+/// Sends idle pool leases that are about to lapse down the ordered teardown, and returns
+/// their ids. Call it after `extend_autoscale` on the same tick.
+///
+/// A lease is retired when it has a node row, the node is Healthy or Draining with no viewers,
+/// the lease is not force-released, and the node's deadline (what the sweeper reaps by) is at
+/// or before `now + margin`. Kept and busy leases were just extended to `now + hint`, so only
+/// unwanted idle ones get that close. A node stuck in Requested or Booting stays with the
+/// sweeper, whose alert is right for it; a lease with no node row is left to the existing
+/// withdrawal.
+///
+/// The teardown is [`crate::desired::DesiredStore::order_teardown`]'s own statements, run in
+/// this function's transaction under the same desired-set lock, after a `FOR UPDATE` read that
+/// selects on every condition: a viewer count that rose, or a deadline extended, before that
+/// read is respected, and neither can change until the teardown commits. (`order_teardown`
+/// itself opens its own transaction, so it could not share the re-check.) The fleet runner's
+/// `complete_teardowns` then destroys the machine, which is not a deadline kill.
+pub async fn retire_idle_autoscale(
+    pool: &PgPool,
+    margin: Duration,
+    now: DateTime<Utc>,
+) -> Result<Vec<NodeId>, LeaseError> {
+    let mut tx = pool.begin().await?;
+    take_desired_write_lock(&mut tx).await?;
+    let due: Vec<String> = sqlx::query_scalar(
+        "SELECT d.mm_node_id
+           FROM mm_fleet_desired d
+           JOIN mm_fleet_nodes n ON n.mm_node_id = d.mm_node_id
+          WHERE d.lease_source = 'autoscale'
+            AND d.ownership = 'rented' AND n.ownership = 'rented'
+            AND n.state IN ('healthy', 'draining')
+            AND n.viewers_current = 0
+            AND (d.lease_release IS NULL OR d.lease_release <> 'force')
+            AND n.destroy_deadline <= $1
+          ORDER BY d.mm_node_id
+            FOR UPDATE OF d, n",
+    )
+    .bind(now + margin)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut retired = Vec::with_capacity(due.len());
+    for id in due {
+        let id = NodeId::new(id);
+        order_teardown_statements(&mut tx, &id).await?;
+        retired.push(id);
+    }
+    tx.commit().await?;
+    Ok(retired)
 }
 
 #[cfg(test)]

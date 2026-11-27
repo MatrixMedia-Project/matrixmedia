@@ -12,15 +12,19 @@
 //! `{"viewers":null}` when nobody is watching, which this test reproduces.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::routing::get;
 use axum::{Json, Router};
 use mm_core::fleet::{FleetNode, NodeFlavor, NodeId, NodeState, Ownership};
-use mm_core::switch_client::SwitchClient;
+use mm_core::switch_client::{SwitchClient, switch_source_id, switch_viewer_id};
+use mm_core::types::{RoomId, StreamId, StreamStatus, UserId};
+use mm_db::test_support::require_or_try_pool as try_pool;
+use mm_db::{Database, PgDatabase};
 use mm_fleet::runner::BroadcastCensus;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 /// Starts a stand-in switch and returns its base URL.
 async fn fake_switch(sources: serde_json::Value, viewers: serde_json::Value) -> String {
@@ -180,10 +184,246 @@ async fn a_node_that_does_not_answer_does_not_fail_the_census() {
     assert!(census.programme_is_live("b1").await.expect("must not error"));
 }
 
-/// `SwitchCensus::new` wants a PgPool. These tests never reach the database —
-/// `programme_is_live` consults the switch only — so a lazily-connected pool at an
-/// unused port is honest: if a test ever DID query, it would fail loudly rather
-/// than silently pass against a fake.
+/// A relay node pulls a stream from the switch it feeds off through a cascade session
+/// (`cascade-{source id}-{relay node id}`), which that switch lists exactly like a viewer.
+/// It is not a person, but it costs the node one stream's egress, so the node's count
+/// (`viewers_current`: drain, lease extension, remaining capacity) includes it. Here node
+/// `relay-a` serves one real viewer and a second relay pulling the same stream from it;
+/// a disconnected session counts for nothing.
+#[tokio::test]
+async fn a_relay_pulling_from_a_node_counts_toward_that_nodes_load() {
+    let origin = fake_switch(
+        json!([{ "id": "stream-b1", "type": "webrtc", "active": true }]),
+        json!(null),
+    )
+    .await;
+    let relay = fake_switch(
+        json!(null),
+        json!([
+            { "id": "viewer-b1--alice-example.org", "current_source": "stream-b1", "connected": true },
+            { "id": "cascade-stream-b1-lease-1-0",   "current_source": "stream-b1", "connected": true },
+            { "id": "viewer-b1--carol-example.org", "current_source": "stream-b1", "connected": false }
+        ]),
+    )
+    .await;
+
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin),
+    )));
+    pool.upsert(&node("relay-a"), Arc::new(SwitchClient::new(&relay)))
+        .await;
+    // viewers_per_node consults the switches only.
+    let census = mm_api::fleet_census::SwitchCensus::new(pool, dummy_pool());
+
+    let per_node = census.viewers_per_node().await;
+    assert_eq!(
+        per_node.get(&NodeId::new("relay-a")).copied(),
+        Some(2),
+        "alice and the relay pulling from the node are both served by it"
+    );
+}
+
+/// A feeder whose only session is a downstream relay is serving that relay's viewers one
+/// hop down. If it read 0 it could lapse or finish draining and be destroyed under them.
+#[tokio::test]
+async fn a_node_that_only_feeds_relays_is_not_empty() {
+    let origin = fake_switch(
+        json!([{ "id": "stream-b1", "type": "webrtc", "active": true }]),
+        json!(null),
+    )
+    .await;
+    let relay = fake_switch(
+        json!(null),
+        json!([
+            { "id": "cascade-stream-b1-lease-1-0", "current_source": "stream-b1", "connected": true }
+        ]),
+    )
+    .await;
+
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin),
+    )));
+    pool.upsert(&node("relay-a"), Arc::new(SwitchClient::new(&relay)))
+        .await;
+    let census = mm_api::fleet_census::SwitchCensus::new(pool, dummy_pool());
+
+    let per_node = census.viewers_per_node().await;
+    assert_eq!(
+        per_node.get(&NodeId::new("relay-a")).copied(),
+        Some(1),
+        "a node feeding one relay serves one session, not none"
+    );
+}
+
+/// The per-stream count the planner grows the fleet on is people only: the origin carries
+/// one real viewer of the stream and one relay pulling it, so the live broadcast has one
+/// viewer, not two. A fan-out node that only feeds a downstream relay adds no viewer to
+/// the stream, yet its own count and its relay-hour sample include that link. Needs a real
+/// `mm_streams` row, because the live list is read from the database.
+#[tokio::test]
+async fn a_relay_pulling_a_stream_is_not_counted_as_a_viewer() {
+    let Some(db) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&db).await;
+    let b1 = seed_active_stream(&db).await;
+    // Unique, so this test's meter samples never mix with another run's.
+    let feeder = format!("relay-{}", uuid::Uuid::new_v4());
+
+    let origin = fake_switch(
+        json!([{ "id": switch_source_id(&b1), "type": "webrtc", "active": true }]),
+        json!([
+            { "id": switch_viewer_id(&b1, "@alice:example.org"), "current_source": switch_source_id(&b1), "connected": true },
+            { "id": format!("cascade-{}-lease-1-0", switch_source_id(&b1)), "current_source": switch_source_id(&b1), "connected": true }
+        ]),
+    )
+    .await;
+    let relay = fake_switch(
+        json!(null),
+        json!([
+            { "id": format!("cascade-{}-lease-2-0", switch_source_id(&b1)), "current_source": switch_source_id(&b1), "connected": true }
+        ]),
+    )
+    .await;
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin),
+    )));
+    pool.upsert(&node(&feeder), Arc::new(SwitchClient::new(&relay)))
+        .await;
+    let census = mm_api::fleet_census::SwitchCensus::new(pool, db.clone());
+
+    let live = census.live_broadcasts().await.expect("census");
+    let viewers = live
+        .iter()
+        .find(|b| b.broadcast_id == b1)
+        .map(|b| b.viewers);
+    assert_eq!(
+        viewers,
+        Some(1),
+        "alice watches; the relay pulling the stream is not a viewer"
+    );
+
+    // pool_sync's tick takes the same count through the combined gather.
+    let pass = census
+        .viewers_per_node_and_live_broadcasts()
+        .await
+        .expect("census");
+    let (per_node, live) = (pass.per_node, pass.live);
+    let viewers = live
+        .iter()
+        .find(|b| b.broadcast_id == b1)
+        .map(|b| b.viewers);
+    assert_eq!(
+        viewers,
+        Some(1),
+        "the combined gather must count the same way"
+    );
+    assert_eq!(
+        per_node.get(&NodeId::new(feeder.as_str())).copied(),
+        Some(1),
+        "the feeder serves the relay pulling from it"
+    );
+
+    // The relay-hour meter splits the feeder's hour by these samples: the stream it
+    // carries only for a downstream relay still gets its share.
+    let samples: Vec<i32> = sqlx::query_scalar(
+        "SELECT viewers FROM mm_relay_usage_samples WHERE mm_node_id = $1 AND broadcast_id = $2",
+    )
+    .bind(&feeder)
+    .bind(&b1)
+    .fetch_all(&db)
+    .await
+    .expect("read samples");
+    assert_eq!(samples, vec![1], "one sample, counting the relay link");
+
+    sqlx::query("DELETE FROM mm_relay_usage_samples WHERE mm_node_id = $1")
+        .bind(&feeder)
+        .execute(&db)
+        .await
+        .expect("clean samples");
+    end_stream(&db, &b1).await;
+}
+
+/// A fan-out node that does not answer is named in the pass's `unanswered` set: its
+/// counts read zero, but the relay tree must not take that zero as "nobody there".
+#[tokio::test]
+async fn a_node_that_does_not_answer_is_reported_as_unanswered() {
+    let Some(db) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&db).await;
+    let origin = fake_switch(json!(null), json!(null)).await;
+    let answering = fake_switch(json!(null), json!(null)).await;
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin),
+    )));
+    let (dead, alive) = (
+        format!("dead-{}", uuid::Uuid::new_v4()),
+        format!("alive-{}", uuid::Uuid::new_v4()),
+    );
+    pool.upsert(&node(&dead), Arc::new(SwitchClient::new("http://127.0.0.1:1")))
+        .await;
+    pool.upsert(&node(&alive), Arc::new(SwitchClient::new(&answering)))
+        .await;
+    let census = mm_api::fleet_census::SwitchCensus::new(pool, db.clone());
+
+    let pass = census
+        .viewers_per_node_and_live_broadcasts()
+        .await
+        .expect("census");
+    assert!(pass.unanswered.contains(&NodeId::new(dead.as_str())));
+    assert!(!pass.unanswered.contains(&NodeId::new(alive.as_str())));
+}
+
+async fn ensure_migrations(pool: &sqlx::PgPool) {
+    static MIGRATIONS: OnceLock<Mutex<bool>> = OnceLock::new();
+    let cell = MIGRATIONS.get_or_init(|| Mutex::new(false));
+    let mut applied = cell.lock().await;
+    if !*applied {
+        mm_db::run_pg_migrations(pool)
+            .await
+            .expect("migrations should apply cleanly");
+        *applied = true;
+    }
+}
+
+/// An active broadcast of its own, so other tests' streams never change its count.
+async fn seed_active_stream(pool: &sqlx::PgPool) -> String {
+    let db = PgDatabase::from_pool(pool.clone());
+    let room = db
+        .get_or_create_room(&RoomId(format!(
+            "!census-{}:localhost",
+            uuid::Uuid::new_v4()
+        )))
+        .await
+        .expect("create room");
+    db.create_stream(
+        room.id,
+        &UserId("@host:localhost".to_string()),
+        Some("Census fixture"),
+        "video",
+        None,
+        None,
+        "core",
+    )
+    .await
+    .expect("create stream")
+    .id
+}
+
+async fn end_stream(pool: &sqlx::PgPool, stream_id: &str) {
+    PgDatabase::from_pool(pool.clone())
+        .update_stream_status(&StreamId(stream_id.to_string()), StreamStatus::Ended)
+        .await
+        .expect("end stream");
+}
+
+/// `SwitchCensus::new` wants a PgPool. The tests that use this never reach the
+/// database — `programme_is_live` and `viewers_per_node` consult the switches only —
+/// so a lazily-connected pool at an unused port is honest: if a test ever DID query,
+/// it would fail loudly rather than silently pass against a fake.
 fn dummy_pool() -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)

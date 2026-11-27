@@ -26,13 +26,19 @@
 //! internet and leaked which Matrix users were watching which stream (FR-349b).
 //! Here it is a Matrix-authenticated, per-stream count: no ids leave the server.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use mm_core::config::MediaPath;
 use mm_core::error::{ErrorCode, ErrorResponse, MMError};
+use mm_core::fleet::NodeId;
+use mm_core::fleet::media_path::{ViewerTarget, effective, viewer_target};
+use mm_core::switch_client::{SwitchClient, SwitchViewer, is_cascade_session};
 use mm_core::types::{StreamId, UserId};
 use mm_db::models::Stream;
 
@@ -40,17 +46,287 @@ use crate::client::ViewerGate;
 use crate::error::ApiError;
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
+use crate::switch_pool::SwitchPool;
 
 /// Token lifetime for one proxied offer. Short because it is used immediately and
 /// once — the offer is forwarded within the same request.
 const VIEWER_TOKEN_TTL_SECS: u64 = 60;
 
-/// Is the S1 proxy (FR-346) in effect? Its flag AND the switch auth secret: the
-/// proxy mints a per-request viewer token, and forwarding an UNBOUND offer would
-/// place a viewer on a node with no identity at all. Read from the config the
-/// caller holds for this request, so it always agrees with what is running.
+/// Is the S1 proxy (FR-346) in effect for every stream? Its flag, or a media path that is
+/// not `core` (relays are reached only through the proxy, so a relay path turns it on),
+/// AND the switch auth secret: the proxy mints a per-request viewer token, and forwarding
+/// an UNBOUND offer would place a viewer on a node with no identity at all. Read from the
+/// config the caller holds for this request, so it always agrees with what is running.
+///
+/// This is the server-wide part. A stream that started in a relay state keeps the proxy
+/// after the setting moved: see [`proxy_enabled_for`].
 pub fn proxy_enabled(cfg: &mm_core::config::Config) -> bool {
-    cfg.fleet.proxy_viewers && cfg.advertising.switch_auth_secret_opt().is_some()
+    proxy_enabled_for(cfg, MediaPath::Core)
+}
+
+/// The switch auth secret is set: not empty and not only whitespace.
+fn secret_set(cfg: &mm_core::config::Config) -> bool {
+    !cfg.advertising.switch_auth_secret.trim().is_empty()
+}
+
+/// Is the proxy on for a stream whose stored media path state is `stored`? The secret is
+/// set AND any of: `fleet.proxy_viewers`; the current setting's effective value is not
+/// `core`; the stream's stored state's effective value is not `core`. The last keeps a
+/// stream that started as `relay_after_threshold` on the proxy (where its relays are)
+/// after the operator moved the setting; under `frozen` or `off` both effective values are
+/// `core`, so a new viewer gets the origin.
+pub fn proxy_enabled_for(cfg: &mm_core::config::Config, stored: MediaPath) -> bool {
+    let mode = cfg.fleet.mode;
+    secret_set(cfg)
+        && (cfg.fleet.proxy_viewers
+            || effective(cfg.fleet.media_path, mode) != MediaPath::Core
+            || effective(stored, mode) != MediaPath::Core)
+}
+
+/// Is a proxied offer served at all? For the stream (`stored`, its stored state, `None`
+/// when there is no such stream) by [`proxy_enabled_for`], or because the viewer is already
+/// on a relay: whatever the setting and the mode say, a viewer watching on a relay may
+/// re-offer there. The kill switch stops new placements; it does not cut people off.
+/// Nothing is served without the secret.
+pub fn proxy_serves_offer(
+    cfg: &mm_core::config::Config,
+    stored: Option<MediaPath>,
+    on_a_relay: bool,
+) -> bool {
+    secret_set(cfg) && (on_a_relay || proxy_enabled_for(cfg, stored.unwrap_or(MediaPath::Core)))
+}
+
+/// The `switch_url` a viewer's join hands back for a stream stored in `stored`: the proxy
+/// form when the proxy is on for that stream ([`proxy_enabled_for`]), else the direct one.
+pub fn viewer_switch_url(
+    public_url: &str,
+    stream_id: &str,
+    stored: MediaPath,
+    cfg: &mm_core::config::Config,
+) -> String {
+    switch_base_url(public_url, stream_id, proxy_enabled_for(cfg, stored))
+}
+
+/// The refusal for an offer the proxy does not serve.
+fn proxy_off() -> ApiError {
+    MMError::api(
+        ErrorCode::FeatureDisabled,
+        "the viewer proxy is off for this stream: it needs MM_SWITCH_AUTH_SECRET and either \
+         fleet.proxy_viewers or a relay media path (fleet.media_path now, or the one the \
+         stream started in) with fleet.mode on",
+    )
+    .into()
+}
+
+/// Is `viewer` bound to a relay the pool still holds? Bindings exist only for relays: a
+/// viewer on the origin is unbound.
+pub async fn on_a_relay(pool: &SwitchPool, viewer: &mm_core::fleet::ViewerId) -> bool {
+    match pool.node_of_viewer(viewer).await {
+        Some(node) => pool.client_for_node(Some(&node)).await.is_some(),
+        None => false,
+    }
+}
+
+/// How long a relay has to answer a proxied offer before the viewer is sent to the origin
+/// instead. Well under the shared HTTP client's 60 s, which a relay that accepts the
+/// connection and never answers would otherwise hold the join for: a caller with a
+/// shorter timeout gives up first, and the join fails though the origin could serve it.
+const RELAY_OFFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Forward a viewer's offer to where [`place_viewer`] put it, and return the node's SDP
+/// answer (the inner `answer` object).
+///
+/// The viewer is bound before forwarding, so an ad switch racing this request resolves to
+/// the same node (FR-405) instead of falling back to the origin; a viewer on the origin is
+/// unbound (binding a synthetic origin id would make a real node indistinguishable from
+/// none).
+///
+/// A join never fails because a relay failed. When the relay refuses, cannot be reached,
+/// does not answer within [`RELAY_OFFER_BUDGET`] or answers with no usable SDP, the
+/// viewer's binding is removed and the same offer goes to the origin, once: a viewer whose
+/// relay has gone bad belongs on the main server, and a binding left in place would send
+/// every retry (the viewer id is deterministic) back to the same relay. If the origin
+/// fails too, its error is returned and the binding stays removed. The binding is kept
+/// only when the relay answers: a request dropped while the relay is still being tried
+/// (its caller gave up) releases it too.
+pub async fn forward_offer(
+    pool: &Arc<SwitchPool>,
+    stream: &StreamId,
+    viewer: &mm_core::fleet::ViewerId,
+    placed: (Option<NodeId>, Arc<SwitchClient>),
+    token: &str,
+    offer: &serde_json::Value,
+    source_id: &str,
+) -> Result<serde_json::Value, MMError> {
+    forward_offer_within(
+        pool,
+        stream,
+        viewer,
+        placed,
+        token,
+        offer,
+        source_id,
+        RELAY_OFFER_BUDGET,
+    )
+    .await
+}
+
+/// [`forward_offer`] with the relay's budget given.
+#[allow(clippy::too_many_arguments)]
+async fn forward_offer_within(
+    pool: &Arc<SwitchPool>,
+    stream: &StreamId,
+    viewer: &mm_core::fleet::ViewerId,
+    placed: (Option<NodeId>, Arc<SwitchClient>),
+    token: &str,
+    offer: &serde_json::Value,
+    source_id: &str,
+    relay_budget: std::time::Duration,
+) -> Result<serde_json::Value, MMError> {
+    let (node_id, client) = placed;
+    let Some(node) = node_id else {
+        pool.unbind_viewer(viewer).await;
+        return offer_to_origin(&client, viewer, token, offer, source_id).await;
+    };
+    pool.bind_viewer(viewer.clone(), node.clone()).await;
+    let binding = RelayBinding {
+        pool: pool.clone(),
+        viewer: Some(viewer.clone()),
+    };
+    let attempt = tokio::time::timeout(
+        relay_budget,
+        offer_to_node(&client, viewer, token, offer, source_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(MMError::Sfu(format!(
+            "the relay did not answer within {} ms",
+            relay_budget.as_millis()
+        )))
+    });
+    match attempt {
+        Ok(answer) => {
+            binding.keep();
+            Ok(answer)
+        }
+        Err(e) => {
+            binding.release().await;
+            tracing::warn!(
+                stream = %stream.0,
+                node = %node,
+                viewer = %viewer,
+                error = %e,
+                "proxied viewer offer: the relay failed, sending the viewer to the origin"
+            );
+            offer_to_origin(&pool.origin(), viewer, token, offer, source_id).await
+        }
+    }
+}
+
+/// A viewer's binding to the relay its offer is being sent to. Kept only by
+/// [`Self::keep`], once the relay has answered; released by [`Self::release`] or, when the
+/// request is dropped mid-attempt, by `Drop`.
+struct RelayBinding {
+    pool: Arc<SwitchPool>,
+    /// `None` once kept or released.
+    viewer: Option<mm_core::fleet::ViewerId>,
+}
+
+impl RelayBinding {
+    fn keep(mut self) {
+        self.viewer = None;
+    }
+
+    async fn release(mut self) {
+        if let Some(viewer) = &self.viewer {
+            self.pool.unbind_viewer(viewer).await;
+        }
+        self.viewer = None;
+    }
+}
+
+impl Drop for RelayBinding {
+    fn drop(&mut self) {
+        if let Some(viewer) = self.viewer.take() {
+            self.pool.unbind_viewer_detached(viewer);
+        }
+    }
+}
+
+/// One offer to the origin. Its failure is the join's: logged here, then returned.
+async fn offer_to_origin(
+    client: &SwitchClient,
+    viewer: &mm_core::fleet::ViewerId,
+    token: &str,
+    offer: &serde_json::Value,
+    source_id: &str,
+) -> Result<serde_json::Value, MMError> {
+    offer_to_node(client, viewer, token, offer, source_id)
+        .await
+        .inspect_err(|e| {
+            tracing::error!(viewer = %viewer, error = %e, "proxied viewer offer: the origin failed");
+        })
+}
+
+/// One offer to one switch, its answer checked for a usable SDP. Logs nothing: the caller
+/// knows whether the switch was a relay (which the origin then stands in for) or the
+/// origin.
+async fn offer_to_node(
+    client: &SwitchClient,
+    viewer: &mm_core::fleet::ViewerId,
+    token: &str,
+    offer: &serde_json::Value,
+    source_id: &str,
+) -> Result<serde_json::Value, MMError> {
+    let forwarded = client
+        .viewer_offer(viewer.as_str(), token, offer, Some(source_id))
+        .await
+        .map_err(|e| MMError::Sfu(format!("switch node rejected the offer: {e}")))?;
+    proxy_answer_of(&forwarded)
+        .map_err(|e| MMError::Sfu(format!("switch node returned an unusable answer: {e}")))
+}
+
+/// Where a new offer of `viewer` on `stream` goes: `Some(node)` for a relay, `None` for
+/// the origin.
+///
+/// A viewer who already has a node keeps it (see the STICKY note in
+/// [`proxy_viewer_offer`]) while that node still carries the stream. A binding to a relay
+/// that no longer carries it (the viewer dropped, and the sync then removed the stream's
+/// source there) is removed and the viewer is placed fresh: that relay would answer the
+/// offer with no picture. Otherwise the stream's stored state (`stream_path`, fixed when
+/// it started) decides through [`viewer_target`], with the live `fleet.mode` and
+/// `fleet.relay_viewer_threshold` and the stream's audience at the last census: `Relay`
+/// takes a relay that carries the stream ([`SwitchPool::assign_fanout_node`]) or falls
+/// back to the origin; `Core` is the origin. So under state `core` relays are never used
+/// for placement, even with `fleet.proxy_viewers` on and relays leased.
+pub async fn place_viewer(
+    pool: &SwitchPool,
+    cfg: &mm_core::config::Config,
+    stream: &StreamId,
+    stream_path: MediaPath,
+    viewer: &mm_core::fleet::ViewerId,
+) -> (Option<NodeId>, Arc<SwitchClient>) {
+    if let Some(node) = pool.node_of_viewer(viewer).await {
+        if pool.carried_by(&node).await.contains(&stream.0)
+            && let Some(client) = pool.client_for_node(Some(&node)).await
+        {
+            return (Some(node), client);
+        }
+        pool.unbind_viewer(viewer).await;
+    }
+    let target = viewer_target(
+        stream_path,
+        cfg.fleet.mode,
+        pool.viewers_of(stream).await,
+        cfg.fleet.relay_viewer_threshold,
+    );
+    match target {
+        ViewerTarget::Relay => match pool.assign_fanout_node(stream).await {
+            Some((node, client)) => (Some(node), client),
+            None => (None, pool.origin()),
+        },
+        ViewerTarget::Core => (None, pool.origin()),
+    }
 }
 
 /// What `switch_url` the join response should hand a client.
@@ -127,11 +403,13 @@ fn unwrap_node_answer(body: serde_json::Value) -> serde_json::Value {
 /// node is touched. Factored over its dependencies like
 /// [`crate::client::authorize_viewer`] so tests can drive it. In order:
 ///
-/// 1. The proxy is on ([`proxy_enabled`]). Off, it is the route's 501 for a
-///    missing switch or secret, before any lookup, so it says nothing about the
-///    stream. The route is mounted whatever the flag says: the settings live in
-///    the database and can change while mm-core runs, so the flag is read per
-///    request rather than when the router is built.
+/// 1. `proxy_on`: off, it is the route's 501, before any lookup. The handler passes `true`
+///    on every path and decides whether the proxy serves the stream and viewer only AFTER
+///    this gate ([`admit_member_offer`], and the same check for the token and share-link
+///    paths), so the answer to a caller the gate refuses never depends on the state the
+///    stream was stored in. The route is mounted whatever the settings say: they live in
+///    the database and can change while mm-core runs, so they are read per request rather
+///    than when the router is built.
 /// 2. `/join`'s viewer gate, the same function: membership, ended, the content
 ///    and tier gates, capacity. Minting a viewer token is handing out the
 ///    stream, so the proxy must refuse whoever `/join` refuses, with the same
@@ -148,11 +426,7 @@ pub async fn admit_offer(
     requested_source: Option<&str>,
 ) -> Result<Stream, ApiError> {
     if !proxy_on {
-        return Err(MMError::api(
-            ErrorCode::FeatureDisabled,
-            "the viewer proxy is off: it needs fleet.proxy_viewers and MM_SWITCH_AUTH_SECRET",
-        )
-        .into());
+        return Err(proxy_off());
     }
     let stream = crate::client::authorize_viewer(gate, id, caller).await?;
     if let Some(requested) = requested_source
@@ -165,6 +439,51 @@ pub async fn admit_offer(
         .into());
     }
     Ok(stream)
+}
+
+/// Admit a member who presents an MM JWT. In order: the secret (without it nothing can be
+/// served, refused before any lookup); [`admit_offer`], `/join`'s gate; then whether the
+/// proxy serves this stream and viewer ([`proxy_serves_admitted`]). The proxy is decided
+/// after the gate, as for the token and share-link paths, so the answer to a caller the gate
+/// refuses never depends on the state the stream was stored in. Returns the stream and the
+/// viewer id derived from the caller.
+pub async fn admit_member_offer(
+    gate: &ViewerGate<'_>,
+    cfg: &mm_core::config::Config,
+    pool: Option<&SwitchPool>,
+    id: &str,
+    caller: &UserId,
+    requested_source: Option<&str>,
+) -> Result<(Stream, String), ApiError> {
+    if !secret_set(cfg) {
+        return Err(proxy_off());
+    }
+    let stream = admit_offer(gate, true, id, caller, requested_source).await?;
+    // Derived, never taken from the body.
+    let viewer_id = mm_core::switch_client::switch_viewer_id(&stream.id, &caller.0);
+    proxy_serves_admitted(cfg, pool, &stream, &viewer_id).await?;
+    Ok((stream, viewer_id))
+}
+
+/// For a viewer the gate admitted: does the proxy serve this stream and viewer
+/// ([`proxy_serves_offer`]: the stream's stored state, or the viewer already on a relay)?
+/// Refused with the proxy's 501 otherwise.
+async fn proxy_serves_admitted(
+    cfg: &mm_core::config::Config,
+    pool: Option<&SwitchPool>,
+    stream: &Stream,
+    viewer_id: &str,
+) -> Result<(), ApiError> {
+    let bound = match pool {
+        Some(pool) => on_a_relay(pool, &mm_core::fleet::ViewerId::new(viewer_id)).await,
+        None => false,
+    };
+    let stored = MediaPath::parse(&stream.media_path).unwrap_or(MediaPath::Core);
+    if proxy_serves_offer(cfg, Some(stored), bound) {
+        Ok(())
+    } else {
+        Err(proxy_off())
+    }
 }
 
 /// The member seat a verified switch viewer token names, if any: the
@@ -262,7 +581,7 @@ pub async fn authorize_member_token_offer(
         (status = 404, description = "Stream not found or not public; the grant is unknown, revoked, or expired; or the member caller is neither the host nor in the room", body = ErrorResponse),
         (status = 409, description = "Every seat is taken and the caller holds none (members only; a guest's seat was taken at join)", body = ErrorResponse),
         (status = 410, description = "Stream already ended", body = ErrorResponse),
-        (status = 501, description = "The proxy is off (fleet.proxy_viewers), or the switch or its auth secret is not configured", body = ErrorResponse),
+        (status = 501, description = "The proxy is off for this stream (it needs the switch auth secret and fleet.proxy_viewers or a relay media path, now or the one the stream started in), or the switch or its auth secret is not configured", body = ErrorResponse),
         (status = 503, description = "The node rejected or could not answer the offer", body = ErrorResponse),
     ),
     security(("mm_jwt" = [])),
@@ -276,33 +595,31 @@ async fn proxy_viewer_offer(
 ) -> Result<Json<ProxyOfferResponse>, ApiError> {
     let cfg = state.config();
     let gate = ViewerGate::from_state(&state, &cfg);
-    // Members first, exactly as before: a valid JWT takes the member gate and
+    // Members first: a valid JWT takes the member gate and
     // derives the viewer id from the Matrix user. Without one the caller must
     // be an anonymous share-link viewer, whose credential rides in the body.
     // These requests carry no `Authorization` header, so the `None` case costs
     // no Matrix-bearer fallback round-trip inside the extractor.
+    let member_jwt = auth.is_some();
     let (stream, viewer_id) = match auth {
+        // The gate, then the proxy for this stream and viewer. `req.id` is accepted and
+        // dropped: the viewer id is derived from the Matrix user.
         Some(auth) => {
-            let stream = admit_offer(
+            admit_member_offer(
                 &gate,
-        proxy_enabled(&cfg),
-        &id,
+                &cfg,
+                state.switch_pool.as_deref(),
+                &id,
                 &auth.user_id,
                 req.source_id.as_deref(),
             )
-            .await?;
-            // Derived, never taken from the body. `req.id` is accepted and dropped.
-            let viewer_id =
-                mm_core::switch_client::switch_viewer_id(&stream.id, &auth.user_id.0);
-            (stream, viewer_id)
+            .await?
         }
         None => {
-            if !proxy_enabled(&cfg) {
-                return Err(MMError::api(
-                    ErrorCode::FeatureDisabled,
-                    "the viewer proxy is off: it needs fleet.proxy_viewers and MM_SWITCH_AUTH_SECRET",
-                )
-                .into());
+            // Without the secret nothing here can work; refuse before any lookup. Whether
+            // the proxy serves this stream and viewer is decided once the viewer is known.
+            if !secret_set(&cfg) {
+                return Err(proxy_off());
             }
             // Shipped member clients hold no MM JWT for the switch path:
             // their /join handed them a switch viewer token, presented
@@ -409,6 +726,13 @@ async fn proxy_viewer_offer(
     };
     let stream_id = StreamId(stream.id.clone());
 
+    // A viewer admitted by a switch viewer token or a share link: whether the proxy serves
+    // this stream and viewer, now that both are known (members were decided the same way,
+    // after their gate, in `admit_member_offer`).
+    if !member_jwt {
+        proxy_serves_admitted(&cfg, state.switch_pool.as_deref(), &stream, &viewer_id).await?;
+    }
+
     let (Some(pool), Some(secret)) = (
         state.switch_pool.clone(),
         cfg.advertising.switch_auth_secret_opt().map(str::to_owned),
@@ -434,35 +758,16 @@ async fn proxy_viewer_offer(
     // its stale entry until that node is destroyed. Worse, the ad binding would
     // move while the viewer's existing PeerConnection did not.
     //
-    // So: reuse the node this viewer is already on, and pick a new one only when
-    // they have none. Deliberately moving a viewer between nodes is
-    // make-before-break (FR-322), an explicit mechanism, not a side effect of
-    // re-offering.
-    let existing = match pool.node_of_viewer(&viewer).await {
-        Some(node) => pool
-            .client_for_node(Some(&node))
-            .await
-            .map(|client| (Some(node), client)),
-        None => None,
-    };
-
-    let (node_id, client) = match existing {
-        Some(pair) => pair,
-        None => match pool.assign_fanout_node(&stream_id).await {
-            Some((node_id, client)) => (Some(node_id), client),
-            None => (None, pool.origin()),
-        },
-    };
-
-    // Bind before forwarding, so an ad switch racing this request resolves to the
-    // same node (FR-405) instead of falling back to the origin.
-    match node_id.clone() {
-        Some(node) => pool.bind_viewer(viewer.clone(), node).await,
-        // Unbound means "on the origin", which `route_viewer` already reads
-        // correctly; binding a synthetic origin id would make a real node
-        // indistinguishable from none.
-        None => pool.unbind_viewer(&viewer).await,
-    }
+    // So: reuse the node this viewer is already on while that relay still carries
+    // the stream, and pick a new one only when they have none. A relay that no longer
+    // carries it (the viewer dropped and the sync removed its source there) would answer
+    // with no picture: that binding is dropped and the viewer placed fresh. Deliberately
+    // moving a viewer between nodes is make-before-break (FR-322), an explicit
+    // mechanism, not a side effect of re-offering.
+    //
+    // A viewer with no node is placed by the stream's stored media path state.
+    let stream_path = MediaPath::parse(&stream.media_path).unwrap_or(MediaPath::Core);
+    let (node_id, client) = place_viewer(&pool, &cfg, &stream_id, stream_path, &viewer).await;
 
     // FR-347b: a per-request VIEWER-role token whose sub is the derived id. Not
     // the server token — that one is exempt from the binding.
@@ -473,30 +778,18 @@ async fn proxy_viewer_offer(
         VIEWER_TOKEN_TTL_SECS,
     );
 
-    let forwarded = client
-        .viewer_offer(&viewer_id, &token, &req.offer, Some(&source_id))
-        .await
-        .map_err(|e| {
-            // The binding rejecting us is our bug, not the caller's, and it must
-            // not be reported as a client error.
-            tracing::error!(
-                viewer = %viewer_id,
-                node = ?node_id,
-                error = %e,
-                "proxied viewer offer failed"
-            );
-            MMError::Sfu(format!("switch node rejected the offer: {e}"))
-        })?;
-
-    let answer = proxy_answer_of(&forwarded).map_err(|e| {
-        tracing::error!(
-            viewer = %viewer_id,
-            node = ?node_id,
-            error = %e,
-            "proxied viewer offer returned an unusable answer"
-        );
-        MMError::Sfu(format!("switch node returned an unusable answer: {e}"))
-    })?;
+    // Binds (or unbinds) the viewer, forwards, and moves the viewer to the origin if a
+    // relay fails.
+    let answer = forward_offer(
+        &pool,
+        &stream_id,
+        &viewer,
+        (node_id, client),
+        &token,
+        &req.offer,
+        &source_id,
+    )
+    .await?;
 
     Ok(Json(ProxyOfferResponse {
         id: viewer_id,
@@ -620,14 +913,7 @@ async fn proxy_viewer_count(
     let mut viewers: u32 = 0;
     for client in clients {
         match client.list_viewers().await {
-            Ok(list) => {
-                viewers += list
-                    .iter()
-                    .filter(|v| v.connected)
-                    // Mid ad-break still counts, as the shipped client counts it.
-                    .filter(|v| v.current_source == want || v.current_source.starts_with("ad-"))
-                    .count() as u32;
-            }
+            Ok(list) => viewers += stream_viewer_count(&list, &want),
             Err(e) => tracing::warn!(
                 node = client.base_url(),
                 error = %e,
@@ -640,6 +926,18 @@ async fn proxy_viewer_count(
         stream_id: id,
         viewers,
     }))
+}
+
+/// People watching `source_id` in one switch's viewer list: connected, on the stream or
+/// mid ad-break (the shipped client counts those too), and not a relay node pulling the
+/// stream through a cascade session — the census counts the same way.
+fn stream_viewer_count(viewers: &[SwitchViewer], source_id: &str) -> u32 {
+    viewers
+        .iter()
+        .filter(|v| v.connected)
+        .filter(|v| !is_cascade_session(&v.id))
+        .filter(|v| v.current_source == source_id || v.current_source.starts_with("ad-"))
+        .count() as u32
 }
 
 fn api_router() -> utoipa_axum::router::OpenApiRouter<SharedState> {
@@ -701,6 +999,32 @@ mod tests {
         // No `answer` field: forward verbatim.
         let flat = serde_json::json!({"type": "answer", "sdp": "v=0"});
         assert_eq!(unwrap_node_answer(flat.clone()), flat);
+    }
+
+    #[test]
+    fn the_proxy_is_on_whenever_the_state_is_not_core() {
+        use mm_core::config::FleetMode;
+        let mut cfg = mm_core::config::Config::default();
+        cfg.fleet.proxy_viewers = false;
+        cfg.fleet.media_path = MediaPath::RelayAfterThreshold;
+        cfg.fleet.mode = FleetMode::On;
+        cfg.advertising.switch_auth_secret = "s3cret".into();
+        assert!(
+            proxy_enabled(&cfg),
+            "a relay path needs the proxy: relays are reached through it"
+        );
+
+        cfg.fleet.mode = FleetMode::Frozen;
+        assert!(
+            !proxy_enabled(&cfg),
+            "frozen makes the path core, and the flag is off"
+        );
+
+        cfg.fleet.mode = FleetMode::On;
+        cfg.advertising.switch_auth_secret = String::new();
+        assert!(!proxy_enabled(&cfg), "no secret: the proxy must stay off");
+        cfg.advertising.switch_auth_secret = "  \n".into();
+        assert!(!proxy_enabled(&cfg), "a whitespace-only secret is not set");
     }
 
     /// FR-346 needs a secret: the proxy mints a per-request viewer token, and an
@@ -779,5 +1103,509 @@ mod tests {
         // The token is minted and used inside one request. A long TTL would turn a
         // logged or cached header into a reusable credential for that viewer id.
         assert!(VIEWER_TOKEN_TTL_SECS <= 300);
+    }
+
+    fn relay(id: &str) -> mm_core::fleet::FleetNode {
+        mm_core::fleet::FleetNode {
+            id: NodeId::new(id),
+            flavor: mm_core::fleet::NodeFlavor::Fanout,
+            ownership: mm_core::fleet::Ownership::Leased,
+            state: mm_core::fleet::NodeState::Healthy,
+            viewer_capacity: 250,
+            viewers_current: 0,
+            funding: mm_core::fleet::funding::Funding::Operator,
+        }
+    }
+
+    /// A pool whose relay `r1` carries stream `s1`, which 500 people watch.
+    async fn pool_with_a_carrier() -> SwitchPool {
+        let pool = SwitchPool::new(Arc::new(SwitchClient::new("http://origin.invalid:7890")));
+        pool.upsert(
+            &relay("r1"),
+            Arc::new(SwitchClient::new("http://r1.invalid:7890")),
+        )
+        .await;
+        pool.set_carried(
+            &NodeId::new("r1"),
+            std::collections::HashSet::from(["s1".to_string()]),
+        )
+        .await;
+        pool.set_stream_viewers(std::collections::HashMap::from([("s1".to_string(), 500)]))
+            .await;
+        pool
+    }
+
+    fn fleet_on(threshold: u32) -> mm_core::config::Config {
+        let mut cfg = mm_core::config::Config::default();
+        cfg.fleet.mode = mm_core::config::FleetMode::On;
+        cfg.fleet.relay_viewer_threshold = threshold;
+        cfg.advertising.switch_auth_secret = "s3cret".into();
+        cfg
+    }
+
+    async fn placed(
+        pool: &SwitchPool,
+        cfg: &mm_core::config::Config,
+        stream: &str,
+        path: MediaPath,
+        viewer: &str,
+    ) -> Option<String> {
+        place_viewer(
+            pool,
+            cfg,
+            &StreamId(stream.into()),
+            path,
+            &mm_core::fleet::ViewerId::new(viewer),
+        )
+        .await
+        .0
+        .map(|n| n.as_str().to_string())
+    }
+
+    /// Design C14: under state `core` relays are not used for placement, even with
+    /// `fleet.proxy_viewers` on, relays leased and carrying the stream, and the audience
+    /// far past the threshold.
+    #[tokio::test]
+    async fn state_core_means_the_core_only() {
+        let pool = pool_with_a_carrier().await;
+        let mut cfg = fleet_on(50);
+        cfg.fleet.proxy_viewers = true;
+        cfg.fleet.media_path = MediaPath::RelayAfterThreshold; // the setting today
+        assert!(proxy_enabled(&cfg));
+        assert_eq!(placed(&pool, &cfg, "s1", MediaPath::Core, "v1").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_relayed_stream_past_its_threshold_sends_new_viewers_to_a_carrier() {
+        let pool = pool_with_a_carrier().await;
+        let path = MediaPath::RelayAfterThreshold;
+
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", path, "v1")
+                .await
+                .as_deref(),
+            Some("r1")
+        );
+        // A stored relay_entry is served as relay_after_threshold.
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", MediaPath::RelayEntry, "v2")
+                .await
+                .as_deref(),
+            Some("r1")
+        );
+        // Below the threshold: the core.
+        assert_eq!(placed(&pool, &fleet_on(501), "s1", path, "v3").await, None);
+        // The fleet not on: the core, whatever the stored state.
+        let mut frozen = fleet_on(50);
+        frozen.fleet.mode = mm_core::config::FleetMode::Frozen;
+        assert_eq!(placed(&pool, &frozen, "s1", path, "v4").await, None);
+        // Nobody carries s2, though it is past its threshold: the core.
+        pool.set_stream_viewers(std::collections::HashMap::from([
+            ("s1".to_string(), 500),
+            ("s2".to_string(), 500),
+        ]))
+        .await;
+        assert_eq!(placed(&pool, &fleet_on(50), "s2", path, "v5").await, None);
+        // A stream the census did not list has an unknown audience: the core.
+        assert_eq!(placed(&pool, &fleet_on(50), "s3", path, "v6").await, None);
+    }
+
+    /// Nobody already watching is moved: a viewer bound to a relay keeps it, even when
+    /// the stream would now place a new viewer on the core.
+    #[tokio::test]
+    async fn a_bound_viewer_keeps_its_node() {
+        let pool = pool_with_a_carrier().await;
+        pool.bind_viewer(mm_core::fleet::ViewerId::new("v1"), NodeId::new("r1"))
+            .await;
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", MediaPath::Core, "v1")
+                .await
+                .as_deref(),
+            Some("r1")
+        );
+    }
+
+    /// A binding is honoured only while its relay carries the stream. A viewer whose relay
+    /// dropped the stream (the viewer's own disconnect let the sync remove it) re-offers
+    /// with the same id: sending them back there would answer with no picture, so the
+    /// binding goes and the viewer is placed fresh, here on the origin.
+    #[tokio::test]
+    async fn a_bound_viewer_whose_relay_no_longer_carries_the_stream_is_placed_fresh() {
+        let pool = pool_with_a_carrier().await;
+        let viewer = mm_core::fleet::ViewerId::new("v1");
+        pool.bind_viewer(viewer.clone(), NodeId::new("r1")).await;
+        pool.set_carried(&NodeId::new("r1"), std::collections::HashSet::new())
+            .await;
+        let path = MediaPath::RelayAfterThreshold;
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", path, "v1").await,
+            None,
+            "nobody carries s1 any more: the origin"
+        );
+        assert_eq!(
+            pool.node_of_viewer(&viewer).await,
+            None,
+            "the stale binding is gone"
+        );
+    }
+
+    /// A bound viewer whose relay carries another stream but not this one is placed fresh
+    /// on a relay that does carry it.
+    #[tokio::test]
+    async fn a_bound_viewer_is_moved_off_a_relay_that_does_not_carry_its_stream() {
+        let pool = pool_with_a_carrier().await;
+        pool.upsert(
+            &relay("r2"),
+            Arc::new(SwitchClient::new("http://r2.invalid:7890")),
+        )
+        .await;
+        pool.set_carried(
+            &NodeId::new("r2"),
+            std::collections::HashSet::from(["s9".to_string()]),
+        )
+        .await;
+        let viewer = mm_core::fleet::ViewerId::new("v1");
+        pool.bind_viewer(viewer.clone(), NodeId::new("r2")).await;
+        let path = MediaPath::RelayAfterThreshold;
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", path, "v1")
+                .await
+                .as_deref(),
+            Some("r1")
+        );
+    }
+
+    // ── The proxy per stream, and a failing relay ──────────────────────────
+
+    #[test]
+    fn the_proxy_stays_on_for_a_stream_that_started_in_the_relay_state() {
+        let mut cfg = fleet_on(50);
+        cfg.fleet.proxy_viewers = false;
+        cfg.fleet.media_path = MediaPath::Core; // moved after the stream started
+        assert!(proxy_enabled_for(&cfg, MediaPath::RelayAfterThreshold));
+        assert!(!proxy_enabled_for(&cfg, MediaPath::Core));
+        cfg.advertising.switch_auth_secret = String::new();
+        assert!(!proxy_enabled_for(&cfg, MediaPath::RelayAfterThreshold));
+    }
+
+    /// The join hands out the proxy URL for a relay-state stream after the setting moved,
+    /// and the direct origin URL for a core stream.
+    #[test]
+    fn the_joins_switch_url_follows_the_streams_state() {
+        let mut cfg = fleet_on(50);
+        cfg.fleet.proxy_viewers = false;
+        cfg.fleet.media_path = MediaPath::Core;
+        assert_eq!(
+            viewer_switch_url(
+                "https://mm.example",
+                "s1",
+                MediaPath::RelayAfterThreshold,
+                &cfg
+            ),
+            "https://mm.example/_mm/fleet/v1/streams/s1"
+        );
+        assert_eq!(
+            viewer_switch_url("https://mm.example", "s1", MediaPath::Core, &cfg),
+            "https://mm.example/_mm/switch"
+        );
+    }
+
+    /// The kill switch stops new placements; it does not cut off a viewer already on a
+    /// relay: the re-offer is admitted and goes to the bound relay.
+    #[tokio::test]
+    async fn a_viewer_already_on_a_relay_is_served_whatever_the_setting() {
+        let pool = pool_with_a_carrier().await;
+        pool.bind_viewer(mm_core::fleet::ViewerId::new("v1"), NodeId::new("r1"))
+            .await;
+        let mut cfg = fleet_on(50);
+        cfg.fleet.proxy_viewers = false;
+        cfg.fleet.media_path = MediaPath::Core;
+        cfg.fleet.mode = mm_core::config::FleetMode::Frozen;
+        let stored = MediaPath::RelayAfterThreshold;
+
+        let viewer = mm_core::fleet::ViewerId::new("v1");
+        assert!(proxy_serves_offer(
+            &cfg,
+            Some(stored),
+            on_a_relay(&pool, &viewer).await
+        ));
+        assert_eq!(
+            placed(&pool, &cfg, "s1", stored, "v1").await.as_deref(),
+            Some("r1")
+        );
+        // Without a secret nothing is served, not even a bound viewer.
+        cfg.advertising.switch_auth_secret = String::new();
+        assert!(!proxy_serves_offer(&cfg, Some(stored), true));
+    }
+
+    #[tokio::test]
+    async fn a_new_viewer_under_frozen_goes_to_the_origin() {
+        let pool = pool_with_a_carrier().await;
+        let mut cfg = fleet_on(50);
+        cfg.fleet.mode = mm_core::config::FleetMode::Frozen;
+        let viewer = mm_core::fleet::ViewerId::new("v-new");
+        assert!(!on_a_relay(&pool, &viewer).await);
+        assert_eq!(
+            placed(&pool, &cfg, "s1", MediaPath::RelayAfterThreshold, "v-new").await,
+            None
+        );
+    }
+
+    /// A stand-in switch answering `POST /api/viewers/offer`: with an SDP naming `name`
+    /// when `ok`, else with a 503.
+    async fn offer_switch(name: &'static str, ok: bool) -> Arc<SwitchClient> {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/api/viewers/offer",
+            post(move || async move {
+                if ok {
+                    Json(serde_json::json!({
+                        "id": "v",
+                        "answer": { "type": "answer", "sdp": format!("v=0 {name}") }
+                    }))
+                    .into_response()
+                } else {
+                    (StatusCode::SERVICE_UNAVAILABLE, "down").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        Arc::new(SwitchClient::new(&url))
+    }
+
+    /// A pool whose origin and relay `r1` are stand-ins.
+    async fn pool_of(origin_ok: bool, relay_ok: bool) -> (Arc<SwitchPool>, Arc<SwitchClient>) {
+        let pool = Arc::new(SwitchPool::new(offer_switch("origin", origin_ok).await));
+        let relay_client = offer_switch("relay", relay_ok).await;
+        pool.upsert(&relay("r1"), relay_client.clone()).await;
+        (pool, relay_client)
+    }
+
+    async fn offer_to(
+        pool: &Arc<SwitchPool>,
+        node: Option<&str>,
+        client: Arc<SwitchClient>,
+    ) -> Result<serde_json::Value, MMError> {
+        forward_offer(
+            pool,
+            &StreamId("s1".into()),
+            &mm_core::fleet::ViewerId::new("v1"),
+            (node.map(NodeId::new), client),
+            "token",
+            &serde_json::json!({ "type": "offer", "sdp": "v=0" }),
+            "stream-s1",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_fails_sends_the_viewer_to_the_origin() {
+        let (pool, relay_client) = pool_of(true, false).await;
+        let answer = offer_to(&pool, Some("r1"), relay_client)
+            .await
+            .expect("the origin answers");
+        assert_eq!(answer["sdp"], "v=0 origin");
+        assert_eq!(
+            pool.node_of_viewer(&mm_core::fleet::ViewerId::new("v1"))
+                .await,
+            None,
+            "the viewer is on the origin now: no binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bound_viewer_whose_relay_fails_moves_to_the_origin() {
+        let (pool, relay_client) = pool_of(true, false).await;
+        let viewer = mm_core::fleet::ViewerId::new("v1");
+        pool.bind_viewer(viewer.clone(), NodeId::new("r1")).await;
+        pool.set_carried(
+            &NodeId::new("r1"),
+            std::collections::HashSet::from(["s1".to_string()]),
+        )
+        .await;
+        // Placed by its binding, as the handler does.
+        let placed_on = place_viewer(
+            &pool,
+            &fleet_on(50),
+            &StreamId("s1".into()),
+            MediaPath::Core,
+            &viewer,
+        )
+        .await;
+        assert_eq!(placed_on.0, Some(NodeId::new("r1")));
+        let _ = relay_client;
+        let answer = forward_offer(
+            &pool,
+            &StreamId("s1".into()),
+            &viewer,
+            placed_on,
+            "token",
+            &serde_json::json!({ "type": "offer", "sdp": "v=0" }),
+            "stream-s1",
+        )
+        .await
+        .expect("the origin answers");
+        assert_eq!(answer["sdp"], "v=0 origin");
+        assert_eq!(pool.node_of_viewer(&viewer).await, None);
+    }
+
+    #[tokio::test]
+    async fn when_the_origin_fails_too_the_error_is_the_origins() {
+        let (pool, relay_client) = pool_of(false, false).await;
+        let err = offer_to(&pool, Some("r1"), relay_client)
+            .await
+            .expect_err("both fail");
+        let text = err.to_string();
+        assert!(text.contains("503"), "{text}");
+        assert_eq!(
+            pool.node_of_viewer(&mm_core::fleet::ViewerId::new("v1"))
+                .await,
+            None
+        );
+
+        // An offer placed on the origin is sent once: its failure is returned as is.
+        let (pool, _) = pool_of(false, true).await;
+        let origin = pool.origin();
+        assert!(offer_to(&pool, None, origin).await.is_err());
+    }
+
+    /// A relay that answers with no usable SDP has failed too.
+    #[tokio::test]
+    async fn a_relay_with_an_unusable_answer_sends_the_viewer_to_the_origin() {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/api/viewers/offer",
+            post(|| async {
+                Json(serde_json::json!({ "id": "v", "answer": { "type": "answer" } }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let pool = Arc::new(SwitchPool::new(offer_switch("origin", true).await));
+        let bad = Arc::new(SwitchClient::new(&url));
+        pool.upsert(&relay("r1"), bad.clone()).await;
+        let answer = offer_to(&pool, Some("r1"), bad)
+            .await
+            .expect("the origin answers");
+        assert_eq!(answer["sdp"], "v=0 origin");
+    }
+
+    /// A stand-in relay that accepts the connection and never answers an offer.
+    async fn hung_relay() -> Arc<SwitchClient> {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/api/viewers/offer",
+            post(|| std::future::pending::<Json<serde_json::Value>>()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        Arc::new(SwitchClient::new(&url))
+    }
+
+    fn offer_within(
+        pool: &Arc<SwitchPool>,
+        client: Arc<SwitchClient>,
+        budget: std::time::Duration,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, MMError>> + '_ {
+        async move {
+            forward_offer_within(
+                pool,
+                &StreamId("s1".into()),
+                &mm_core::fleet::ViewerId::new("v1"),
+                (Some(NodeId::new("r1")), client),
+                "token",
+                &serde_json::json!({ "type": "offer", "sdp": "v=0" }),
+                "stream-s1",
+                budget,
+            )
+            .await
+        }
+    }
+
+    /// A relay that never answers has its own budget: once it runs out, the viewer's
+    /// binding goes and the same offer is answered by the origin.
+    #[tokio::test]
+    async fn a_relay_that_never_answers_gives_way_to_the_origin_within_its_budget() {
+        let pool = Arc::new(SwitchPool::new(offer_switch("origin", true).await));
+        let hung = hung_relay().await;
+        pool.upsert(&relay("r1"), hung.clone()).await;
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            offer_within(&pool, hung, std::time::Duration::from_millis(200)),
+        )
+        .await
+        .expect("answered within the relay's budget, not the client's")
+        .expect("the origin answers");
+        assert_eq!(answer["sdp"], "v=0 origin");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(
+            pool.node_of_viewer(&mm_core::fleet::ViewerId::new("v1"))
+                .await,
+            None
+        );
+    }
+
+    /// A request dropped while its relay hangs (the caller gave up and the server dropped
+    /// the handler) leaves no binding: a retry with the same viewer id must not be sent
+    /// back to the relay that never answered.
+    #[tokio::test]
+    async fn a_request_dropped_while_its_relay_hangs_leaves_no_binding() {
+        let pool = Arc::new(SwitchPool::new(offer_switch("origin", true).await));
+        let hung = hung_relay().await;
+        pool.upsert(&relay("r1"), hung.clone()).await;
+        let viewer = mm_core::fleet::ViewerId::new("v1");
+        let cut_short = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            offer_within(&pool, hung, std::time::Duration::from_secs(60)),
+        )
+        .await;
+        assert!(cut_short.is_err(), "the request was dropped mid-attempt");
+        // The release may have to wait for the lock; give it a moment.
+        for _ in 0..50 {
+            if pool.node_of_viewer(&viewer).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.node_of_viewer(&viewer).await, None);
+    }
+
+    /// The count the apps show must agree with the census: a relay pulling the
+    /// stream (`cascade-…`) is not a viewer, while a real viewer, one mid ad-break,
+    /// is. Disconnected viewers and other streams' viewers are not counted either.
+    #[test]
+    fn a_relay_pulling_the_stream_is_not_in_the_viewer_count() {
+        let viewer = |id: &str, source: &str, connected: bool| SwitchViewer {
+            id: id.to_string(),
+            current_source: source.to_string(),
+            connected,
+        };
+        let list = vec![
+            viewer("viewer-b1--alice-example.org", "stream-b1", true),
+            viewer("cascade-stream-b1-lease-1-0", "stream-b1", true),
+            viewer("viewer-b1--bob-example.org", "ad-bob", true),
+            viewer("viewer-b1--carol-example.org", "stream-b1", false),
+            viewer("viewer-b2--dave-example.org", "stream-b2", true),
+        ];
+        assert_eq!(stream_viewer_count(&list, "stream-b1"), 2);
     }
 }

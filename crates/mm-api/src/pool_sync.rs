@@ -13,9 +13,10 @@
 //!
 //! [`run_pool_sync`] is the impure shell: it reads `mm_fleet_nodes`, applies
 //! `sync_actions` to the pool, takes the census, and applies `plan_feeds` to
-//! the relays: an add seeds the cascade source pointing at its feeder (R2), a
-//! replacement re-points only the row, a removal (sent only where nobody can be
-//! watching) removes the source, and every row is seeded again on every tick.
+//! the relays: every row that stays is seeded on every tick (R2), a removal (sent
+//! only where nobody can be watching) removes the source, and a row is written only
+//! when a seed created or re-created the source, so rows record where sources
+//! really pull from.
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
@@ -184,25 +185,44 @@ pub struct FeedRow {
 
 /// What one tick does to the relay tree.
 ///
+/// A row records where a relay's source ACTUALLY pulls from. It is written only when a
+/// seed reports that it created the source, or re-created it after the dead-source rule
+/// fired, and then with the feeder that seed used. So the plan never re-points a row.
+///
 /// A removal of a cascade source ends the programme for everyone on that relay
 /// (mm-switch treats every `stream-…` id as a programme), so only `remove` ever calls
 /// the switch's removal, and only for a row nobody can be watching through.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FeedPlan {
-    /// New rows: seeded first, written once the seed succeeded.
+    /// New rows: seeded against their feeder, written only if the seed created the
+    /// source.
     pub add: Vec<FeedRow>,
-    /// Kept rows whose feeder left: the row is rewritten to name the new feeder and
-    /// depth, and the relay's source is left alone. It goes on pulling from its old
-    /// feeder while that lives, and moves to the new one only when the dead-source rule
-    /// replaces it.
-    pub replace: Vec<FeedRow>,
+    /// Stored rows that stay as they are and are seeded against their own feeder: those
+    /// whose chain reaches the entry, and those below an orphan.
+    pub keep: Vec<FeedRow>,
+    /// For each ORPHAN (a row that stays, but whose feeder left the relays or has no row
+    /// that stays): the row it gets if its source has to be created again. The stored
+    /// row is left as it is; the orphan is seeded against this row's feeder, and this
+    /// row is written only if that seed created or re-created the source.
+    pub fallback: Vec<FeedRow>,
     /// (stream id, node id) dropped for good on a relay: the stream is not live, or it
-    /// is not wanted and nothing is connected to it there. The source is removed, then
-    /// the row. Deepest rows of each stream first.
+    /// is not wanted and not held there. The source is removed, then the row. Deepest
+    /// rows of each stream first.
     pub remove: Vec<(String, NodeId)>,
     /// (stream id, node id) whose node is no longer a relay: only the row goes. There is
     /// nothing to call, and a draining node serves whoever is still on it.
     pub forget: Vec<(String, NodeId)>,
+}
+
+/// Where a stored row that stays stands in its stream's tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// Its chain of rows reaches the entry.
+    Rooted,
+    /// Its feeder left the relays or has no row that stays (or its chain loops).
+    Orphan,
+    /// Its chain reaches an orphan.
+    BelowOrphan,
 }
 
 /// The relay tree's diff for one tick. Pure.
@@ -214,18 +234,20 @@ pub struct FeedPlan {
 ///   node (see [`held_pairs`]).
 /// * `existing`: the stored rows.
 ///
-/// Wanted only decides who JOINS; it never cuts anyone off. An existing row stays while
-/// its node is still a relay and its stream is wanted or the pair is held. It stays as
-/// it is when its feeder is the entry or a row that stays as it is; otherwise its feeder
-/// left and the row is replaced with a new feeder. Relays without a row join a stream
-/// only when it is wanted. A row on a node that is no longer a relay is forgotten; any
-/// other row is removed. Relays are visited in id order and each one needing a feeder
-/// gets [`feeder_for`] over the rows kept or placed so far for that stream (depth = the
-/// feeder's + 1, or 1 for the entry). A relay being re-fed is never given a feeder that
-/// the stored rows show pulling (directly or further down) from it: its old source
-/// stays, so that would close a loop once one end's source is replaced. A feeder
-/// outlives its downstream with no extra rule: the downstream's relay link is a
-/// connected session on the feeder, so that pair is held.
+/// Wanted only decides who JOINS; it never cuts anyone off. A stored row stays while its
+/// node is still a relay and its stream is wanted or the pair is held; a row on a node
+/// that is no longer a relay is forgotten, any other row is removed. Rows that stay are
+/// never changed here (see [`FeedPlan`]).
+///
+/// Carriers (what [`feeder_for`] may choose from) are only relays whose chain of rows
+/// reaches the entry: rooted rows and rows added this tick. An orphan and everything
+/// below it carry nothing, so nobody joins under a branch whose top lost its feeder.
+/// Relays are visited in id order:
+/// * a relay with no row joins a wanted stream, fed by [`feeder_for`] over the carriers
+///   so far (depth = the feeder's + 1, or 1 for the entry);
+/// * an orphan gets a fallback: [`feeder_for`] over the carriers that are not below it
+///   and sit above its recorded depth, else the entry. So its depth never grows, and the
+///   recorded depths below it stay upper bounds of where those relays really are.
 pub fn plan_feeds(
     relays: &[RelayPlace],
     wanted_streams: &[String],
@@ -247,62 +269,71 @@ pub fn plan_feeds(
         let is_wanted = wanted.contains(stream);
         let mut rows: Vec<&FeedRow> = existing.iter().filter(|r| r.stream_id == stream).collect();
         rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        let row_of: HashMap<&NodeId, &FeedRow> = rows.iter().map(|r| (&r.node_id, *r)).collect();
 
-        let may_stay = |row: &FeedRow| {
+        let stays = |row: &FeedRow| {
             relay_by_id.contains_key(&row.node_id)
                 && (is_wanted || held.contains(&(stream.to_string(), row.node_id.clone())))
         };
-        // The stored chain above a row, nearest first. Stops at the entry, at a feeder
-        // with no row, or on a cycle.
-        let ancestors = |row: &FeedRow| {
-            let mut out: Vec<NodeId> = Vec::new();
-            let mut cur = row;
-            while let Some(up) = &cur.feeder {
-                if out.contains(up) || out.len() > rows.len() {
-                    break;
-                }
-                out.push(up.clone());
-                match row_of.get(up) {
-                    Some(next) => cur = next,
-                    None => break,
-                }
-            }
-            out
-        };
-        // Unchanged: every row from this one up to the entry may stay. A broken chain (a
-        // feeder with no row) or a cycle never reaches the entry.
-        let reaches_entry = |row: &FeedRow| {
+        let staying: HashMap<&NodeId, &FeedRow> = rows
+            .iter()
+            .filter(|r| stays(r))
+            .map(|r| (&r.node_id, *r))
+            .collect();
+        // Walk up the rows that stay: to the entry (rooted), or to a row whose feeder has
+        // no row that stays (that row is the orphan). A loop counts as an orphan.
+        let standing = |row: &FeedRow| {
             let mut cur = row;
             for _ in 0..=rows.len() {
-                if !may_stay(cur) {
-                    return false;
-                }
                 match &cur.feeder {
-                    None => return true,
-                    Some(up) => match row_of.get(up) {
+                    None => return Standing::Rooted,
+                    Some(up) => match staying.get(up) {
                         Some(next) => cur = next,
-                        None => return false,
+                        None if std::ptr::eq(cur, row) => return Standing::Orphan,
+                        None => return Standing::BelowOrphan,
                     },
                 }
             }
-            false
+            Standing::Orphan
+        };
+        // The relays whose stored chain passes through `node`.
+        let below = |node: &NodeId| -> HashSet<NodeId> {
+            rows.iter()
+                .filter(|r| {
+                    let mut up = r.feeder.as_ref();
+                    for _ in 0..=rows.len() {
+                        match up {
+                            Some(f) if f == node => return true,
+                            Some(f) => up = staying.get(f).and_then(|n| n.feeder.as_ref()),
+                            None => return false,
+                        }
+                    }
+                    false
+                })
+                .map(|r| r.node_id.clone())
+                .collect()
         };
 
         let mut carriers: Vec<Carrier> = Vec::new();
-        let mut placed: HashSet<&NodeId> = HashSet::new();
-        let mut refeed: HashSet<&NodeId> = HashSet::new();
+        let mut orphans: HashMap<&NodeId, &FeedRow> = HashMap::new();
         let mut remove: Vec<&FeedRow> = Vec::new();
         for row in &rows {
-            if reaches_entry(row) {
-                carriers.push(carrier(relay_by_id[&row.node_id], row.depth));
-                placed.insert(&row.node_id);
-            } else if may_stay(row) {
-                refeed.insert(&row.node_id);
-            } else if relay_by_id.contains_key(&row.node_id) {
-                remove.push(row);
-            } else {
-                plan.forget.push((stream.to_string(), row.node_id.clone()));
+            if !stays(row) {
+                if relay_by_id.contains_key(&row.node_id) {
+                    remove.push(row);
+                } else {
+                    plan.forget.push((stream.to_string(), row.node_id.clone()));
+                }
+                continue;
+            }
+            match standing(row) {
+                Standing::Rooted => {
+                    carriers.push(carrier(relay_by_id[&row.node_id], row.depth));
+                    plan.keep.push((*row).clone());
+                }
+                Standing::BelowOrphan => plan.keep.push((*row).clone()),
+                Standing::Orphan => {
+                    orphans.insert(&row.node_id, row);
+                }
             }
         }
         remove.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.node_id.cmp(&b.node_id)));
@@ -310,70 +341,59 @@ pub fn plan_feeds(
             .extend(remove.into_iter().map(|r| (stream.to_string(), r.node_id.clone())));
 
         for place in &relays_in_order {
-            let refed = refeed.contains(&place.id);
-            if placed.contains(&place.id) || !(is_wanted || refed) {
-                continue;
-            }
-            // Relays the stored rows show pulling from this one, directly or further down.
-            let below: HashSet<&NodeId> = if refed {
-                rows.iter()
-                    .filter(|r| ancestors(r).contains(&place.id))
-                    .map(|r| &r.node_id)
-                    .collect()
-            } else {
-                HashSet::new()
-            };
-            let candidates: Vec<Carrier> = carriers
-                .iter()
-                .filter(|c| !below.contains(&c.id))
-                .cloned()
-                .collect();
-            let (feeder, depth) =
-                match feeder_for(place.zone.as_deref(), place.region.as_deref(), &candidates) {
-                    Feeder::Entry => (None, 1),
-                    Feeder::Relay(id) => {
-                        let up = candidates
-                            .iter()
-                            .find(|c| c.id == id)
-                            .map_or(0, |c| c.depth);
-                        (Some(id), up + 1)
-                    }
-                };
-            carriers.push(carrier(place, depth));
-            placed.insert(&place.id);
-            let row = FeedRow {
-                stream_id: stream.to_string(),
-                node_id: place.id.clone(),
-                feeder,
-                depth,
-            };
-            if refed {
-                plan.replace.push(row);
-            } else {
-                plan.add.push(row);
+            if let Some(orphan) = orphans.get(&place.id) {
+                let under = below(&place.id);
+                let candidates: Vec<Carrier> = carriers
+                    .iter()
+                    .filter(|c| !under.contains(&c.id) && c.depth < orphan.depth)
+                    .cloned()
+                    .collect();
+                let (feeder, depth) = feed_from(place, &candidates);
+                plan.fallback.push(FeedRow {
+                    stream_id: stream.to_string(),
+                    node_id: place.id.clone(),
+                    feeder,
+                    depth,
+                });
+            } else if is_wanted && !staying.contains_key(&place.id) {
+                let (feeder, depth) = feed_from(place, &carriers);
+                carriers.push(carrier(place, depth));
+                plan.add.push(FeedRow {
+                    stream_id: stream.to_string(),
+                    node_id: place.id.clone(),
+                    feeder,
+                    depth,
+                });
             }
         }
     }
     plan
 }
 
+/// [`feeder_for`] over `carriers`, with the depth the relay would then have.
+fn feed_from(place: &RelayPlace, carriers: &[Carrier]) -> (Option<NodeId>, u8) {
+    match feeder_for(place.zone.as_deref(), place.region.as_deref(), carriers) {
+        Feeder::Entry => (None, 1),
+        Feeder::Relay(id) => {
+            let up = carriers.iter().find(|c| c.id == id).map_or(0, |c| c.depth);
+            (Some(id), up + 1)
+        }
+    }
+}
+
 /// The (stream, node) pairs where people may be watching a live stream through a node:
-/// the node serves at least one connected session of it (relay links included); or the
-/// node did not answer the census; or someone on it is on an ad break, which names no
-/// programme. The last two hold every live stream the node has a row for, because what
-/// they serve is unknown, and guessing low would remove a source people are on.
-/// The (stream, node) pairs where people may be watching a live stream through a node:
-/// the node serves at least one connected session of it (relay links included); or the
-/// node did not answer the census; or someone on it is on an ad break, which names no
-/// programme. The last two hold every live stream the node has a row for, because what
-/// they serve is unknown, and guessing low would remove a source people are on.
+/// at least one session of it is LISTED there, connected or not (someone negotiating or
+/// briefly disconnected is still there), relay links included; or the node did not
+/// answer the census; or someone on it is on an ad break, which names no programme. The
+/// last two hold every live stream the node has a row for, because what they serve is
+/// unknown, and guessing low would remove a source people are on.
 fn held_pairs(pass: &CensusPass, existing: &[FeedRow]) -> HashSet<(String, NodeId)> {
     let live: HashSet<&str> = pass.live.iter().map(|b| b.broadcast_id.as_str()).collect();
     let mut held: HashSet<(String, NodeId)> = pass
-        .per_node_per_broadcast
+        .listed
         .iter()
-        .filter(|((_, broadcast), sessions)| **sessions > 0 && live.contains(broadcast.as_str()))
-        .map(|((node, broadcast), _)| (broadcast.clone(), node.clone()))
+        .filter(|(_, broadcast)| live.contains(broadcast.as_str()))
+        .map(|(node, broadcast)| (broadcast.clone(), node.clone()))
         .collect();
     held.extend(
         existing
@@ -428,7 +448,8 @@ type InactiveTracker = AsyncMutex<HashMap<(NodeId, String), Instant>>;
 ///     time, win or lose, so the NEXT reconnect (ICE drop, 401) always has a current
 ///     token instead of the one pinned at seed time.
 ///
-/// Returns whether the relay holds the source now (created, or already there).
+/// Returns what this call did to the relay's source ([`Seeded`]). Only `Created` and
+/// `Recreated` mean the source now pulls from `origin_url`.
 #[allow(clippy::too_many_arguments)]
 async fn seed_cascade_source(
     dialer: &SwitchClient,
@@ -438,7 +459,7 @@ async fn seed_cascade_source(
     secret: &str,
     broadcast_id: &str,
     inactive: &InactiveTracker,
-) -> bool {
+) -> Seeded {
     // B1: the claim's "broadcast id" field must be the EXACT string the origin derives
     // from the offer it receives after stripping "cascade-" and "-{relay_node_id}" —
     // that is switch_source_id(broadcast_id) ("stream-{broadcast_id}"), not the raw
@@ -462,10 +483,10 @@ async fn seed_cascade_source(
         {
             Ok(CascadeSeedOutcome::Created) => {
                 inactive.lock().await.remove(&key);
-                return true;
+                return Seeded::Created;
             }
             Ok(CascadeSeedOutcome::AlreadyExists) => {
-                reconcile_existing_cascade_source(
+                return reconcile_existing_cascade_source(
                     dialer,
                     relay_base_url,
                     relay_node_id,
@@ -475,7 +496,6 @@ async fn seed_cascade_source(
                     inactive,
                 )
                 .await;
-                return true;
             }
             Ok(CascadeSeedOutcome::Unauthorized) => {
                 tracing::warn!(
@@ -493,7 +513,7 @@ async fn seed_cascade_source(
                     error = %e,
                     "cascade seed failed"
                 );
-                return false;
+                return Seeded::Failed;
             }
         }
     }
@@ -503,7 +523,29 @@ async fn seed_cascade_source(
         "cascade seed: relay rejected the server bearer twice in a row — giving up this \
          tick; check MM_SWITCH_AUTH_SECRET on this relay, not the cascade token"
     );
-    false
+    Seeded::Failed
+}
+
+/// What one seed call did to a relay's cascade source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seeded {
+    /// The relay had no such source; this call created it, pulling from the URL given.
+    Created,
+    /// The source was there but dead past the grace period; this call removed it and
+    /// created it again, pulling from the URL given.
+    Recreated,
+    /// The source is there and was left as it is (alive, or not dead for long enough),
+    /// still pulling from wherever it was created to pull from.
+    AlreadyThere,
+    /// The relay could not be made to hold the source this tick.
+    Failed,
+}
+
+impl Seeded {
+    /// Did this call make the source pull from the URL it was given?
+    fn pulls_from_given_url(self) -> bool {
+        matches!(self, Self::Created | Self::Recreated)
+    }
 }
 
 /// M2 + M3: called once `add_cascade_source` has confirmed the relay already has this
@@ -520,7 +562,7 @@ async fn reconcile_existing_cascade_source(
     source_id: &str,
     fresh_token: &str,
     inactive: &InactiveTracker,
-) {
+) -> Seeded {
     let key = (relay_node_id.clone(), source_id.to_string());
 
     // M3: always push the token we just minted, independent of liveness below — the
@@ -550,14 +592,14 @@ async fn reconcile_existing_cascade_source(
                 error = %e,
                 "cascade seed: could not check source liveness this tick"
             );
-            return;
+            return Seeded::AlreadyThere;
         }
     };
     let active = sources.iter().any(|s| s.id == source_id && s.active);
 
     if active {
         inactive.lock().await.remove(&key);
-        return;
+        return Seeded::AlreadyThere;
     }
 
     let now = Instant::now();
@@ -567,7 +609,7 @@ async fn reconcile_existing_cascade_source(
     drop(guard);
 
     if dead_for < INACTIVE_GRACE {
-        return;
+        return Seeded::AlreadyThere;
     }
 
     tracing::warn!(
@@ -584,7 +626,7 @@ async fn reconcile_existing_cascade_source(
             error = %e,
             "cascade seed: removing a dead source before re-seeding failed"
         );
-        return;
+        return Seeded::AlreadyThere;
     }
     inactive.lock().await.remove(&key);
 
@@ -592,13 +634,27 @@ async fn reconcile_existing_cascade_source(
         .add_cascade_source(relay_base_url, source_id, origin_url, fresh_token, relay_node_id.as_str())
         .await
     {
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
-            relay = %relay_node_id,
-            source = source_id,
-            error = %e,
-            "cascade seed: re-seeding a deleted dead source failed"
-        ),
+        Ok(CascadeSeedOutcome::Created) => Seeded::Recreated,
+        // Someone else's seed got there between our removal and this one: whatever it
+        // pulls from, it was not this call's doing.
+        Ok(CascadeSeedOutcome::AlreadyExists) => Seeded::AlreadyThere,
+        Ok(CascadeSeedOutcome::Unauthorized) => {
+            tracing::warn!(
+                relay = %relay_node_id,
+                source = source_id,
+                "cascade seed: re-seeding a deleted dead source was refused as unauthorized"
+            );
+            Seeded::Failed
+        }
+        Err(e) => {
+            tracing::warn!(
+                relay = %relay_node_id,
+                source = source_id,
+                error = %e,
+                "cascade seed: re-seeding a deleted dead source failed"
+            );
+            Seeded::Failed
+        }
     }
 }
 
@@ -804,43 +860,17 @@ async fn feed_relays(
     for (stream, node) in &plan.remove {
         work.entry(node.clone()).or_default().remove.push(stream.clone());
     }
-    for row in &plan.add {
+    // Every row that stays is ensured: added and kept rows against their feeder, an
+    // orphan against its fallback. Each carries the row to write if its seed creates or
+    // re-creates the source: the row with the feeder that seed used.
+    for row in plan.add.iter().chain(&plan.keep).chain(&plan.fallback) {
         let Some(origin_url) = origin_of(&row.feeder) else {
             continue;
         };
         work.entry(row.node_id.clone())
             .or_default()
-            .add
+            .ensure
             .push((row.clone(), origin_url));
-    }
-    for row in &plan.replace {
-        let Some(origin_url) = origin_of(&row.feeder) else {
-            continue;
-        };
-        work.entry(row.node_id.clone())
-            .or_default()
-            .replace
-            .push((row.clone(), origin_url));
-    }
-    let changed: HashSet<(&str, &NodeId)> = plan
-        .replace
-        .iter()
-        .map(|r| (r.stream_id.as_str(), &r.node_id))
-        .chain(plan.remove.iter().chain(&plan.forget).map(|(s, n)| (s.as_str(), n)))
-        .collect();
-    for row in &existing {
-        if changed.contains(&(row.stream_id.as_str(), &row.node_id))
-            || !place_of.contains_key(&row.node_id)
-        {
-            continue;
-        }
-        let Some(origin_url) = origin_of(&row.feeder) else {
-            continue;
-        };
-        work.entry(row.node_id.clone())
-            .or_default()
-            .keep
-            .push((row.stream_id.clone(), origin_url));
     }
 
     let mut relay_jobs = Vec::new();
@@ -864,44 +894,26 @@ async fn feed_relays(
     }
 }
 
-/// One relay's share of a tick's [`FeedPlan`], run in this order: removals, new rows,
-/// replaced rows, unchanged rows.
+/// One relay's share of a tick's [`FeedPlan`]: removals first, then every row that
+/// stays is ensured.
 ///
-/// Every row that stays (new, replaced or unchanged) is seeded on every tick against its
-/// CURRENT feeder's URL, or the entry's: a live source answers 409 and is left as it is
-/// (its token renewed); a source that has read inactive past `INACTIVE_GRACE` is replaced
-/// from that URL (`reconcile_existing_cascade_source`); a relay that lost the source is
-/// seeded afresh.
+/// Ensuring seeds the source against the URL the row names (the feeder's, or the
+/// entry's): a live source answers 409 and is left as it is, nothing written; one that
+/// has read inactive past `INACTIVE_GRACE` is removed and created again from that URL
+/// (`reconcile_existing_cascade_source`); a missing one is created. Only the last two
+/// write the row, because only then does the source pull from that URL.
 #[derive(Default)]
 struct NodeFeedWork {
     /// Streams whose cascade source is removed, and their rows with it.
     remove: Vec<String>,
-    /// New rows, with the URL their source pulls from.
-    add: Vec<(FeedRow, String)>,
-    /// Rows rewritten to name a new feeder, with that feeder's URL.
-    replace: Vec<(FeedRow, String)>,
-    /// Unchanged rows (stream, the URL their source pulls from).
-    keep: Vec<(String, String)>,
+    /// (the row to write if the seed creates or re-creates the source, the URL it
+    /// pulls from).
+    ensure: Vec<(FeedRow, String)>,
 }
 
 impl NodeFeedWork {
     async fn run(self, client: &SwitchClient, db: &PgPool, relay_id: &NodeId, secret: &str) {
         let relay_base_url = client.base_url().to_string();
-        let ensure = |stream: String, origin_url: String| {
-            let relay_base_url = relay_base_url.clone();
-            async move {
-                seed_cascade_source(
-                    client,
-                    &relay_base_url,
-                    relay_id,
-                    &origin_url,
-                    secret,
-                    &stream,
-                    inactive_tracker(),
-                )
-                .await
-            }
-        };
 
         // Only rows nobody can be watching through reach this list (see `FeedPlan`).
         for stream in self.remove {
@@ -924,22 +936,22 @@ impl NodeFeedWork {
             }
         }
         // Within one relay the streams stay sequential: they share a connection, and a
-        // relay slow for one stream is slow for all.
-        for (row, origin_url) in self.add {
-            // A NEW row is written only once the relay holds the source; a failed seed
-            // leaves no row and the next tick tries again.
-            if ensure(row.stream_id.clone(), origin_url).await {
-                insert_feed_row(db, &row).await;
+        // relay slow for one stream is slow for all. A failed seed writes nothing; the
+        // next tick tries again.
+        for (row, origin_url) in self.ensure {
+            let seeded = seed_cascade_source(
+                client,
+                &relay_base_url,
+                relay_id,
+                &origin_url,
+                secret,
+                &row.stream_id,
+                inactive_tracker(),
+            )
+            .await;
+            if seeded.pulls_from_given_url() {
+                write_feed_row(db, &row).await;
             }
-        }
-        for (row, origin_url) in self.replace {
-            // The row names the new feeder whatever the seed says: the relay keeps the
-            // source it has, and a failed seed is tried again next tick like any other.
-            replace_feed_row(db, &row).await;
-            ensure(row.stream_id, origin_url).await;
-        }
-        for (stream, origin_url) in self.keep {
-            ensure(stream, origin_url).await;
         }
     }
 }
@@ -975,32 +987,11 @@ async fn load_live_media_paths(db: &PgPool) -> Result<HashMap<String, MediaPath>
         .collect())
 }
 
-/// Record a seeded feed. A row already there (another server instance seeded the same
-/// relay this tick) is left as it is.
-async fn insert_feed_row(db: &PgPool, row: &FeedRow) {
-    if let Err(e) = sqlx::query(
-        "INSERT INTO mm_fleet_relay_feeds (stream_id, node_id, feeder_node_id, depth)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (stream_id, node_id) DO NOTHING",
-    )
-    .bind(&row.stream_id)
-    .bind(row.node_id.as_str())
-    .bind(row.feeder.as_ref().map(NodeId::as_str))
-    .bind(i16::from(row.depth))
-    .execute(db)
-    .await
-    {
-        tracing::warn!(
-            relay = %row.node_id,
-            broadcast = %row.stream_id,
-            error = %e,
-            "relay feeding: recording a feed failed"
-        );
-    }
-}
-
-/// Point an existing feed at its new feeder and depth.
-async fn replace_feed_row(db: &PgPool, row: &FeedRow) {
+/// Record where a relay's source now pulls from, after a seed created or re-created it.
+/// Overwrites a stored row for the same relay: the seed that just ran is the truth. Two
+/// server instances seeding the same relay at once cannot both create the source (the
+/// second gets 409 and writes nothing).
+async fn write_feed_row(db: &PgPool, row: &FeedRow) {
     if let Err(e) = sqlx::query(
         "INSERT INTO mm_fleet_relay_feeds (stream_id, node_id, feeder_node_id, depth)
          VALUES ($1, $2, $3, $4)
@@ -1018,7 +1009,7 @@ async fn replace_feed_row(db: &PgPool, row: &FeedRow) {
             relay = %row.node_id,
             broadcast = %row.stream_id,
             error = %e,
-            "relay feeding: re-pointing a feed failed"
+            "relay feeding: recording a feed failed"
         );
     }
 }
@@ -1360,6 +1351,55 @@ mod tests {
         out
     }
 
+    fn kept(plan: &FeedPlan) -> Vec<&str> {
+        let mut out: Vec<&str> = plan.keep.iter().map(|r| r.node_id.as_str()).collect();
+        out.sort();
+        out
+    }
+
+    /// Apply a plan the way the shell does when every seed of a NEW row creates its
+    /// source, every stored row's source is alive (nothing written), and the sources of
+    /// `reseeded` are re-created from their fallback.
+    fn apply(existing: &[FeedRow], plan: &FeedPlan, reseeded: &[&str]) -> Vec<FeedRow> {
+        let gone: HashSet<(&str, &str)> = plan
+            .remove
+            .iter()
+            .chain(&plan.forget)
+            .map(|(s, n)| (s.as_str(), n.as_str()))
+            .collect();
+        let mut rows: Vec<FeedRow> = existing
+            .iter()
+            .filter(|r| !gone.contains(&(r.stream_id.as_str(), r.node_id.as_str())))
+            .map(|r| {
+                plan.fallback
+                    .iter()
+                    .find(|f| f.stream_id == r.stream_id && f.node_id == r.node_id)
+                    .filter(|f| reseeded.contains(&f.node_id.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| r.clone())
+            })
+            .collect();
+        rows.extend(plan.add.iter().cloned());
+        rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        rows
+    }
+
+    /// Every chain of rows ends at the entry or at a feeder with no row, never back at
+    /// itself, and no recorded depth is above the limit.
+    fn assert_tree(rows: &[FeedRow], step: &str) {
+        let row_of: HashMap<&NodeId, &FeedRow> = rows.iter().map(|r| (&r.node_id, r)).collect();
+        for row in rows {
+            assert!(row.depth <= MAX_RELAY_DEPTH, "{step}: {row:?}");
+            let mut seen = vec![&row.node_id];
+            let mut up = row.feeder.as_ref();
+            while let Some(f) = up {
+                assert!(!seen.contains(&f), "{step}: {} is in a loop: {rows:?}", row.node_id);
+                seen.push(f);
+                up = row_of.get(f).and_then(|r| r.feeder.as_ref());
+            }
+        }
+    }
+
     #[test]
     fn the_first_relay_is_fed_by_the_entry() {
         let plan = plan_feeds(&[relay("r1", "ams", 0)], &wanted(), &held(&[]), &[]);
@@ -1381,6 +1421,7 @@ mod tests {
             plan,
             FeedPlan {
                 add: vec![feed("r2", Some("r1"), 2)],
+                keep: vec![feed("r1", None, 1)],
                 ..FeedPlan::default()
             },
             "r1's row stays as it is"
@@ -1388,8 +1429,30 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_whose_feeder_left_keeps_its_row() {
+        let relays = [relay("r2", "ams", 0)];
+        let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        assert!(plan.keep.is_empty(), "r2 is not kept as a normal row: {:?}", plan.keep);
+        assert_eq!(
+            plan.fallback,
+            vec![feed("r2", None, 1)],
+            "r2's row stays as stored; the entry is its fallback"
+        );
+        assert!(plan.remove.is_empty(), "{:?}", plan.remove);
+        assert_eq!(nodes(&plan.forget), vec!["r1"]);
+        assert!(plan.add.is_empty());
+        assert_eq!(
+            apply(&existing, &plan, &[]),
+            vec![feed("r2", Some("r1"), 2)],
+            "while r2's source lives, its row still names r1"
+        );
+    }
+
+    #[test]
     fn a_lost_feeder_reattaches_its_relays() {
-        // r1 is gone from the relays; r2 hung off it and r3 off r2.
+        // r1 is gone; r2 hung off it and r3 off r2. Only r2 lost its feeder; r3 still
+        // pulls from r2. A row changes only when its source is re-created.
         let relays = [relay("r2", "ams", 0), relay("r3", "ams", 0)];
         let existing = [
             feed("r1", None, 1),
@@ -1397,30 +1460,116 @@ mod tests {
             feed("r3", Some("r2"), 3),
         ];
         let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
-        assert_eq!(
-            plan.replace,
-            vec![feed("r2", None, 1), feed("r3", Some("r2"), 2)],
-            "r2 and r3 get rows naming their new feeders and depths"
-        );
-        assert!(plan.remove.is_empty(), "a re-attach removes no source: {:?}", plan.remove);
-        assert_eq!(nodes(&plan.forget), vec!["r1"], "r1 is no relay: only its row goes");
-        assert!(plan.add.is_empty());
+        assert_eq!(plan.fallback, vec![feed("r2", None, 1)]);
+        assert_eq!(plan.keep, vec![feed("r3", Some("r2"), 3)]);
+        assert!(plan.remove.is_empty() && plan.add.is_empty());
+        assert_eq!(nodes(&plan.forget), vec!["r1"]);
+
+        // Once r2's source is re-created from the entry, r2's row says so; r3's recorded
+        // depth (3) stays an upper bound of where it really is (2).
+        let after = apply(&existing, &plan, &["r2"]);
+        assert_eq!(after, vec![feed("r2", None, 1), feed("r3", Some("r2"), 3)]);
+        let next = plan_feeds(&relays, &wanted(), &held(&[]), &after);
+        assert!(next.fallback.is_empty() && next.remove.is_empty() && next.forget.is_empty());
+        assert_eq!(kept(&next), vec!["r2", "r3"]);
     }
 
     #[test]
-    fn a_reattached_relay_is_never_fed_by_one_still_pulling_from_it() {
-        // x is gone. b hung off x, and a off b: a's source still pulls from b. Visited
-        // first, a is fed by the entry; b must not then be fed by a, or b's replacement
-        // source (once its own dies) would pull from a relay pulling from b.
+    fn an_orphan_is_never_offered_a_feeder_below_it() {
+        // X is gone. A hung off X, and B off A: B still pulls from A.
         let relays = [relay("a", "ams", 0), relay("b", "ams", 0)];
         let existing = [
             feed("x", None, 1),
-            feed("b", Some("x"), 2),
-            feed("a", Some("b"), 3),
+            feed("a", Some("x"), 2),
+            feed("b", Some("a"), 3),
         ];
         let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
-        assert_eq!(plan.replace, vec![feed("a", None, 1), feed("b", None, 1)]);
-        assert!(plan.remove.is_empty());
+        assert_eq!(plan.fallback, vec![feed("a", None, 1)], "never b: b pulls from a");
+        assert_eq!(plan.keep, vec![feed("b", Some("a"), 3)]);
+        assert!(plan.remove.is_empty() && plan.add.is_empty());
+    }
+
+    #[test]
+    fn an_orphans_fallback_is_no_deeper_than_its_row() {
+        // o is recorded at depth 2 under the lost x. c1 (depth 1) is busy, c2 (depth 2) is
+        // idle and would win on load, but would put o at depth 3.
+        let relays = [
+            relay("c1", "ams", 50),
+            relay("c2", "ams", 0),
+            relay("o", "ams", 0),
+        ];
+        let existing = [
+            feed("c1", None, 1),
+            feed("c2", Some("c1"), 2),
+            feed("x", None, 1),
+            feed("o", Some("x"), 2),
+        ];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        assert_eq!(plan.fallback, vec![feed("o", Some("c1"), 2)]);
+        assert!(plan.fallback.iter().all(|f| f.depth <= 2));
+    }
+
+    #[test]
+    fn a_new_relay_does_not_join_under_an_orphan() {
+        let relays = [
+            relay("a", "ams", 0),
+            relay("b", "ams", 0),
+            relay("n", "ams", 0),
+        ];
+        let existing = [
+            feed("x", None, 1),
+            feed("a", Some("x"), 2),
+            feed("b", Some("a"), 3),
+        ];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        assert_eq!(plan.add, vec![feed("n", None, 1)], "neither a nor b may feed n");
+    }
+
+    /// Review finding 1, replayed. Rows A←X, B←A (B sorts before A); X drains; later Y
+    /// (a candidate fallback) leaves; then X is destroyed and A's source is re-created.
+    /// A row changes only where a step says a source was re-created.
+    #[test]
+    fn the_reviewers_sequence_cannot_form_a_loop() {
+        let all = |ids: &[&str]| -> Vec<RelayPlace> { ids.iter().map(|i| relay(i, "ams", 0)).collect() };
+        let mut rows = vec![
+            feed("A", Some("X"), 2),
+            feed("B", Some("A"), 3),
+            feed("C", None, 1),
+            feed("X", None, 1),
+            feed("Y", None, 1),
+        ];
+        assert_tree(&rows, "start");
+
+        // 1. X starts draining: A has lost its feeder, but its source still pulls from X.
+        let relays = all(&["A", "B", "C", "Y"]);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        assert_eq!(plan.fallback.len(), 1, "{plan:?}");
+        assert_eq!(plan.fallback[0].node_id, NodeId::new("A"));
+        assert_ne!(plan.fallback[0].feeder, Some(NodeId::new("B")));
+        rows = apply(&rows, &plan, &[]);
+        assert_tree(&rows, "X drains");
+        assert_eq!(rows.iter().find(|r| r.node_id.as_str() == "A").unwrap().feeder, Some(NodeId::new("X")));
+
+        // 2. Y leaves too. Nothing has been re-created: rows only lose Y.
+        let relays = all(&["A", "B", "C"]);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        assert_ne!(plan.fallback[0].feeder, Some(NodeId::new("B")));
+        rows = apply(&rows, &plan, &[]);
+        assert_tree(&rows, "Y leaves");
+
+        // 3. X is destroyed: A's source dies and is re-created from its fallback.
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        let fallback = plan.fallback[0].clone();
+        assert_ne!(fallback.feeder, Some(NodeId::new("B")), "B pulls from A");
+        rows = apply(&rows, &plan, &["A"]);
+        assert_tree(&rows, "A re-created");
+
+        // 4. The tree is whole again, with every recorded depth an upper bound.
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        assert!(plan.fallback.is_empty() && plan.remove.is_empty(), "{plan:?}");
+        rows = apply(&rows, &plan, &[]);
+        assert_tree(&rows, "settled");
+        assert_eq!(kept(&plan), vec!["A", "B", "C"]);
     }
 
     #[test]
@@ -1447,7 +1596,8 @@ mod tests {
                 feed("r5", Some("r2"), 3),
             ]
         );
-        assert!(plan.replace.is_empty() && plan.remove.is_empty() && plan.forget.is_empty());
+        assert!(plan.keep.is_empty() && plan.fallback.is_empty());
+        assert!(plan.remove.is_empty() && plan.forget.is_empty());
 
         let rows: HashMap<&NodeId, &FeedRow> =
             plan.add.iter().map(|r| (&r.node_id, r)).collect();
@@ -1472,7 +1622,8 @@ mod tests {
         let plan = plan_feeds(&relays, &[], &held(&[]), &existing);
         assert_eq!(nodes(&plan.remove), vec!["r1", "r2"], "nobody is connected: removed");
         assert_eq!(plan.remove[0].1.as_str(), "r2", "the deepest goes first");
-        assert!(plan.add.is_empty() && plan.replace.is_empty() && plan.forget.is_empty());
+        assert!(plan.add.is_empty() && plan.keep.is_empty() && plan.fallback.is_empty());
+        assert!(plan.forget.is_empty());
     }
 
     #[test]
@@ -1481,7 +1632,8 @@ mod tests {
         let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
         let plan = plan_feeds(&relays, &[], &held(&["r1"]), &existing);
         assert_eq!(nodes(&plan.remove), vec!["r2"]);
-        assert!(plan.add.is_empty() && plan.replace.is_empty() && plan.forget.is_empty());
+        assert_eq!(kept(&plan), vec!["r1"]);
+        assert!(plan.add.is_empty() && plan.fallback.is_empty() && plan.forget.is_empty());
     }
 
     #[test]
@@ -1489,7 +1641,13 @@ mod tests {
         let relays = [relay("r1", "ams", 1), relay("r2", "ams", 4)];
         let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
         let plan = plan_feeds(&relays, &[], &held(&["r1", "r2"]), &existing);
-        assert_eq!(plan, FeedPlan::default());
+        assert_eq!(
+            plan,
+            FeedPlan {
+                keep: existing.to_vec(),
+                ..FeedPlan::default()
+            }
+        );
     }
 
     #[test]
@@ -1497,7 +1655,13 @@ mod tests {
         let relays = [relay("r1", "ams", 2), relay("r2", "ams", 0)];
         let existing = [feed("r1", None, 1)];
         let plan = plan_feeds(&relays, &[], &held(&["r1"]), &existing);
-        assert_eq!(plan, FeedPlan::default());
+        assert_eq!(
+            plan,
+            FeedPlan {
+                keep: existing.to_vec(),
+                ..FeedPlan::default()
+            }
+        );
     }
 
     #[test]
@@ -1505,10 +1669,11 @@ mod tests {
         let relays = [relay("r2", "ams", 5)];
         let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
         let plan = plan_feeds(&relays, &[], &held(&["r2"]), &existing);
-        assert_eq!(plan.replace, vec![feed("r2", None, 1)]);
+        assert_eq!(plan.fallback, vec![feed("r2", None, 1)]);
         assert!(plan.remove.is_empty(), "people are on r2: no removal");
         assert_eq!(nodes(&plan.forget), vec!["r1"]);
-        assert!(plan.add.is_empty());
+        assert!(plan.add.is_empty() && plan.keep.is_empty());
+        assert_eq!(apply(&existing, &plan, &["r2"]), vec![feed("r2", None, 1)]);
     }
 
     // ── Who holds a relay (held_pairs) ──────────────────────────────────────
@@ -1539,13 +1704,25 @@ mod tests {
     }
 
     #[test]
-    fn a_connected_session_of_a_live_stream_holds_its_node() {
+    fn a_listed_session_of_a_live_stream_holds_its_node() {
         let pass = CensusPass {
             live: live(&["s1"]),
-            per_node_per_broadcast: HashMap::from([
-                ((NodeId::new("r1"), "s1".to_string()), 2),
-                ((NodeId::new("r2"), "ended".to_string()), 4),
+            listed: HashSet::from([
+                (NodeId::new("r1"), "s1".to_string()),
+                (NodeId::new("r2"), "ended".to_string()),
             ]),
+            ..CensusPass::default()
+        };
+        assert_eq!(pairs(&held_pairs(&pass, &[])), vec![("s1", "r1")]);
+    }
+
+    #[test]
+    fn a_listed_session_that_is_not_connected_holds_its_pair() {
+        // Negotiating, or briefly ICE-disconnected: it counts nowhere, but holds.
+        let pass = CensusPass {
+            live: live(&["s1"]),
+            listed: HashSet::from([(NodeId::new("r1"), "s1".to_string())]),
+            per_node_per_broadcast: HashMap::new(),
             ..CensusPass::default()
         };
         assert_eq!(pairs(&held_pairs(&pass, &[])), vec![("s1", "r1")]);
@@ -1575,6 +1752,114 @@ mod tests {
         };
         let rows = [row_on("s1", "r2"), row_on("ended", "r2"), row_on("s1", "r1")];
         assert_eq!(pairs(&held_pairs(&pass, &rows)), vec![("s1", "r2")]);
+    }
+
+    // ── What the seed reports ───────────────────────────────────────────────
+
+    /// A stand-in relay for the seed: holds `held` sources (listed as `active`), answers
+    /// 409 for one it holds, and records the `origin_url` of every seed.
+    async fn seed_relay(held: &[&str], active: bool) -> (String, Arc<AsyncMutex<Vec<String>>>) {
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::{delete, get, post};
+        use axum::{Json, Router};
+        use serde_json::{Value, json};
+
+        #[derive(Clone)]
+        struct Relay {
+            held: Arc<AsyncMutex<HashSet<String>>>,
+            origins: Arc<AsyncMutex<Vec<String>>>,
+            active: bool,
+        }
+        let relay = Relay {
+            held: Arc::new(AsyncMutex::new(held.iter().map(|s| s.to_string()).collect())),
+            origins: Arc::default(),
+            active,
+        };
+        let origins = relay.origins.clone();
+        let app = Router::new()
+            .route(
+                "/api/sources",
+                get(|State(r): State<Relay>| async move {
+                    let list: Vec<Value> = r
+                        .held
+                        .lock()
+                        .await
+                        .iter()
+                        .map(|id| json!({ "id": id, "type": "cascade", "active": r.active }))
+                        .collect();
+                    Json(json!({ "sources": list }))
+                }),
+            )
+            .route(
+                "/api/sources/cascade",
+                post(|State(r): State<Relay>, Json(body): Json<Value>| async move {
+                    r.origins
+                        .lock()
+                        .await
+                        .push(body["origin_url"].as_str().unwrap_or_default().to_string());
+                    let id = body["id"].as_str().unwrap_or_default().to_string();
+                    if r.held.lock().await.insert(id) {
+                        StatusCode::CREATED
+                    } else {
+                        StatusCode::CONFLICT
+                    }
+                }),
+            )
+            .route(
+                "/api/sources/{id}/cascade-token",
+                post(|| async { Json(json!({ "ok": "true" })) }),
+            )
+            .route(
+                "/api/sources/{id}",
+                delete(|State(r): State<Relay>, Path(id): Path<String>| async move {
+                    r.held.lock().await.remove(&id);
+                    Json(json!({ "ok": "true" }))
+                }),
+            )
+            .with_state(relay);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), origins)
+    }
+
+    #[tokio::test]
+    async fn the_seed_reports_created_already_there_and_recreated() {
+        let source = switch_source_id("b1");
+        let relay_id = NodeId::new("r1");
+        let tracker: InactiveTracker = AsyncMutex::new(HashMap::new());
+
+        // Nothing there: created.
+        let (url, _) = seed_relay(&[], true).await;
+        let client = SwitchClient::with_auth(&url, "s".to_string());
+        let got = seed_cascade_source(&client, &url, &relay_id, "http://feeder", "s", "b1", &tracker).await;
+        assert_eq!(got, Seeded::Created);
+
+        // There and alive: already there, nothing replaced.
+        let got = seed_cascade_source(&client, &url, &relay_id, "http://fallback", "s", "b1", &tracker).await;
+        assert_eq!(got, Seeded::AlreadyThere);
+
+        // There, inactive, but inside the grace period: already there.
+        let (url, origins) = seed_relay(&[&source], false).await;
+        let client = SwitchClient::with_auth(&url, "s".to_string());
+        let got = seed_cascade_source(&client, &url, &relay_id, "http://fallback", "s", "b1", &tracker).await;
+        assert_eq!(got, Seeded::AlreadyThere);
+
+        // Inactive past the grace period: removed and re-created from the URL passed in.
+        tracker.lock().await.insert(
+            (relay_id.clone(), source.clone()),
+            Instant::now() - INACTIVE_GRACE - StdDuration::from_secs(1),
+        );
+        let got = seed_cascade_source(&client, &url, &relay_id, "http://fallback", "s", "b1", &tracker).await;
+        assert_eq!(got, Seeded::Recreated);
+        assert_eq!(
+            origins.lock().await.last().map(String::as_str),
+            Some("http://fallback"),
+            "the replacement pulls from the URL the caller passed: the row's fallback"
+        );
     }
 
     #[test]

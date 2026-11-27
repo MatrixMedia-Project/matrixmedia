@@ -30,6 +30,8 @@ struct Calls {
     removals: Vec<String>,
     /// Cascade sources it holds now.
     held: HashSet<String>,
+    /// Answer every removal with a 500 and keep the source.
+    fail_removals: bool,
 }
 
 type Recorder = Arc<Mutex<Calls>>;
@@ -99,9 +101,12 @@ async fn fake_relay(viewers: Value) -> (String, Recorder) {
             "/api/sources/{id}",
             delete(|State(calls): State<Recorder>, Path(id): Path<String>| async move {
                 let mut calls = calls.lock().await;
+                calls.removals.push(id.clone());
+                if calls.fail_removals {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "boom" })));
+                }
                 calls.held.remove(&id);
-                calls.removals.push(id);
-                Json(json!({ "ok": "true" }))
+                (StatusCode::OK, Json(json!({ "ok": "true" })))
             }),
         )
         .with_state(calls.clone());
@@ -175,8 +180,9 @@ async fn feeds(db: &sqlx::PgPool, stream_id: &str) -> Vec<(String, Option<String
 
 /// One stream through the life of its relay tree: the first relay is fed by the entry
 /// and the second by the first; every row is seeded again on every pass; a feeder that
-/// leaves the relay list re-points its downstream relay's ROW without removing the
-/// source people are watching; a stream that ended has its sources removed.
+/// leaves the relay list removes nothing downstream and changes no row until the
+/// downstream source is re-created from its fallback; a stream that ended has its
+/// sources removed, and a failed removal keeps its row.
 #[tokio::test]
 async fn a_relay_is_seeded_with_its_feeders_address() {
     let Some(db) = try_pool().await else {
@@ -282,23 +288,48 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
         "a draining node is not called at all"
     );
     assert_eq!(
-        feeds(&db, &b1).await,
-        vec![(node_b.clone(), None, 1)],
-        "b's row now names its new feeder, the entry, and a's row is gone"
-    );
-    assert_eq!(
         seeded_from(&calls_b, &source).await.last(),
         Some(&json!(origin_url)),
-        "b is ensured against its row's current feeder"
+        "b is ensured against its fallback, the entry"
+    );
+    assert_eq!(
+        feeds(&db, &b1).await,
+        vec![(node_b.clone(), Some(node_a.clone()), 2)],
+        "b's source is alive (409), so its row still names where it pulls from: a"
     );
 
-    // Pass 4: the stream ends. Nobody can be watching it: b's source is removed.
+    // Pass 4: b's source is gone (the relay lost it). The next seed creates it from the
+    // fallback, and only now does the row change.
+    calls_b.lock().await.held.remove(&source);
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(
+        seeded_from(&calls_b, &source).await.last(),
+        Some(&json!(origin_url))
+    );
+    assert_eq!(
+        feeds(&db, &b1).await,
+        vec![(node_b.clone(), None, 1)],
+        "the re-created source pulls from the entry, and the row says so"
+    );
+
+    // Pass 5: the stream ends, but b refuses the removal: the row stays.
     PgDatabase::from_pool(db.clone())
         .update_stream_status(&StreamId(b1.clone()), StreamStatus::Ended)
         .await
         .expect("end stream");
+    calls_b.lock().await.fail_removals = true;
     mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
-    assert_eq!(removals_of(&calls_b, &source).await, 1, "an ended stream's source is removed");
+    assert_eq!(removals_of(&calls_b, &source).await, 1, "the removal was tried");
+    assert_eq!(
+        feeds(&db, &b1).await,
+        vec![(node_b.clone(), None, 1)],
+        "a failed removal keeps its row"
+    );
+
+    // Pass 6: b accepts. Nobody can be watching an ended stream: source and row go.
+    calls_b.lock().await.fail_removals = false;
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(removals_of(&calls_b, &source).await, 2);
     assert!(feeds(&db, &b1).await.is_empty(), "and its row with it");
 
     cleanup(&db, &b1, &[&node_a, &node_b], &provider).await;

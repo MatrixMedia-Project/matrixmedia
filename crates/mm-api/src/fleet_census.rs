@@ -70,15 +70,29 @@ struct Tally {
     /// included, for the relay-hour meter's samples (Task 9, §8.2 R4): a relay link costs
     /// the node one stream's egress, like a person. The origin is never a key.
     per_node_per_broadcast: HashMap<(mm_core::fleet::NodeId, String), i64>,
-    /// Fan-out nodes with at least one person on an `ad-…` source. An ad source names
-    /// the user, not the programme the break interrupted, so such a person cannot be
-    /// counted toward a broadcast; the node is marked instead. Counts nothing.
+    /// Fan-out nodes with at least one person listed on an `ad-…` source, connected or
+    /// not. An ad source names the user, not the programme the break interrupted, so
+    /// such a person cannot be counted toward a broadcast; the node is marked instead.
+    /// Counts nothing.
     ad_break_nodes: HashSet<mm_core::fleet::NodeId>,
+    /// (node, broadcast) pairs with at least one session LISTED on a `stream-<broadcast>`
+    /// source, connected or not, relay links included: someone negotiating or briefly
+    /// disconnected is still there. Counts nothing.
+    listed: HashSet<(mm_core::fleet::NodeId, String)>,
 }
 
 fn tally(gathered: &[(CensusTarget, Vec<SwitchViewer>)]) -> Tally {
     let mut t = Tally::default();
     for (target, viewers) in gathered {
+        if let Some(node_id) = target {
+            for v in viewers {
+                if let Some(broadcast_id) = v.current_source.strip_prefix("stream-") {
+                    t.listed.insert((node_id.clone(), broadcast_id.to_string()));
+                } else if v.current_source.starts_with("ad-") && !is_cascade_session(&v.id) {
+                    t.ad_break_nodes.insert(node_id.clone());
+                }
+            }
+        }
         let connected: Vec<_> = viewers.iter().filter(|v| v.connected).collect();
         if let Some(node_id) = target {
             t.per_node.insert(node_id.clone(), connected.len() as i64);
@@ -88,9 +102,6 @@ fn tally(gathered: &[(CensusTarget, Vec<SwitchViewer>)]) -> Tally {
                 *t.by_source.entry(v.current_source.clone()).or_insert(0) += 1;
             }
             if let Some(node_id) = target {
-                if is_audience(v) && v.current_source.starts_with("ad-") {
-                    t.ad_break_nodes.insert(node_id.clone());
-                }
                 if let Some(broadcast_id) = v.current_source.strip_prefix("stream-") {
                     *t.per_node_per_broadcast
                         .entry((node_id.clone(), broadcast_id.to_string()))
@@ -117,8 +128,25 @@ pub struct CensusPass {
     /// counts above read zero, but nobody knows what they serve.
     pub unanswered: HashSet<mm_core::fleet::NodeId>,
     /// Fan-out nodes with at least one person on an ad break (an `ad-…` source, which
-    /// names no programme): whichever stream they will return to, it is on that node.
+    /// names no programme), connected or not: whichever stream they will return to, it
+    /// is on that node.
     pub ad_break_nodes: HashSet<mm_core::fleet::NodeId>,
+    /// (node, broadcast) pairs with at least one session listed, connected or not,
+    /// relay links included. What holds a relay; it counts nothing.
+    pub listed: HashSet<(mm_core::fleet::NodeId, String)>,
+}
+
+/// The fan-out nodes a gather was sent to that did not answer: errored, ran out of
+/// time, or whose task never came back (panicked or dropped).
+fn not_answered(
+    spawned: &[mm_core::fleet::NodeId],
+    answered: &HashSet<mm_core::fleet::NodeId>,
+) -> HashSet<mm_core::fleet::NodeId> {
+    spawned
+        .iter()
+        .filter(|n| !answered.contains(*n))
+        .cloned()
+        .collect()
 }
 
 pub struct SwitchCensus {
@@ -153,6 +181,8 @@ impl SwitchCensus {
             }
         }
 
+        let spawned: Vec<mm_core::fleet::NodeId> =
+            targets.iter().filter_map(|(t, _)| t.clone()).collect();
         let mut tasks = JoinSet::new();
         for (target, client) in targets {
             tasks.spawn(async move {
@@ -189,24 +219,25 @@ impl SwitchCensus {
         }
 
         let mut out = Vec::new();
-        let mut unanswered = HashSet::new();
+        let mut answered = HashSet::new();
         while let Some(res) = tasks.join_next().await {
             match res {
-                Ok((target, Some(viewers))) => out.push((target, viewers)),
-                Ok((target, None)) => {
+                Ok((target, Some(viewers))) => {
                     if let Some(node_id) = &target {
-                        unanswered.insert(node_id.clone());
+                        answered.insert(node_id.clone());
                     }
-                    out.push((target, Vec::new()));
+                    out.push((target, viewers));
                 }
+                Ok((target, None)) => out.push((target, Vec::new())),
                 // m5: contained (one node's gather, not the tick), but previously silent.
+                // Its node never reaches `answered`, so it is reported unanswered.
                 Err(e) => tracing::error!(
                     error = %e,
                     "viewer census: a node's gather task panicked or was cancelled"
                 ),
             }
         }
-        (out, unanswered)
+        (out, not_answered(&spawned, &answered))
     }
 
     /// Viewer counts per programme source, gathered across the origin and every
@@ -265,6 +296,7 @@ impl SwitchCensus {
             by_source,
             per_node_per_broadcast,
             ad_break_nodes,
+            listed,
         } = tally(&gathered);
         self.insert_relay_usage_samples(&per_node_per_broadcast, Utc::now())
             .await;
@@ -299,6 +331,7 @@ impl SwitchCensus {
             per_node_per_broadcast,
             unanswered,
             ad_break_nodes,
+            listed,
         })
     }
 
@@ -465,8 +498,9 @@ mod tests {
     }
 
     /// A person on an ad break watches an `ad-…` source that names no programme, so the
-    /// node they are on is marked instead. A relay link or a disconnected session on an ad
-    /// source marks nothing, and the origin is never a node.
+    /// node they are on is marked instead, connected or not (a session that is only
+    /// negotiating or briefly disconnected comes back). A relay link on an ad source
+    /// marks nothing, and the origin is never a node.
     #[test]
     fn a_person_on_an_ad_break_marks_their_node() {
         let t = tally(&[
@@ -479,15 +513,57 @@ mod tests {
                 vec![session("viewer-b1--bob-example.org", "ad-bob-1", false)],
             ),
             (
+                Some(NodeId::new("relay-c")),
+                vec![session("cascade-ad-x-lease-1-0", "ad-x", true)],
+            ),
+            (
                 None,
                 vec![session("viewer-b1--carol-example.org", "ad-carol-1", true)],
             ),
         ]);
         assert_eq!(
             t.ad_break_nodes,
-            std::collections::HashSet::from([NodeId::new("relay-a")])
+            HashSet::from([NodeId::new("relay-a"), NodeId::new("relay-b")])
         );
         assert_eq!(sample(&t, "relay-a", "b1"), None, "the counts are unchanged");
+    }
+
+    /// Every session listed on a node marks its (node, broadcast) pair, connected or not;
+    /// the counts still take connected sessions only.
+    #[test]
+    fn every_listed_session_marks_its_pair_but_only_connected_ones_count() {
+        let t = tally(&[
+            (
+                Some(NodeId::new("relay-a")),
+                vec![
+                    session("viewer-b1--alice-example.org", "stream-b1", false),
+                    session("cascade-stream-b2-lease-1-0", "stream-b2", true),
+                ],
+            ),
+            (None, vec![session("viewer-b3--bob-example.org", "stream-b3", false)]),
+        ]);
+        assert_eq!(
+            t.listed,
+            HashSet::from([
+                (NodeId::new("relay-a"), "b1".to_string()),
+                (NodeId::new("relay-a"), "b2".to_string()),
+            ])
+        );
+        assert_eq!(sample(&t, "relay-a", "b1"), None);
+        assert_eq!(sample(&t, "relay-a", "b2"), Some(1));
+        assert_eq!(t.per_node.get(&NodeId::new("relay-a")).copied(), Some(1));
+    }
+
+    /// A gather task that panicked or was dropped never reports back; its node is
+    /// unanswered, like one that errored or ran out of time.
+    #[test]
+    fn a_node_whose_gather_task_did_not_return_is_unanswered() {
+        let spawned = [NodeId::new("relay-a"), NodeId::new("relay-b"), NodeId::new("relay-c")];
+        let answered = HashSet::from([NodeId::new("relay-a")]);
+        assert_eq!(
+            not_answered(&spawned, &answered),
+            HashSet::from([NodeId::new("relay-b"), NodeId::new("relay-c")])
+        );
     }
 
     /// The origin is billed to nobody and written back nowhere.

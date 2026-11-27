@@ -345,6 +345,38 @@ async fn a_relay_pulling_a_stream_is_not_counted_as_a_viewer() {
     end_stream(&db, &b1).await;
 }
 
+/// A fan-out node that does not answer is named in the pass's `unanswered` set: its
+/// counts read zero, but the relay tree must not take that zero as "nobody there".
+#[tokio::test]
+async fn a_node_that_does_not_answer_is_reported_as_unanswered() {
+    let Some(db) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    ensure_migrations(&db).await;
+    let origin = fake_switch(json!(null), json!(null)).await;
+    let answering = fake_switch(json!(null), json!(null)).await;
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin),
+    )));
+    let (dead, alive) = (
+        format!("dead-{}", uuid::Uuid::new_v4()),
+        format!("alive-{}", uuid::Uuid::new_v4()),
+    );
+    pool.upsert(&node(&dead), Arc::new(SwitchClient::new("http://127.0.0.1:1")))
+        .await;
+    pool.upsert(&node(&alive), Arc::new(SwitchClient::new(&answering)))
+        .await;
+    let census = mm_api::fleet_census::SwitchCensus::new(pool, db.clone());
+
+    let pass = census
+        .viewers_per_node_and_live_broadcasts()
+        .await
+        .expect("census");
+    assert!(pass.unanswered.contains(&NodeId::new(dead.as_str())));
+    assert!(!pass.unanswered.contains(&NodeId::new(alive.as_str())));
+}
+
 async fn ensure_migrations(pool: &sqlx::PgPool) {
     static MIGRATIONS: OnceLock<Mutex<bool>> = OnceLock::new();
     let cell = MIGRATIONS.get_or_init(|| Mutex::new(false));

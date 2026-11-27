@@ -1041,6 +1041,12 @@ func newInterceptorRegistry(m *webrtc.MediaEngine) (*interceptor.Registry, error
 	return i, nil
 }
 
+// tuneICEGathering adjusts candidate gathering on every peer connection this process
+// creates. It does nothing here: the switch gathers on every interface, as it always
+// has. It exists for the tests, which run both ends of a connection in one process and
+// replace it so that ICE does not depend on the host's interfaces (see TestMain).
+var tuneICEGathering = func(*webrtc.SettingEngine) {}
+
 func createPeerConnection() (*webrtc.PeerConnection, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
@@ -1058,6 +1064,7 @@ func createPeerConnection() (*webrtc.PeerConnection, error) {
 		settingEngine.SetNAT1To1IPs([]string{ip}, webrtc.ICECandidateTypeHost)
 	}
 	applyICETransport(&settingEngine)
+	tuneICEGathering(&settingEngine)
 
 	// Fast cleanup of dead connections:
 	// - Disconnect timeout: 3s (default 5s) — fail faster on lost peer

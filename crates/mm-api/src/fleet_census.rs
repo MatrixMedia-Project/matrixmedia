@@ -76,8 +76,9 @@ struct Tally {
     /// Counts nothing.
     ad_break_nodes: HashSet<mm_core::fleet::NodeId>,
     /// (node, broadcast) pairs with at least one session LISTED on a `stream-<broadcast>`
-    /// source, connected or not, relay links included: someone negotiating or briefly
-    /// disconnected is still there. Counts nothing.
+    /// source, connected or not, relay links included: a session still negotiating is
+    /// listed before it connects (mm-switch drops one on Disconnected, Failed or Closed).
+    /// Counts nothing.
     listed: HashSet<(mm_core::fleet::NodeId, String)>,
 }
 
@@ -499,7 +500,7 @@ mod tests {
 
     /// A person on an ad break watches an `ad-…` source that names no programme, so the
     /// node they are on is marked instead, connected or not (a session that is only
-    /// negotiating or briefly disconnected comes back). A relay link on an ad source
+    /// negotiating is listed before it connects). A relay link on an ad source
     /// marks nothing, and the origin is never a node.
     #[test]
     fn a_person_on_an_ad_break_marks_their_node() {

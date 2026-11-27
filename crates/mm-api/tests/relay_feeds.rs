@@ -389,6 +389,65 @@ async fn an_ad_break_holds_the_relay_it_is_on() {
     cleanup(&db, &b1, &[&node], &provider).await;
 }
 
+/// A relay that already holds a stream's source no row describes (a seed that was cut
+/// off before its row was written) is adopted as a leaf of unknown origin: (None, 3). It
+/// can then be removed like any row when the stream ends.
+#[tokio::test]
+async fn a_source_found_with_no_row_is_adopted_as_a_leaf() {
+    let Some(db) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    mm_db::run_pg_migrations(&db)
+        .await
+        .expect("migrations should apply cleanly");
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let node = format!("0-feeds-{tag}-adopt");
+    let provider = format!("feeds-{tag}");
+    let zone = "ams-1";
+
+    let b1 = seed_active_stream(&db).await;
+    sqlx::query("UPDATE mm_streams SET media_path = 'relay_after_threshold' WHERE id = $1")
+        .bind(&b1)
+        .execute(&db)
+        .await
+        .expect("set media_path");
+    let source = switch_source_id(&b1);
+    let origin_url = fake_origin(
+        json!([{ "id": source, "type": "webrtc", "active": true }]),
+        json!([{ "id": switch_viewer_id(&b1, "@alice:example.org"), "current_source": source, "connected": true }]),
+    )
+    .await;
+    let (url, calls) = fake_relay(json!(null)).await;
+    calls.lock().await.held.insert(source.clone());
+
+    seed_provider_zone(&db, &provider, zone).await;
+    seed_relay(&db, &node, "192.0.2.4", &provider, zone).await;
+    let ctx = context(HashMap::from([("192.0.2.4".to_string(), url)]));
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin_url),
+    )));
+
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(seeded_from(&calls, &source).await, vec![json!(origin_url)]);
+    assert_eq!(
+        feeds(&db, &b1).await,
+        vec![(node.clone(), None, 3)],
+        "the relay answered 409: adopted as a leaf, origin unknown"
+    );
+
+    PgDatabase::from_pool(db.clone())
+        .update_stream_status(&StreamId(b1.clone()), StreamStatus::Ended)
+        .await
+        .expect("end stream");
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(removals_of(&calls, &source).await, 1, "an adopted leaf is removed like any row");
+    assert!(feeds(&db, &b1).await.is_empty());
+
+    cleanup(&db, &b1, &[&node], &provider).await;
+}
+
 async fn seed_provider_zone(db: &sqlx::PgPool, provider: &str, zone: &str) {
     // A priority no other live provider holds (the column is unique among them).
     let priority = 1_000_000 + (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i32;

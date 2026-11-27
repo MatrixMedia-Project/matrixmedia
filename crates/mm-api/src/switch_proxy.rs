@@ -235,7 +235,10 @@ async fn offer_to_node(
 /// the origin.
 ///
 /// A viewer who already has a node keeps it (see the STICKY note in
-/// [`proxy_viewer_offer`]). Otherwise the stream's stored state (`stream_path`, fixed when
+/// [`proxy_viewer_offer`]) while that node still carries the stream. A binding to a relay
+/// that no longer carries it (the viewer dropped, and the sync then removed the stream's
+/// source there) is removed and the viewer is placed fresh: that relay would answer the
+/// offer with no picture. Otherwise the stream's stored state (`stream_path`, fixed when
 /// it started) decides through [`viewer_target`], with the live `fleet.mode` and
 /// `fleet.relay_viewer_threshold` and the stream's audience at the last census: `Relay`
 /// takes a relay that carries the stream ([`SwitchPool::assign_fanout_node`]) or falls
@@ -248,10 +251,13 @@ pub async fn place_viewer(
     stream_path: MediaPath,
     viewer: &mm_core::fleet::ViewerId,
 ) -> (Option<NodeId>, Arc<SwitchClient>) {
-    if let Some(node) = pool.node_of_viewer(viewer).await
-        && let Some(client) = pool.client_for_node(Some(&node)).await
-    {
-        return (Some(node), client);
+    if let Some(node) = pool.node_of_viewer(viewer).await {
+        if pool.carried_by(&node).await.contains(&stream.0)
+            && let Some(client) = pool.client_for_node(Some(&node)).await
+        {
+            return (Some(node), client);
+        }
+        pool.unbind_viewer(viewer).await;
     }
     let target = viewer_target(
         stream_path,
@@ -1130,7 +1136,57 @@ mod tests {
         );
     }
 
-    // ── Fix round 1: the proxy per stream, and a failing relay ─────────────
+    /// A binding is honoured only while its relay carries the stream. A viewer whose relay
+    /// dropped the stream (the viewer's own disconnect let the sync remove it) re-offers
+    /// with the same id: sending them back there would answer with no picture, so the
+    /// binding goes and the viewer is placed fresh, here on the origin.
+    #[tokio::test]
+    async fn a_bound_viewer_whose_relay_no_longer_carries_the_stream_is_placed_fresh() {
+        let pool = pool_with_a_carrier().await;
+        let viewer = mm_core::fleet::ViewerId::new("v1");
+        pool.bind_viewer(viewer.clone(), NodeId::new("r1")).await;
+        pool.set_carried(&NodeId::new("r1"), std::collections::HashSet::new())
+            .await;
+        let path = MediaPath::RelayAfterThreshold;
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", path, "v1").await,
+            None,
+            "nobody carries s1 any more: the origin"
+        );
+        assert_eq!(
+            pool.node_of_viewer(&viewer).await,
+            None,
+            "the stale binding is gone"
+        );
+    }
+
+    /// A bound viewer whose relay carries another stream but not this one is placed fresh
+    /// on a relay that does carry it.
+    #[tokio::test]
+    async fn a_bound_viewer_is_moved_off_a_relay_that_does_not_carry_its_stream() {
+        let pool = pool_with_a_carrier().await;
+        pool.upsert(
+            &relay("r2"),
+            Arc::new(SwitchClient::new("http://r2.invalid:7890")),
+        )
+        .await;
+        pool.set_carried(
+            &NodeId::new("r2"),
+            std::collections::HashSet::from(["s9".to_string()]),
+        )
+        .await;
+        let viewer = mm_core::fleet::ViewerId::new("v1");
+        pool.bind_viewer(viewer.clone(), NodeId::new("r2")).await;
+        let path = MediaPath::RelayAfterThreshold;
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", path, "v1")
+                .await
+                .as_deref(),
+            Some("r1")
+        );
+    }
+
+    // ── The proxy per stream, and a failing relay ──────────────────────────
 
     #[test]
     fn the_proxy_stays_on_for_a_stream_that_started_in_the_relay_state() {
@@ -1281,6 +1337,11 @@ mod tests {
         let (pool, relay_client) = pool_of(true, false).await;
         let viewer = mm_core::fleet::ViewerId::new("v1");
         pool.bind_viewer(viewer.clone(), NodeId::new("r1")).await;
+        pool.set_carried(
+            &NodeId::new("r1"),
+            std::collections::HashSet::from(["s1".to_string()]),
+        )
+        .await;
         // Placed by its binding, as the handler does.
         let placed_on = place_viewer(
             &pool,

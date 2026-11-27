@@ -18,6 +18,7 @@ pub mod discovery;
 pub mod error;
 pub mod event_namespaces;
 pub mod feed;
+pub mod follow_rooms;
 pub mod fleet_boot_report;
 pub mod fleet_census;
 pub mod honeypot;

@@ -879,7 +879,7 @@ pub(crate) async fn publish_stream_started(
 ) -> String {
     let cfg = state.config();
     let ctx = crate::stream_lifecycle::MarkerContext::from_state(state, &cfg);
-    publish_stream_started_with(
+    let state_event_id = publish_stream_started_with(
         &ctx,
         &cfg,
         stream,
@@ -890,7 +890,11 @@ pub(crate) async fn publish_stream_started(
         e2ee_info,
         source,
     )
-    .await
+    .await;
+    // Go-live follow fan-out (V065): best-effort, spawned so stream
+    // creation never waits on followers' rooms.
+    crate::follow_rooms::spawn_notify_go_live(state, stream, title.map(str::to_string));
+    state_event_id
 }
 
 /// [`publish_stream_started`] over the slice of state it actually uses (the

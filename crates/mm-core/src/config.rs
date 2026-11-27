@@ -1952,6 +1952,57 @@ impl Config {
                 }
             }
         }
+
+        // --- Media path ---
+        //
+        // Same shape as the kill-switch: an unparseable value lands in `core`,
+        // the state that rents nothing, and says so.
+        if let Ok(v) = std::env::var("MM_FLEET_MEDIA_PATH") {
+            match MediaPath::parse(&v) {
+                Some(path) => {
+                    info!("Config override: MM_FLEET_MEDIA_PATH={path}");
+                    self.fleet.media_path = path;
+                }
+                None => {
+                    tracing::error!(
+                        value = %v,
+                        "MM_FLEET_MEDIA_PATH is not one of core/relay_after_threshold/relay_entry \
+                         — using `core`"
+                    );
+                    self.fleet.media_path = MediaPath::Core;
+                }
+            }
+        }
+
+        // 0 is refused like a typo (the setting's range starts at 1): a threshold
+        // of 0 would send every stream to relays from its first viewer.
+        if let Ok(v) = std::env::var("MM_FLEET_RELAY_VIEWER_THRESHOLD") {
+            match v.trim().parse::<u32>() {
+                Ok(viewers) if viewers > 0 => {
+                    info!("Config override: MM_FLEET_RELAY_VIEWER_THRESHOLD={viewers}");
+                    self.fleet.relay_viewer_threshold = viewers;
+                }
+                _ => tracing::error!(
+                    value = %v,
+                    "MM_FLEET_RELAY_VIEWER_THRESHOLD is not a positive number — keeping the \
+                     configured relay viewer threshold"
+                ),
+            }
+        }
+
+        if let Ok(v) = std::env::var("MM_FLEET_MAX_RELAY_NODES") {
+            match v.trim().parse::<u32>() {
+                Ok(nodes) => {
+                    info!("Config override: MM_FLEET_MAX_RELAY_NODES={nodes}");
+                    self.fleet.max_relay_nodes = nodes;
+                }
+                Err(_) => tracing::error!(
+                    value = %v,
+                    "MM_FLEET_MAX_RELAY_NODES is not a number — keeping the configured \
+                     relay node ceiling"
+                ),
+            }
+        }
     }
 }
 
@@ -2111,6 +2162,24 @@ pub struct FleetConfig {
     /// How long a zone sits out after a stock-out before it is tried again.
     #[serde(default = "default_capacity_cooldown_secs")]
     pub capacity_cooldown_secs: u64,
+
+    /// Where live media flows for a new stream. **Default `core`**: every viewer
+    /// is served by the core's own switch, as before this setting existed. The
+    /// state is fixed per stream when it starts, so a change applies to new
+    /// streams only.
+    #[serde(default)]
+    pub media_path: MediaPath,
+
+    /// Under `relay_after_threshold`, the viewer count at which a stream's new
+    /// viewers go to a relay node instead of the core. Default 50.
+    #[serde(default = "default_relay_viewer_threshold")]
+    pub relay_viewer_threshold: u32,
+
+    /// The most relay nodes the media path may hold at once, across all
+    /// streams. **Default 0 — no relay nodes**, so choosing a relay state
+    /// rents nothing until an operator also raises this ceiling.
+    #[serde(default)]
+    pub max_relay_nodes: u32,
 }
 
 impl FleetConfig {
@@ -2146,6 +2215,10 @@ fn default_test_boots_per_day() -> i64 {
 
 fn default_capacity_cooldown_secs() -> u64 {
     600
+}
+
+fn default_relay_viewer_threshold() -> u32 {
+    50
 }
 
 fn default_wallet_currency() -> String {
@@ -2197,6 +2270,10 @@ impl Default for FleetConfig {
             max_gpu_nodes: default_max_gpu_nodes(),
             test_boots_per_day: default_test_boots_per_day(),
             capacity_cooldown_secs: default_capacity_cooldown_secs(),
+            media_path: MediaPath::default(),
+            relay_viewer_threshold: default_relay_viewer_threshold(),
+            // 0 = no relay nodes, see the field doc.
+            max_relay_nodes: 0,
         }
     }
 }
@@ -2259,6 +2336,54 @@ impl std::fmt::Display for FleetMode {
             Self::Frozen => "frozen",
             Self::Off => "off",
         })
+    }
+}
+
+/// Where live media flows for a stream (`fleet.media_path`).
+///
+/// `Core` is the default because it is today's behaviour: the core's own switch
+/// serves every viewer and nothing is rented. The state is fixed per stream when
+/// it starts; with `fleet.mode` `frozen` or `off` every state behaves as `Core`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaPath {
+    /// **Default.** Every viewer is served by the core's own switch.
+    #[default]
+    Core,
+
+    /// Viewers start on the core; once a stream reaches
+    /// `fleet.relay_viewer_threshold` viewers, new viewers go to relay nodes.
+    RelayAfterThreshold,
+
+    /// Every viewer goes to a relay node from the start.
+    RelayEntry,
+}
+
+impl MediaPath {
+    /// Case-insensitive parse of the setting value. `None` for anything else;
+    /// the env override turns that into `Core` and logs an error.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "core" => Some(Self::Core),
+            "relay_after_threshold" => Some(Self::RelayAfterThreshold),
+            "relay_entry" => Some(Self::RelayEntry),
+            _ => None,
+        }
+    }
+
+    /// The setting value, as stored and as serialised.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::RelayAfterThreshold => "relay_after_threshold",
+            Self::RelayEntry => "relay_entry",
+        }
+    }
+}
+
+impl std::fmt::Display for MediaPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -2412,6 +2537,37 @@ mod tests {
             "a typo must not resolve to a mode; the caller holds it in frozen instead"
         );
         assert_eq!(FleetMode::parse(""), None);
+    }
+
+    #[test]
+    fn media_path_serializes_as_its_setting_value() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::to_value(MediaPath::RelayAfterThreshold).unwrap(),
+            json!("relay_after_threshold")
+        );
+        assert_eq!(serde_json::to_value(MediaPath::Core).unwrap(), json!("core"));
+        assert_eq!(serde_json::to_value(MediaPath::RelayEntry).unwrap(), json!("relay_entry"));
+        assert_eq!(MediaPath::parse("relay_entry"), Some(MediaPath::RelayEntry));
+        assert_eq!(MediaPath::parse("Relay"), None);
+        assert_eq!(MediaPath::default(), MediaPath::Core);
+        for path in [MediaPath::Core, MediaPath::RelayAfterThreshold, MediaPath::RelayEntry] {
+            assert_eq!(MediaPath::parse(path.as_str()), Some(path), "{path}");
+        }
+    }
+
+    /// Asserted through both paths, as the meter interval is: a derived `Default`
+    /// would make the viewer threshold 0.
+    #[test]
+    fn media_path_settings_default_to_core_fifty_and_no_relays() {
+        let parsed: Config = toml::from_str("[server]\nclient_bind = \"0.0.0.0:8080\"\n")
+            .expect("parse");
+        let in_code = FleetConfig::default();
+        for (how, fleet) in [("parsed from toml", &parsed.fleet), ("::default()", &in_code)] {
+            assert_eq!(fleet.media_path, MediaPath::Core, "{how}");
+            assert_eq!(fleet.relay_viewer_threshold, 50, "{how}");
+            assert_eq!(fleet.max_relay_nodes, 0, "{how}");
+        }
     }
 
     #[test]

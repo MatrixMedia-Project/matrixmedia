@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use mm_core::config::Config;
+use mm_core::config::{Config, MediaPath};
 use mm_core::settings::{ENV_ONLY, EXCLUDED, URL_CREDENTIALS, ValueKind, find, registry};
 use mm_core::settings::{ApplyClass, Group};
 use serde_json::Value;
@@ -407,7 +407,7 @@ fn every_env_var_read_by_apply_env_overrides_is_accounted_for() {
 #[test]
 fn every_fleet_setting_lives_in_the_fleet_group() {
     let fleet: Vec<_> = registry().iter().filter(|d| d.key.starts_with("fleet.")).collect();
-    assert_eq!(fleet.len(), 19, "{:?}", fleet.iter().map(|d| d.key).collect::<Vec<_>>());
+    assert_eq!(fleet.len(), 22, "{:?}", fleet.iter().map(|d| d.key).collect::<Vec<_>>());
     for d in &fleet {
         assert_eq!(d.group, Group::Fleet, "{}", d.key);
     }
@@ -432,6 +432,9 @@ fn fleet_apply_classes_are_pinned() {
         "fleet.max_gpu_nodes",
         "fleet.test_boots_per_day",
         "fleet.capacity_cooldown_secs",
+        "fleet.media_path",
+        "fleet.relay_viewer_threshold",
+        "fleet.max_relay_nodes",
     ] {
         assert_eq!(find(k).unwrap().class, ApplyClass::Live, "{k}");
     }
@@ -468,4 +471,31 @@ fn ad_upload_limits_apply_live_and_the_media_dir_is_bootstrap() {
         assert_eq!(find(k).unwrap().class, ApplyClass::Live, "{k}");
     }
     assert!(matches!(find("advertising.media_dir").unwrap().class, ApplyClass::Bootstrap { .. }));
+}
+
+/// A typo in `MM_FLEET_MEDIA_PATH` lands in `core`, the state that rents nothing,
+/// whatever the config said — the same shape as `MM_FLEET_MODE` holding in `frozen`.
+///
+/// This is the only test in this binary that touches the environment, and no other
+/// test here reads it (the rest read config.rs as text or build configs in code), so
+/// setting one variable and restoring it does not race anything.
+#[test]
+fn an_unparseable_media_path_env_falls_back_to_core() {
+    const VAR: &str = "MM_FLEET_MEDIA_PATH";
+    let prior = std::env::var(VAR).ok();
+    // SAFETY: no other test in this binary reads or writes the environment (see above).
+    unsafe { std::env::set_var(VAR, "relay") };
+
+    let mut cfg = Config::default();
+    cfg.fleet.media_path = MediaPath::RelayAfterThreshold;
+    cfg.apply_env_overrides();
+
+    // SAFETY: as above.
+    unsafe {
+        match prior {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+    }
+    assert_eq!(cfg.fleet.media_path, MediaPath::Core);
 }

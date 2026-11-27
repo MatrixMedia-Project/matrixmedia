@@ -698,6 +698,13 @@ pub(crate) struct CreatedStreamRecord {
     pub has_video: bool,
 }
 
+/// The media path state a stream starting now is fixed in, stored on its row:
+/// `fleet.media_path` under `fleet.mode` ([`mm_core::fleet::media_path::effective`]), both
+/// read from `cfg`, the live configuration of the request that starts the stream.
+pub fn starting_media_path(cfg: &mm_core::config::Config) -> mm_core::config::MediaPath {
+    mm_core::fleet::media_path::effective(cfg.fleet.media_path, cfg.fleet.mode)
+}
+
 pub(crate) async fn create_stream_record(
     state: &SharedState,
     host_user_id: &mm_core::types::UserId,
@@ -798,6 +805,8 @@ pub(crate) async fn create_stream_record(
         .await
         .map_err(|e| MMError::Sfu(format!("{e}")))?;
 
+    // The media path state is fixed here, from the live settings at this moment; a later
+    // change of `fleet.media_path` (or `fleet.mode`) applies to new streams only.
     let stream = state
         .db
         .create_stream(
@@ -807,6 +816,7 @@ pub(crate) async fn create_stream_record(
             media_type,
             Some(&sfu_room.name),
             min_tier_level,
+            starting_media_path(&cfg).as_str(),
         )
         .await?;
 

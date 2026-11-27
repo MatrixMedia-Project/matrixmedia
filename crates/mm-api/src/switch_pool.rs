@@ -20,9 +20,10 @@
 //! silently falling back to the origin: for a viewer we have placed, the origin
 //! is a *wrong* answer, not a safe default.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use chrono::{DateTime, Duration, Utc};
 use mm_core::fleet::{FleetNode, NodeId, ViewerId};
 use mm_core::switch_client::SwitchClient;
 use mm_core::types::StreamId;
@@ -34,13 +35,30 @@ pub struct SwitchPool {
     /// Which node each placed viewer sits on. Without this `for_viewer` can
     /// never answer, and every ad switch silently goes to the origin.
     viewers: RwLock<HashMap<ViewerId, NodeId>>,
+    /// The streams each relay has the picture of: its cascade source read active at the
+    /// pool sync's last ensure (see [`Self::set_carried`]). Kept apart from `nodes` so the
+    /// sync's per-tick `upsert` does not clear it before the tick's own `set_carried`.
+    carried: RwLock<HashMap<NodeId, HashSet<String>>>,
+    /// People watching each live stream at the last census; `None` before the first.
+    stream_viewers: RwLock<Option<HashMap<String, u32>>>,
     origin: Arc<SwitchClient>,
 }
 
 struct Entry {
     node: FleetNode,
     client: Arc<SwitchClient>,
+    /// When a rented node is destroyed; `None` for a node that is not rented.
+    destroy_deadline: Option<DateTime<Utc>>,
 }
+
+/// How close to its destroy deadline a relay may be and still take new viewers.
+///
+/// The pool retires an idle relay 5 minutes before its deadline
+/// (`mm_fleet::pool_autoscale::RETIRE_MARGIN`), so nobody may be placed on one in the window
+/// before that: a viewer placed there would hold a node that is about to be let go. A kept
+/// relay's deadline is always about an hour away (each pool tick extends it by a full lease
+/// window), so this never excludes a relay the pool wants.
+pub const PLACEMENT_DEADLINE_GUARD: Duration = Duration::minutes(10);
 
 /// Where a viewer-scoped call should go, and whether its outcome may be billed.
 #[derive(Clone)]
@@ -59,6 +77,8 @@ impl SwitchPool {
         Self {
             nodes: RwLock::new(HashMap::new()),
             viewers: RwLock::new(HashMap::new()),
+            carried: RwLock::new(HashMap::new()),
+            stream_viewers: RwLock::new(None),
             origin,
         }
     }
@@ -87,13 +107,64 @@ impl SwitchPool {
     /// Register or refresh a node. Called by the fleet runner as observations
     /// arrive; re-registering an existing id replaces its state and its client.
     pub async fn upsert(&self, node: &FleetNode, client: Arc<SwitchClient>) {
+        self.upsert_with_deadline(node, client, None).await;
+    }
+
+    /// [`Self::upsert`] for a node with a known destroy deadline (a rented relay), so
+    /// placement can keep new viewers off it in its last minutes
+    /// ([`PLACEMENT_DEADLINE_GUARD`]). `None` is a node that is not rented.
+    pub async fn upsert_with_deadline(
+        &self,
+        node: &FleetNode,
+        client: Arc<SwitchClient>,
+        destroy_deadline: Option<DateTime<Utc>>,
+    ) {
         self.nodes.write().await.insert(
             node.id.clone(),
             Entry {
                 node: node.clone(),
                 client,
+                destroy_deadline,
             },
         );
+    }
+
+    /// Record which streams `node` has the picture of: those whose cascade source on it
+    /// read active this tick. Only such a relay is offered to a new viewer of a stream
+    /// ([`Self::assign_fanout_node`]); a feed row alone records where a source pulls from,
+    /// not that it has a picture. Ignored for a node the pool does not hold, so a late
+    /// call cannot bring back a node that was just evicted.
+    pub async fn set_carried(&self, node: &NodeId, streams: HashSet<String>) {
+        let nodes = self.nodes.read().await;
+        if nodes.contains_key(node) {
+            self.carried.write().await.insert(node.clone(), streams);
+        }
+    }
+
+    /// The streams `node` was last recorded as carrying (empty when none).
+    pub async fn carried_by(&self, node: &NodeId) -> HashSet<String> {
+        self.carried
+            .read()
+            .await
+            .get(node)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Replace the per-stream audience with the census's: people only, never relay links.
+    pub async fn set_stream_viewers(&self, counts: HashMap<String, u32>) {
+        *self.stream_viewers.write().await = Some(counts);
+    }
+
+    /// People watching `stream` at the last census. `None` before the first census and for
+    /// a stream the last census did not list: unknown, which places a viewer on the core.
+    pub async fn viewers_of(&self, stream: &StreamId) -> Option<u32> {
+        self.stream_viewers
+            .read()
+            .await
+            .as_ref()?
+            .get(&stream.0)
+            .copied()
     }
 
     /// Remove a node, and with it every viewer binding that pointed at it.
@@ -104,6 +175,7 @@ impl SwitchPool {
     /// process. Callers must re-place those viewers.
     pub async fn evict(&self, id: &NodeId) -> Vec<ViewerId> {
         self.nodes.write().await.remove(id);
+        self.carried.write().await.remove(id);
 
         let mut viewers = self.viewers.write().await;
         let orphaned: Vec<ViewerId> = viewers
@@ -184,31 +256,44 @@ impl SwitchPool {
     }
 
     /// Pick a fan-out node for a new viewer of `stream`: the placeable node with
-    /// the most headroom, or the origin when the fleet has nothing to offer.
+    /// the most headroom among those that carry `stream` and are not in their last
+    /// minutes ([`PLACEMENT_DEADLINE_GUARD`]), or the origin when the fleet has nothing
+    /// to offer.
     ///
     /// Ties break on node id rather than on hash order. A `max_by_key` over a
     /// `HashMap` is otherwise nondeterministic between runs, which turns "why
     /// did this viewer land there" into an unanswerable question and makes any
     /// test with two equal nodes flaky.
-    pub async fn assign_fanout(&self, _stream: &StreamId) -> Arc<SwitchClient> {
-        match self.pick_placeable().await {
+    pub async fn assign_fanout(&self, stream: &StreamId) -> Arc<SwitchClient> {
+        match self.assign_fanout_node(stream).await {
             Some((_, client)) => client,
             None => self.origin.clone(),
         }
     }
 
     /// Same choice as `assign_fanout`, but also returns the node id so the
-    /// caller can record the placement and bind the viewer.
+    /// caller can record the placement and bind the viewer. `None` means the origin.
     pub async fn assign_fanout_node(&self, stream: &StreamId) -> Option<(NodeId, Arc<SwitchClient>)> {
-        let _ = stream;
-        self.pick_placeable().await
+        self.assign_fanout_node_at(stream, Utc::now()).await
     }
 
-    async fn pick_placeable(&self) -> Option<(NodeId, Arc<SwitchClient>)> {
+    /// [`Self::assign_fanout_node`] at a given time, which the deadline guard is measured
+    /// from.
+    async fn assign_fanout_node_at(
+        &self,
+        stream: &StreamId,
+        now: DateTime<Utc>,
+    ) -> Option<(NodeId, Arc<SwitchClient>)> {
         let nodes = self.nodes.read().await;
+        let carried = self.carried.read().await;
         nodes
             .iter()
             .filter(|(_, e)| e.node.is_placeable())
+            .filter(|(id, _)| carried.get(*id).is_some_and(|s| s.contains(&stream.0)))
+            .filter(|(_, e)| {
+                e.destroy_deadline
+                    .is_none_or(|deadline| deadline > now + PLACEMENT_DEADLINE_GUARD)
+            })
             .max_by(|(a_id, a), (b_id, b)| {
                 a.node
                     .headroom()
@@ -277,6 +362,16 @@ mod tests {
         n
     }
 
+    /// Record that each of `ids` has the picture of `stream`, as the pool sync does once a
+    /// relay's source reads active.
+    async fn carry(pool: &SwitchPool, ids: &[&str], stream: &str) {
+        for id in ids {
+            let mut streams = pool.carried_by(&NodeId::new(*id)).await;
+            streams.insert(stream.to_string());
+            pool.set_carried(&NodeId::new(*id), streams).await;
+        }
+    }
+
     /// THE CONTRACT WITH EVERY EXISTING SELF-HOSTED DEPLOYMENT.
     ///
     /// FR-102: a single-host OSS install has no fleet, and must behave exactly
@@ -296,6 +391,7 @@ mod tests {
         let pool = SwitchPool::new(origin_client());
         pool.upsert(&node("a", Ownership::Rented, 250, 200), client("a")).await;
         pool.upsert(&node("b", Ownership::Leased, 250, 10), client("b")).await;
+        carry(&pool, &["a", "b"], "s1").await;
 
         let got = pool.assign_fanout(&StreamId("s1".into())).await;
         assert_eq!(pool.node_id_of(&got).await.unwrap().as_str(), "b");
@@ -306,6 +402,7 @@ mod tests {
         let pool = SwitchPool::new(origin_client());
         pool.upsert(&draining_node("c"), client("c")).await;
         pool.upsert(&node("d", Ownership::Rented, 250, 250), client("d")).await;
+        carry(&pool, &["c", "d"], "s1").await;
 
         let got = pool.assign_fanout(&StreamId("s1".into())).await;
         assert!(
@@ -322,6 +419,7 @@ mod tests {
         let pool = SwitchPool::new(origin_client());
         pool.upsert(&node("d", Ownership::Rented, 250, 300), client("d")).await;
         pool.upsert(&node("e", Ownership::Rented, 250, 249), client("e")).await;
+        carry(&pool, &["d", "e"], "s1").await;
 
         let got = pool.assign_fanout(&StreamId("s1".into())).await;
         assert_eq!(
@@ -339,6 +437,7 @@ mod tests {
             n.flavor = flavor;
             pool.upsert(&n, client(id)).await;
         }
+        carry(&pool, &["edge-1", "tx-1"], "s1").await;
 
         let got = pool.assign_fanout(&StreamId("s1".into())).await;
         assert!(
@@ -352,11 +451,24 @@ mod tests {
     async fn evicted_node_is_never_returned() {
         let pool = SwitchPool::new(origin_client());
         pool.upsert(&node("e", Ownership::Rented, 250, 0), client("e")).await;
+        carry(&pool, &["e"], "s1").await;
         pool.evict(&NodeId::new("e")).await;
 
         let got = pool.assign_fanout(&StreamId("s1".into())).await;
         assert!(Arc::ptr_eq(&got, &pool.origin()));
         assert_eq!(pool.node_count().await, 0);
+        assert!(
+            pool.carried_by(&NodeId::new("e")).await.is_empty(),
+            "eviction forgets what the node carried"
+        );
+        // Back under the same id, it carries nothing until the sync says so again.
+        pool.upsert(&node("e", Ownership::Rented, 250, 0), client("e"))
+            .await;
+        assert!(
+            pool.assign_fanout_node(&StreamId("s1".into()))
+                .await
+                .is_none()
+        );
     }
 
     /// Eviction must hand back the viewers it orphaned, or they are lost: the
@@ -427,6 +539,7 @@ mod tests {
         let pool = SwitchPool::new(origin_client());
         pool.upsert(&node("a", Ownership::Rented, 250, 0), client("a")).await;
         pool.upsert(&node("b", Ownership::Rented, 250, 100), client("b")).await;
+        carry(&pool, &["a", "b"], "s1").await;
 
         // `a` fills up. The pool must notice on the next observation.
         pool.upsert(&node("a", Ownership::Rented, 250, 250), client("a")).await;
@@ -446,9 +559,155 @@ mod tests {
             for id in ["m", "a", "z"] {
                 pool.upsert(&node(id, Ownership::Rented, 250, 0), client(id)).await;
             }
+            carry(&pool, &["m", "a", "z"], "s1").await;
             let got = pool.assign_fanout(&StreamId("s1".into())).await;
             assert_eq!(pool.node_id_of(&got).await.unwrap().as_str(), "a");
         }
+    }
+
+    /// Review Focus 5: a relay without the picture of a stream would hand its viewer
+    /// black video, so only a relay that carries the stream is offered.
+    #[tokio::test]
+    async fn a_viewer_is_only_sent_to_a_relay_that_carries_the_stream() {
+        let pool = SwitchPool::new(origin_client());
+        // `a` is emptier, so it would win on headroom alone.
+        pool.upsert(&node("a", Ownership::Rented, 250, 0), client("a"))
+            .await;
+        pool.upsert(&node("b", Ownership::Rented, 250, 100), client("b"))
+            .await;
+        carry(&pool, &["b"], "s1").await;
+
+        let (picked, _) = pool
+            .assign_fanout_node(&StreamId("s1".into()))
+            .await
+            .expect("b carries s1");
+        assert_eq!(picked.as_str(), "b");
+        assert!(
+            pool.assign_fanout_node(&StreamId("s2".into()))
+                .await
+                .is_none(),
+            "nobody carries s2: its viewer goes to the origin"
+        );
+        let got = pool.assign_fanout(&StreamId("s2".into())).await;
+        assert!(
+            Arc::ptr_eq(&got, &pool.origin()),
+            "assign_fanout follows the same rule"
+        );
+    }
+
+    /// The sync records what a relay carries each tick; a new record replaces the old one.
+    #[tokio::test]
+    async fn a_relay_that_stops_carrying_a_stream_is_no_longer_offered() {
+        let pool = SwitchPool::new(origin_client());
+        pool.upsert(&node("a", Ownership::Rented, 250, 0), client("a"))
+            .await;
+        carry(&pool, &["a"], "s1").await;
+        assert!(
+            pool.assign_fanout_node(&StreamId("s1".into()))
+                .await
+                .is_some()
+        );
+
+        pool.set_carried(&NodeId::new("a"), HashSet::new()).await;
+        assert!(
+            pool.assign_fanout_node(&StreamId("s1".into()))
+                .await
+                .is_none()
+        );
+
+        // An upsert (every tick refreshes the node) does not clear it.
+        carry(&pool, &["a"], "s1").await;
+        pool.upsert(&node("a", Ownership::Rented, 250, 3), client("a"))
+            .await;
+        assert!(
+            pool.assign_fanout_node(&StreamId("s1".into()))
+                .await
+                .is_some()
+        );
+
+        // A node the pool does not hold records nothing.
+        pool.set_carried(&NodeId::new("ghost"), HashSet::from(["s1".to_string()]))
+            .await;
+        assert!(pool.carried_by(&NodeId::new("ghost")).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_viewer_count_is_none() {
+        let pool = SwitchPool::new(origin_client());
+        assert_eq!(
+            pool.viewers_of(&StreamId("s1".into())).await,
+            None,
+            "before any census the count is unknown"
+        );
+
+        pool.set_stream_viewers(HashMap::from([("s1".to_string(), 60)]))
+            .await;
+        assert_eq!(pool.viewers_of(&StreamId("s1".into())).await, Some(60));
+        assert_eq!(
+            pool.viewers_of(&StreamId("s2".into())).await,
+            None,
+            "a stream the last census did not list is unknown, not zero"
+        );
+
+        pool.set_stream_viewers(HashMap::from([("s2".to_string(), 0)]))
+            .await;
+        assert_eq!(
+            pool.viewers_of(&StreamId("s1".into())).await,
+            None,
+            "replaced, not merged"
+        );
+        assert_eq!(pool.viewers_of(&StreamId("s2".into())).await, Some(0));
+    }
+
+    /// No new viewer on a relay in its last minutes: the pool retires an idle relay five
+    /// minutes before its deadline, so a viewer placed there would sit on a node about to
+    /// be let go.
+    #[tokio::test]
+    async fn a_relay_near_its_deadline_takes_no_new_viewers() {
+        let now = Utc::now();
+        let s1 = StreamId("s1".into());
+
+        // Two carriers; the near one is emptier, so headroom alone would pick it.
+        let pool = SwitchPool::new(origin_client());
+        pool.upsert_with_deadline(
+            &node("near", Ownership::Rented, 250, 0),
+            client("near"),
+            Some(now + Duration::minutes(6)),
+        )
+        .await;
+        pool.upsert_with_deadline(
+            &node("far", Ownership::Rented, 250, 100),
+            client("far"),
+            Some(now + Duration::minutes(55)),
+        )
+        .await;
+        carry(&pool, &["near", "far"], "s1").await;
+        for _ in 0..20 {
+            let (picked, _) = pool.assign_fanout_node_at(&s1, now).await.expect("far");
+            assert_eq!(picked.as_str(), "far");
+        }
+
+        // The near one alone: nobody is offered, the viewer goes to the origin.
+        pool.evict(&NodeId::new("far")).await;
+        assert!(pool.assign_fanout_node_at(&s1, now).await.is_none());
+
+        // Exactly at the guard is still inside the last minutes.
+        let pool = SwitchPool::new(origin_client());
+        pool.upsert_with_deadline(
+            &node("edge", Ownership::Rented, 250, 0),
+            client("edge"),
+            Some(now + PLACEMENT_DEADLINE_GUARD),
+        )
+        .await;
+        carry(&pool, &["edge"], "s1").await;
+        assert!(pool.assign_fanout_node_at(&s1, now).await.is_none());
+
+        // A node with no deadline (not rented) is always eligible.
+        pool.upsert(&node("owned", Ownership::Leased, 250, 200), client("owned"))
+            .await;
+        carry(&pool, &["owned"], "s1").await;
+        let (picked, _) = pool.assign_fanout_node_at(&s1, now).await.expect("owned");
+        assert_eq!(picked.as_str(), "owned");
     }
 
     #[tokio::test]
@@ -500,6 +759,10 @@ mod stickiness_tests {
         let busy = client("busy");
         pool.upsert(&node("busy", 250, 200), busy.clone()).await;
         pool.upsert(&node("empty", 250, 0), client("empty")).await;
+        for id in ["busy", "empty"] {
+            pool.set_carried(&NodeId::new(id), HashSet::from(["s1".to_string()]))
+                .await;
+        }
         pool.bind_viewer(ViewerId::new("v1"), NodeId::new("busy")).await;
 
         // assign_fanout_node would pick `empty`...

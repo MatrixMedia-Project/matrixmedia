@@ -196,6 +196,7 @@ impl Harness {
                 media_type,
                 Some("sfu-wire"),
                 None,
+                "core",
             )
             .await
             .expect("stream")

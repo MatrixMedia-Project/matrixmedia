@@ -14,6 +14,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use mm_core::config::{Config, FleetMode};
 use mm_core::config_handle::ConfigHandle;
+use mm_core::fleet::NodeId;
 use mm_core::switch_client::{SwitchClient, switch_source_id, switch_viewer_id};
 use mm_core::types::{RoomId, StreamId, StreamStatus, UserId};
 use mm_db::test_support::require_or_try_pool as try_pool;
@@ -253,6 +254,16 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
     assert!(to_b.is_empty(), "b waits a tick: {to_b:?}");
     assert_eq!(from_entry(&to_a, &to_b), 1, "the origin feeds exactly one relay");
     assert_eq!(feeds(&db, &b1).await, vec![(node_a.clone(), None, 1)]);
+    // Placement: the census's people count is recorded, and a source just created has no
+    // picture yet, so no relay is offered to a viewer.
+    let stream = StreamId(b1.clone());
+    let (id_a, id_b) = (NodeId::new(&node_a), NodeId::new(&node_b));
+    assert_eq!(pool.viewers_of(&stream).await, Some(1));
+    assert!(
+        pool.carried_by(&id_a).await.is_empty(),
+        "just created: not carried yet"
+    );
+    assert!(pool.assign_fanout_node(&stream).await.is_none());
 
     // Pass 2: b joins under the stored a; a is seeded again with the same origin (409).
     mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
@@ -267,6 +278,15 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
     let seed_b = calls_b.lock().await.seeds[0].clone();
     assert_eq!(seed_b["relay_node_id"], json!(node_b));
     assert_eq!(from_entry(&to_a, &to_b), 1, "still exactly one relay pulls from the entry");
+    assert_eq!(
+        pool.carried_by(&id_a).await,
+        HashSet::from([b1.clone()]),
+        "a's source read active: a carries the stream"
+    );
+    assert!(
+        pool.carried_by(&id_b).await.is_empty(),
+        "b's was just created"
+    );
     assert_eq!(
         feeds(&db, &b1).await,
         vec![
@@ -285,6 +305,30 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
     );
     assert_eq!(removals_of(&calls_a, &source).await, 0);
     assert_eq!(removals_of(&calls_b, &source).await, 0);
+    assert_eq!(pool.carried_by(&id_b).await, HashSet::from([b1.clone()]));
+    let (picked, _) = pool
+        .assign_fanout_node(&stream)
+        .await
+        .expect("both carry b1");
+    assert_eq!(picked, id_a, "equal headroom: the lowest id");
+
+    // Pass 2c: a is rented and 6 minutes from its destroy deadline. It still carries the
+    // stream, but takes no new viewers: b does.
+    sqlx::query(
+        "UPDATE mm_fleet_nodes SET ownership = 'rented', destroy_deadline = now() + interval '6 minutes'
+          WHERE mm_node_id = $1",
+    )
+    .bind(&node_a)
+    .execute(&db)
+    .await
+    .expect("rent a");
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    assert_eq!(pool.carried_by(&id_a).await, HashSet::from([b1.clone()]));
+    let (picked, _) = pool
+        .assign_fanout_node(&stream)
+        .await
+        .expect("b carries b1");
+    assert_eq!(picked, id_b, "a relay in its last minutes is not offered");
 
     // Pass 3: a starts draining, so it leaves the relay list while it may still serve b.
     sqlx::query("UPDATE mm_fleet_nodes SET state = 'draining' WHERE mm_node_id = $1")
@@ -307,6 +351,10 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
         seeded_from(&calls_b, &source).await.last(),
         Some(&json!(origin_url)),
         "b is ensured against its fallback, the entry"
+    );
+    assert!(
+        pool.carried_by(&id_a).await.is_empty(),
+        "evicted: a carries nothing"
     );
     assert_eq!(
         feeds(&db, &b1).await,
@@ -520,6 +568,7 @@ async fn seed_active_stream(pool: &sqlx::PgPool) -> String {
         "video",
         None,
         None,
+        "core",
     )
     .await
     .expect("create stream")

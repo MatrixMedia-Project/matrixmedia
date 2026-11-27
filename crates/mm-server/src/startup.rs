@@ -1115,18 +1115,32 @@ pub async fn run(
                                 // With no census it sizes from no demand, which orders nothing
                                 // and retires nothing a previous tick wanted (those were just
                                 // extended a full lease window ahead); only growth waits.
+                                // Only streams whose stored state uses relays count, whatever
+                                // fleet.media_path says now (a stream keeps the state it started
+                                // in); with the states unreadable it sizes from no demand, the
+                                // same way.
+                                let stream_viewers = match census {
+                                    Some(live) => {
+                                        use mm_fleet::pool_autoscale::{live_media_paths, relay_stream_viewers};
+                                        match live_media_paths(&pool_db).await {
+                                            Ok(stored) => relay_stream_viewers(&live, &stored),
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "relay pool: reading the streams' media paths failed: {e}"
+                                                );
+                                                Vec::new()
+                                            }
+                                        }
+                                    }
+                                    None => Vec::new(),
+                                };
                                 let pool_inputs = mm_fleet::pool_autoscale::PoolInputs {
-                                    path: cfg.fleet.media_path,
                                     mode: cfg.fleet.mode,
                                     threshold: cfg.fleet.relay_viewer_threshold,
                                     ceiling: cfg.fleet.max_relay_nodes,
                                     capacity_per_node: pool_capacity_per_node,
                                     region: cfg.fleet.default_region.clone(),
-                                    stream_viewers: census
-                                        .unwrap_or_default()
-                                        .iter()
-                                        .map(|b| b.viewers)
-                                        .collect(),
+                                    stream_viewers,
                                 };
                                 match mm_fleet::pool_autoscale::tick(&pool_db, &pool_inputs, chrono::Utc::now())
                                     .await

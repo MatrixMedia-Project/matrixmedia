@@ -72,7 +72,15 @@ async fn fixture(pool: &PgPool, test: &str) -> Fixture {
     let host = UserId(format!("@host-{tag}:hs"));
     let row = db.get_or_create_room(&room).await.expect("create room");
     let stream = db
-        .create_stream(row.id, &host, Some("private broadcast"), "video", None, None)
+        .create_stream(
+            row.id,
+            &host,
+            Some("private broadcast"),
+            "video",
+            None,
+            None,
+            "core",
+        )
         .await
         .expect("create stream");
 

@@ -26,14 +26,19 @@
 //! internet and leaked which Matrix users were watching which stream (FR-349b).
 //! Here it is a Matrix-authenticated, per-stream count: no ids leave the server.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use mm_core::config::MediaPath;
 use mm_core::error::{ErrorCode, ErrorResponse, MMError};
-use mm_core::switch_client::{SwitchViewer, is_cascade_session};
+use mm_core::fleet::NodeId;
+use mm_core::fleet::media_path::{ViewerTarget, effective, viewer_target};
+use mm_core::switch_client::{SwitchClient, SwitchViewer, is_cascade_session};
 use mm_core::types::{StreamId, UserId};
 use mm_db::models::Stream;
 
@@ -41,17 +46,58 @@ use crate::client::ViewerGate;
 use crate::error::ApiError;
 use crate::middleware::AuthUser;
 use crate::state::SharedState;
+use crate::switch_pool::SwitchPool;
 
 /// Token lifetime for one proxied offer. Short because it is used immediately and
 /// once — the offer is forwarded within the same request.
 const VIEWER_TOKEN_TTL_SECS: u64 = 60;
 
-/// Is the S1 proxy (FR-346) in effect? Its flag AND the switch auth secret: the
-/// proxy mints a per-request viewer token, and forwarding an UNBOUND offer would
-/// place a viewer on a node with no identity at all. Read from the config the
-/// caller holds for this request, so it always agrees with what is running.
+/// Is the S1 proxy (FR-346) in effect? Its flag, or a media path that is not `core`
+/// (relays are reached only through the proxy, so a relay path turns it on), AND the
+/// switch auth secret: the proxy mints a per-request viewer token, and forwarding an
+/// UNBOUND offer would place a viewer on a node with no identity at all. A secret that
+/// is empty or only whitespace is not set. Read from the config the caller holds for
+/// this request, so it always agrees with what is running.
 pub fn proxy_enabled(cfg: &mm_core::config::Config) -> bool {
-    cfg.fleet.proxy_viewers && cfg.advertising.switch_auth_secret_opt().is_some()
+    let relay_path = effective(cfg.fleet.media_path, cfg.fleet.mode) != MediaPath::Core;
+    (cfg.fleet.proxy_viewers || relay_path) && !cfg.advertising.switch_auth_secret.trim().is_empty()
+}
+
+/// Where a new offer of `viewer` on `stream` goes: `Some(node)` for a relay, `None` for
+/// the origin.
+///
+/// A viewer who already has a node keeps it (see the STICKY note in
+/// [`proxy_viewer_offer`]). Otherwise the stream's stored state (`stream_path`, fixed when
+/// it started) decides through [`viewer_target`], with the live `fleet.mode` and
+/// `fleet.relay_viewer_threshold` and the stream's audience at the last census: `Relay`
+/// takes a relay that carries the stream ([`SwitchPool::assign_fanout_node`]) or falls
+/// back to the origin; `Core` is the origin. So under state `core` relays are never used
+/// for placement, even with `fleet.proxy_viewers` on and relays leased.
+pub async fn place_viewer(
+    pool: &SwitchPool,
+    cfg: &mm_core::config::Config,
+    stream: &StreamId,
+    stream_path: MediaPath,
+    viewer: &mm_core::fleet::ViewerId,
+) -> (Option<NodeId>, Arc<SwitchClient>) {
+    if let Some(node) = pool.node_of_viewer(viewer).await
+        && let Some(client) = pool.client_for_node(Some(&node)).await
+    {
+        return (Some(node), client);
+    }
+    let target = viewer_target(
+        stream_path,
+        cfg.fleet.mode,
+        pool.viewers_of(stream).await,
+        cfg.fleet.relay_viewer_threshold,
+    );
+    match target {
+        ViewerTarget::Relay => match pool.assign_fanout_node(stream).await {
+            Some((node, client)) => (Some(node), client),
+            None => (None, pool.origin()),
+        },
+        ViewerTarget::Core => (None, pool.origin()),
+    }
 }
 
 /// What `switch_url` the join response should hand a client.
@@ -439,21 +485,10 @@ async fn proxy_viewer_offer(
     // they have none. Deliberately moving a viewer between nodes is
     // make-before-break (FR-322), an explicit mechanism, not a side effect of
     // re-offering.
-    let existing = match pool.node_of_viewer(&viewer).await {
-        Some(node) => pool
-            .client_for_node(Some(&node))
-            .await
-            .map(|client| (Some(node), client)),
-        None => None,
-    };
-
-    let (node_id, client) = match existing {
-        Some(pair) => pair,
-        None => match pool.assign_fanout_node(&stream_id).await {
-            Some((node_id, client)) => (Some(node_id), client),
-            None => (None, pool.origin()),
-        },
-    };
+    //
+    // A viewer with no node is placed by the stream's stored media path state.
+    let stream_path = MediaPath::parse(&stream.media_path).unwrap_or(MediaPath::Core);
+    let (node_id, client) = place_viewer(&pool, &cfg, &stream_id, stream_path, &viewer).await;
 
     // Bind before forwarding, so an ad switch racing this request resolves to the
     // same node (FR-405) instead of falling back to the origin.
@@ -709,6 +744,32 @@ mod tests {
         assert_eq!(unwrap_node_answer(flat.clone()), flat);
     }
 
+    #[test]
+    fn the_proxy_is_on_whenever_the_state_is_not_core() {
+        use mm_core::config::FleetMode;
+        let mut cfg = mm_core::config::Config::default();
+        cfg.fleet.proxy_viewers = false;
+        cfg.fleet.media_path = MediaPath::RelayAfterThreshold;
+        cfg.fleet.mode = FleetMode::On;
+        cfg.advertising.switch_auth_secret = "s3cret".into();
+        assert!(
+            proxy_enabled(&cfg),
+            "a relay path needs the proxy: relays are reached through it"
+        );
+
+        cfg.fleet.mode = FleetMode::Frozen;
+        assert!(
+            !proxy_enabled(&cfg),
+            "frozen makes the path core, and the flag is off"
+        );
+
+        cfg.fleet.mode = FleetMode::On;
+        cfg.advertising.switch_auth_secret = String::new();
+        assert!(!proxy_enabled(&cfg), "no secret: the proxy must stay off");
+        cfg.advertising.switch_auth_secret = "  \n".into();
+        assert!(!proxy_enabled(&cfg), "a whitespace-only secret is not set");
+    }
+
     /// FR-346 needs a secret: the proxy mints a per-request viewer token, and an
     /// UNBOUND offer would place a viewer on a node with no identity. So the flag
     /// alone does not enable it — and the rule is applied where the join reads the
@@ -785,6 +846,126 @@ mod tests {
         // The token is minted and used inside one request. A long TTL would turn a
         // logged or cached header into a reusable credential for that viewer id.
         assert!(VIEWER_TOKEN_TTL_SECS <= 300);
+    }
+
+    fn relay(id: &str) -> mm_core::fleet::FleetNode {
+        mm_core::fleet::FleetNode {
+            id: NodeId::new(id),
+            flavor: mm_core::fleet::NodeFlavor::Fanout,
+            ownership: mm_core::fleet::Ownership::Leased,
+            state: mm_core::fleet::NodeState::Healthy,
+            viewer_capacity: 250,
+            viewers_current: 0,
+            funding: mm_core::fleet::funding::Funding::Operator,
+        }
+    }
+
+    /// A pool whose relay `r1` carries stream `s1`, which 500 people watch.
+    async fn pool_with_a_carrier() -> SwitchPool {
+        let pool = SwitchPool::new(Arc::new(SwitchClient::new("http://origin.invalid:7890")));
+        pool.upsert(
+            &relay("r1"),
+            Arc::new(SwitchClient::new("http://r1.invalid:7890")),
+        )
+        .await;
+        pool.set_carried(
+            &NodeId::new("r1"),
+            std::collections::HashSet::from(["s1".to_string()]),
+        )
+        .await;
+        pool.set_stream_viewers(std::collections::HashMap::from([("s1".to_string(), 500)]))
+            .await;
+        pool
+    }
+
+    fn fleet_on(threshold: u32) -> mm_core::config::Config {
+        let mut cfg = mm_core::config::Config::default();
+        cfg.fleet.mode = mm_core::config::FleetMode::On;
+        cfg.fleet.relay_viewer_threshold = threshold;
+        cfg.advertising.switch_auth_secret = "s3cret".into();
+        cfg
+    }
+
+    async fn placed(
+        pool: &SwitchPool,
+        cfg: &mm_core::config::Config,
+        stream: &str,
+        path: MediaPath,
+        viewer: &str,
+    ) -> Option<String> {
+        place_viewer(
+            pool,
+            cfg,
+            &StreamId(stream.into()),
+            path,
+            &mm_core::fleet::ViewerId::new(viewer),
+        )
+        .await
+        .0
+        .map(|n| n.as_str().to_string())
+    }
+
+    /// Design C14: under state `core` relays are not used for placement, even with
+    /// `fleet.proxy_viewers` on, relays leased and carrying the stream, and the audience
+    /// far past the threshold.
+    #[tokio::test]
+    async fn state_core_means_the_core_only() {
+        let pool = pool_with_a_carrier().await;
+        let mut cfg = fleet_on(50);
+        cfg.fleet.proxy_viewers = true;
+        cfg.fleet.media_path = MediaPath::RelayAfterThreshold; // the setting today
+        assert!(proxy_enabled(&cfg));
+        assert_eq!(placed(&pool, &cfg, "s1", MediaPath::Core, "v1").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_relayed_stream_past_its_threshold_sends_new_viewers_to_a_carrier() {
+        let pool = pool_with_a_carrier().await;
+        let path = MediaPath::RelayAfterThreshold;
+
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", path, "v1")
+                .await
+                .as_deref(),
+            Some("r1")
+        );
+        // A stored relay_entry is served as relay_after_threshold.
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", MediaPath::RelayEntry, "v2")
+                .await
+                .as_deref(),
+            Some("r1")
+        );
+        // Below the threshold: the core.
+        assert_eq!(placed(&pool, &fleet_on(501), "s1", path, "v3").await, None);
+        // The fleet not on: the core, whatever the stored state.
+        let mut frozen = fleet_on(50);
+        frozen.fleet.mode = mm_core::config::FleetMode::Frozen;
+        assert_eq!(placed(&pool, &frozen, "s1", path, "v4").await, None);
+        // Nobody carries s2, though it is past its threshold: the core.
+        pool.set_stream_viewers(std::collections::HashMap::from([
+            ("s1".to_string(), 500),
+            ("s2".to_string(), 500),
+        ]))
+        .await;
+        assert_eq!(placed(&pool, &fleet_on(50), "s2", path, "v5").await, None);
+        // A stream the census did not list has an unknown audience: the core.
+        assert_eq!(placed(&pool, &fleet_on(50), "s3", path, "v6").await, None);
+    }
+
+    /// Nobody already watching is moved: a viewer bound to a relay keeps it, even when
+    /// the stream would now place a new viewer on the core.
+    #[tokio::test]
+    async fn a_bound_viewer_keeps_its_node() {
+        let pool = pool_with_a_carrier().await;
+        pool.bind_viewer(mm_core::fleet::ViewerId::new("v1"), NodeId::new("r1"))
+            .await;
+        assert_eq!(
+            placed(&pool, &fleet_on(50), "s1", MediaPath::Core, "v1")
+                .await
+                .as_deref(),
+            Some("r1")
+        );
     }
 
     /// The count the apps show must agree with the census: a relay pulling the

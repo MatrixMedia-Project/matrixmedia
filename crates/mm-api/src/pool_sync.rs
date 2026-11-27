@@ -105,12 +105,14 @@ pub fn sync_actions(db_nodes: &[FleetNode], pool_nodes: &[NodeId]) -> SyncAction
 /// plus the address that `load_nodes` (`mm_fleet::desired::DesiredStore`)
 /// deliberately omits — that method serves the sweepers, which never need to
 /// dial a node, so it was never taught to read `public_ip` — and the node's
-/// zone and region, which choose its feeder in the relay tree.
+/// zone and region, which choose its feeder in the relay tree, and its destroy deadline,
+/// which keeps new viewers off it in its last minutes.
 struct FanoutRow {
     node: FleetNode,
     public_ip: Option<String>,
     zone: Option<String>,
     region: Option<String>,
+    destroy_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn load_fanout_rows(db: &PgPool) -> Result<Vec<FanoutRow>, String> {
@@ -125,10 +127,12 @@ async fn load_fanout_rows(db: &PgPool) -> Result<Vec<FanoutRow>, String> {
         String,         // funding
         Option<String>, // provider zone
         Option<String>, // that zone's region
+        Option<chrono::DateTime<chrono::Utc>>, // destroy_deadline (rented nodes only)
     );
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT n.mm_node_id, n.flavor, n.ownership, n.state, host(n.public_ip)::text,
-                n.viewer_capacity, n.viewers_current, n.funding, n.provider_zone, z.region
+                n.viewer_capacity, n.viewers_current, n.funding, n.provider_zone, z.region,
+                n.destroy_deadline
            FROM mm_fleet_nodes n
            LEFT JOIN mm_fleet_provider_zones z
                   ON z.provider_id = n.provider_ref AND z.zone = n.provider_zone
@@ -141,7 +145,19 @@ async fn load_fanout_rows(db: &PgPool) -> Result<Vec<FanoutRow>, String> {
     Ok(rows
         .into_iter()
         .filter_map(
-            |(id, flavor, ownership, state, public_ip, cap, cur, funding, zone, region)| {
+            |(
+                id,
+                flavor,
+                ownership,
+                state,
+                public_ip,
+                cap,
+                cur,
+                funding,
+                zone,
+                region,
+                deadline,
+            )| {
                 Some(FanoutRow {
                     node: FleetNode {
                         id: NodeId::new(id),
@@ -155,6 +171,7 @@ async fn load_fanout_rows(db: &PgPool) -> Result<Vec<FanoutRow>, String> {
                     public_ip,
                     zone,
                     region,
+                    destroy_deadline: deadline,
                 })
             },
         )
@@ -489,12 +506,12 @@ fn row_to_write(kind: Ensure, planned: &FeedRow, seeded: Seeded) -> Option<FeedR
             depth: if planned.feeder.is_none() { 1 } else { planned.depth },
             ..planned.clone()
         }),
-        Seeded::AlreadyThere if kind == Ensure::Add => Some(FeedRow {
+        Seeded::AlreadyThere(_) if kind == Ensure::Add => Some(FeedRow {
             feeder: None,
             depth: MAX_RELAY_DEPTH,
             ..planned.clone()
         }),
-        Seeded::AlreadyThere | Seeded::Failed => None,
+        Seeded::AlreadyThere(_) | Seeded::Failed => None,
     }
 }
 
@@ -664,10 +681,54 @@ enum Seeded {
     /// created it again, pulling from the URL given.
     Recreated,
     /// The source is there and was left as it is (alive, or not dead for long enough),
-    /// still pulling from wherever it was created to pull from.
-    AlreadyThere,
+    /// still pulling from wherever it was created to pull from; with what the relay's
+    /// source list said about it.
+    AlreadyThere(Liveness),
     /// The relay could not be made to hold the source this tick.
     Failed,
+}
+
+/// What a relay's source list said about a source that was already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// Listed active: the relay has the picture.
+    Active,
+    /// Not active (no track yet, or dead and not yet past the grace period, or about to
+    /// be re-created): no picture.
+    NotActive,
+    /// The source list could not be read this tick.
+    Unread,
+}
+
+/// The streams a relay carries after this tick's ensure, for viewer placement
+/// ([`SwitchPool::set_carried`]). `ensured` are the streams the relay's job was to ensure,
+/// `seeded` what each seed reported (a stream is missing when its job ran out of budget
+/// first), `before` what the relay carried after the last tick.
+///
+/// A stream is carried when its source read active. One just created or re-created has no
+/// picture until it reads active (normally on the next tick); one inactive, or whose seed
+/// failed, is not carried; one whose state could not be read this tick keeps last tick's
+/// answer. A stream the relay was not to ensure (removed, or no longer planned there) is
+/// not carried: a feed row alone records where a source pulls from, not a picture.
+fn carried_after(
+    ensured: &[String],
+    seeded: &HashMap<String, Seeded>,
+    before: &HashSet<String>,
+) -> HashSet<String> {
+    ensured
+        .iter()
+        .filter(|stream| match seeded.get(*stream) {
+            Some(Seeded::AlreadyThere(Liveness::Active)) => true,
+            Some(Seeded::AlreadyThere(Liveness::Unread)) | None => before.contains(*stream),
+            Some(
+                Seeded::AlreadyThere(Liveness::NotActive)
+                | Seeded::Created
+                | Seeded::Recreated
+                | Seeded::Failed,
+            ) => false,
+        })
+        .cloned()
+        .collect()
 }
 
 
@@ -715,14 +776,14 @@ async fn reconcile_existing_cascade_source(
                 error = %e,
                 "cascade seed: could not check source liveness this tick"
             );
-            return Seeded::AlreadyThere;
+            return Seeded::AlreadyThere(Liveness::Unread);
         }
     };
     let active = sources.iter().any(|s| s.id == source_id && s.active);
 
     if active {
         inactive.lock().await.remove(&key);
-        return Seeded::AlreadyThere;
+        return Seeded::AlreadyThere(Liveness::Active);
     }
 
     let now = Instant::now();
@@ -732,7 +793,7 @@ async fn reconcile_existing_cascade_source(
     drop(guard);
 
     if dead_for < INACTIVE_GRACE {
-        return Seeded::AlreadyThere;
+        return Seeded::AlreadyThere(Liveness::NotActive);
     }
 
     tracing::warn!(
@@ -749,7 +810,7 @@ async fn reconcile_existing_cascade_source(
             error = %e,
             "cascade seed: removing a dead source before re-seeding failed"
         );
-        return Seeded::AlreadyThere;
+        return Seeded::AlreadyThere(Liveness::NotActive);
     }
     inactive.lock().await.remove(&key);
 
@@ -759,8 +820,8 @@ async fn reconcile_existing_cascade_source(
     {
         Ok(CascadeSeedOutcome::Created) => Seeded::Recreated,
         // Someone else's seed got there between our removal and this one: whatever it
-        // pulls from, it was not this call's doing.
-        Ok(CascadeSeedOutcome::AlreadyExists) => Seeded::AlreadyThere,
+        // pulls from, it was not this call's doing. Just created, it has no picture yet.
+        Ok(CascadeSeedOutcome::AlreadyExists) => Seeded::AlreadyThere(Liveness::NotActive),
         Ok(CascadeSeedOutcome::Unauthorized) => {
             tracing::warn!(
                 relay = %relay_node_id,
@@ -902,7 +963,8 @@ pub async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, ctx: &PoolSyncContex
             Some(secret) => Arc::new(SwitchClient::with_auth(&base_url, secret.to_string())),
             None => Arc::new(SwitchClient::new(&base_url)),
         };
-        pool.upsert(node, client).await;
+        pool.upsert_with_deadline(node, client, row.destroy_deadline)
+            .await;
         upserted.push((row, base_url));
     }
 
@@ -923,6 +985,15 @@ pub async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, ctx: &PoolSyncContex
     if let Err(e) = nodes_db::update_viewers_current(db, &viewer_counts).await {
         tracing::warn!("pool sync: writing back viewers_current failed: {e}");
     }
+    // Viewer placement reads each stream's audience from here: people only, never relay
+    // links (the census's per-stream counts).
+    pool.set_stream_viewers(
+        pass.live
+            .iter()
+            .map(|b| (b.broadcast_id.clone(), b.viewers))
+            .collect(),
+    )
+    .await;
 
     let Some(secret) = ctx.switch_secret.as_deref() else {
         return;
@@ -1018,6 +1089,21 @@ async fn feed_relays(
             .push((row.clone(), kind, origin_url));
     }
 
+    // What each relay was to ensure, and what each seed reported, for placement below.
+    let ensured: HashMap<NodeId, Vec<String>> = work
+        .iter()
+        .map(|(id, job)| {
+            (
+                id.clone(),
+                job.ensure
+                    .iter()
+                    .map(|(r, _, _)| r.stream_id.clone())
+                    .collect(),
+            )
+        })
+        .collect();
+    let seeded: SeedReports = Arc::default();
+
     let mut relay_jobs = Vec::new();
     for (node_id, job) in work {
         let Some(client) = pool.client_for_node(Some(&node_id)).await else {
@@ -1026,7 +1112,8 @@ async fn feed_relays(
         let db = db.clone();
         let secret = secret.to_string();
         let relay_id = node_id.clone();
-        let fut = async move { job.run(&client, &db, &relay_id, &secret).await };
+        let reports = seeded.clone();
+        let fut = async move { job.run(&client, &db, &relay_id, &secret, &reports).await };
         relay_jobs.push((node_id, fut));
     }
     for relay_id in seed_relays_within_budget(relay_jobs, SEED_BUDGET_PER_RELAY).await {
@@ -1037,7 +1124,28 @@ async fn feed_relays(
              relay's work; every step is idempotent and the next tick retries"
         );
     }
+
+    // Which streams each relay now has the picture of. A relay the census could not reach
+    // keeps what it had: one timeout does not take it away from viewer placement.
+    let seeded = std::mem::take(&mut *seeded.lock().unwrap_or_else(|e| e.into_inner()));
+    for relay in relays {
+        if pass.unanswered.contains(&relay.id) {
+            continue;
+        }
+        let to_ensure = ensured
+            .get(&relay.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let reported = seeded.get(&relay.id).cloned().unwrap_or_default();
+        let before = pool.carried_by(&relay.id).await;
+        pool.set_carried(&relay.id, carried_after(to_ensure, &reported, &before))
+            .await;
+    }
 }
+
+/// Each relay's seed reports this tick: (relay, stream) → what the seed did. Written as each
+/// seed returns, so a relay that runs out of budget still reports the seeds it finished.
+type SeedReports = Arc<std::sync::Mutex<HashMap<NodeId, HashMap<String, Seeded>>>>;
 
 /// One relay's share of a tick's [`FeedPlan`]: removals first, then every row that
 /// stays is ensured.
@@ -1057,7 +1165,14 @@ struct NodeFeedWork {
 }
 
 impl NodeFeedWork {
-    async fn run(self, client: &SwitchClient, db: &PgPool, relay_id: &NodeId, secret: &str) {
+    async fn run(
+        self,
+        client: &SwitchClient,
+        db: &PgPool,
+        relay_id: &NodeId,
+        secret: &str,
+        reports: &SeedReports,
+    ) {
         let relay_base_url = client.base_url().to_string();
 
         // Only rows nobody can be watching through reach this list (see `FeedPlan`).
@@ -1097,6 +1212,12 @@ impl NodeFeedWork {
             if let Some(written) = row_to_write(kind, &row, seeded) {
                 write_feed_row(db, &written).await;
             }
+            reports
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(relay_id.clone())
+                .or_default()
+                .insert(row.stream_id.clone(), seeded);
         }
     }
 }
@@ -1121,15 +1242,9 @@ async fn load_feed_rows(db: &PgPool) -> Result<Vec<FeedRow>, String> {
 
 /// The stored state of every active stream. An unreadable value reads as `core`.
 async fn load_live_media_paths(db: &PgPool) -> Result<HashMap<String, MediaPath>, String> {
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, media_path FROM mm_streams WHERE status = 'active'")
-            .fetch_all(db)
-            .await
-            .map_err(|e| format!("reading the streams' media paths failed: {e}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, path)| (id, MediaPath::parse(&path).unwrap_or(MediaPath::Core)))
-        .collect())
+    mm_fleet::pool_autoscale::live_media_paths(db)
+        .await
+        .map_err(|e| format!("reading the streams' media paths failed: {e}"))
 }
 
 /// Record where a relay's source now pulls from, after a seed created or re-created it.
@@ -2024,14 +2139,29 @@ mod tests {
         // An add whose seed finds the source already there: adopted as a leaf of unknown
         // origin. Created or re-created: the row as planned.
         assert_eq!(
-            row_to_write(Ensure::Add, &planned, Seeded::AlreadyThere),
+            row_to_write(
+                Ensure::Add,
+                &planned,
+                Seeded::AlreadyThere(Liveness::Active)
+            ),
             Some(feed("x", None, MAX_RELAY_DEPTH))
         );
+        // Whatever the source list said: an add that finds its source is adopted.
+        for liveness in [Liveness::NotActive, Liveness::Unread] {
+            assert_eq!(
+                row_to_write(Ensure::Add, &planned, Seeded::AlreadyThere(liveness)),
+                Some(feed("x", None, MAX_RELAY_DEPTH))
+            );
+            assert_eq!(
+                row_to_write(Ensure::Stored, &planned, Seeded::AlreadyThere(liveness)),
+                None
+            );
+        }
         assert_eq!(row_to_write(Ensure::Add, &planned, Seeded::Created), Some(planned.clone()));
         assert_eq!(row_to_write(Ensure::Add, &planned, Seeded::Recreated), Some(planned.clone()));
         assert_eq!(row_to_write(Ensure::Add, &planned, Seeded::Failed), None);
         // A stored row or a fallback that finds its source alive writes nothing.
-        assert_eq!(row_to_write(Ensure::Stored, &planned, Seeded::AlreadyThere), None);
+        assert_eq!(row_to_write(Ensure::Stored, &planned, Seeded::AlreadyThere(Liveness::Active)), None);
         assert_eq!(row_to_write(Ensure::Stored, &planned, Seeded::Created), Some(planned.clone()));
         // A leaf re-created from the entry is at depth 1.
         let leaf = feed("x", None, MAX_RELAY_DEPTH);
@@ -2232,13 +2362,13 @@ mod tests {
 
         // There and alive: already there, nothing replaced.
         let got = seed_cascade_source(&client, &url, &relay_id, "http://fallback", "s", "b1", &tracker).await;
-        assert_eq!(got, Seeded::AlreadyThere);
+        assert_eq!(got, Seeded::AlreadyThere(Liveness::Active));
 
-        // There, inactive, but inside the grace period: already there.
+        // There, inactive, but inside the grace period: already there, not active.
         let (url, origins) = seed_relay(&[&source], false).await;
         let client = SwitchClient::with_auth(&url, "s".to_string());
         let got = seed_cascade_source(&client, &url, &relay_id, "http://fallback", "s", "b1", &tracker).await;
-        assert_eq!(got, Seeded::AlreadyThere);
+        assert_eq!(got, Seeded::AlreadyThere(Liveness::NotActive));
 
         // Inactive past the grace period: removed and re-created from the URL passed in.
         tracker.lock().await.insert(
@@ -2252,6 +2382,106 @@ mod tests {
             Some("http://fallback"),
             "the replacement pulls from the URL the caller passed: the row's fallback"
         );
+    }
+
+    /// The seed's source list cannot be read: already there, liveness unread.
+    #[tokio::test]
+    async fn a_source_list_that_cannot_be_read_reports_unread() {
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use serde_json::json;
+
+        let app = Router::new()
+            .route(
+                "/api/sources",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/api/sources/cascade",
+                post(|| async { StatusCode::CONFLICT }),
+            )
+            .route(
+                "/api/sources/{id}/cascade-token",
+                post(|| async { Json(json!({ "ok": "true" })) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let client = SwitchClient::with_auth(&url, "s".to_string());
+        let tracker: InactiveTracker = AsyncMutex::new(HashMap::new());
+        let got = seed_cascade_source(
+            &client,
+            &url,
+            &NodeId::new("r1"),
+            "http://f",
+            "s",
+            "b1",
+            &tracker,
+        )
+        .await;
+        assert_eq!(got, Seeded::AlreadyThere(Liveness::Unread));
+    }
+
+    // ── What a relay carries for placement (carried_after) ──────────────────
+
+    #[test]
+    fn a_relay_carries_a_stream_only_once_its_source_reads_active() {
+        let streams =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| s.to_string()).collect() };
+        let set =
+            |names: &[&str]| -> HashSet<String> { names.iter().map(|s| s.to_string()).collect() };
+        let ensured = streams(&[
+            "active",
+            "created",
+            "recreated",
+            "inactive",
+            "failed",
+            "unread",
+            "unreached",
+        ]);
+        let seeded = HashMap::from([
+            ("active".to_string(), Seeded::AlreadyThere(Liveness::Active)),
+            ("created".to_string(), Seeded::Created),
+            ("recreated".to_string(), Seeded::Recreated),
+            (
+                "inactive".to_string(),
+                Seeded::AlreadyThere(Liveness::NotActive),
+            ),
+            ("failed".to_string(), Seeded::Failed),
+            ("unread".to_string(), Seeded::AlreadyThere(Liveness::Unread)),
+            // "unreached": the relay's budget ran out before its seed.
+        ]);
+
+        // Nothing carried before: only the active source counts.
+        assert_eq!(
+            carried_after(&ensured, &seeded, &set(&[])),
+            set(&["active"])
+        );
+
+        // Everything carried before: unread and unreached keep it, the rest lose it, and a
+        // stream the relay was not to ensure this tick (its row removed) is dropped.
+        let before = set(&[
+            "active",
+            "created",
+            "recreated",
+            "inactive",
+            "failed",
+            "unread",
+            "unreached",
+            "removed",
+        ]);
+        assert_eq!(
+            carried_after(&ensured, &seeded, &before),
+            set(&["active", "unread", "unreached"])
+        );
+
+        // A relay with nothing to ensure carries nothing.
+        assert!(carried_after(&[], &HashMap::new(), &before).is_empty());
     }
 
     #[test]

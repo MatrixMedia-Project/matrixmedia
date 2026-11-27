@@ -164,6 +164,7 @@ impl Harness {
                 "video",
                 Some("sfu"),
                 None,
+                "core",
             )
             .await
             .unwrap()

@@ -715,7 +715,15 @@ async fn an_admin_reads_one_stream_by_id() {
         .await
         .expect("room");
     let stream = db
-        .create_stream(room.id, &UserId("@host:localhost".into()), Some("Admin read"), "audio", None, None)
+        .create_stream(
+            room.id,
+            &UserId("@host:localhost".into()),
+            Some("Admin read"),
+            "audio",
+            None,
+            None,
+            "core",
+        )
         .await
         .expect("stream");
     // `Route` paths are &'static str; a test can afford to leak one.

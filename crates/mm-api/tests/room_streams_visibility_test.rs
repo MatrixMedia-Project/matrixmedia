@@ -110,14 +110,14 @@ async fn fixture(pool: &PgPool, test: &str) -> Fixture {
 
     let row = db.get_or_create_room(&room).await.expect("create room");
     let host_stream = db
-        .create_stream(row.id, &host, Some("host's"), "video", None, None)
+        .create_stream(row.id, &host, Some("host's"), "video", None, None, "core")
         .await
         .expect("host stream");
     db.end_stream_if_active(&mm_core::types::StreamId(host_stream.id.clone()))
         .await
         .expect("end host stream");
     let guest_stream = db
-        .create_stream(row.id, &guest, Some("guest's"), "video", None, None)
+        .create_stream(row.id, &guest, Some("guest's"), "video", None, None, "core")
         .await
         .expect("guest stream");
 
@@ -252,7 +252,7 @@ async fn synapse_is_not_asked_when_membership_cannot_change_the_answer() {
     let row = f.db.get_or_create_room(&solo_room).await.unwrap();
     let solo = f
         .db
-        .create_stream(row.id, &solo_host, None, "video", None, None)
+        .create_stream(row.id, &solo_host, None, "video", None, None, "core")
         .await
         .unwrap();
     let own = room_streams_visible_to(

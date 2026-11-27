@@ -682,6 +682,10 @@ pub trait Database: Send + Sync + 'static {
     ///
     /// `min_tier_level` (V026): `None` = free / no gate; `Some(n)` =
     /// requires an active subscription at level >= n to view.
+    ///
+    /// `media_path` (V066): the media path state the stream is fixed in
+    /// (`"core"`, `"relay_after_threshold"` or `"relay_entry"`), stored once here.
+    #[allow(clippy::too_many_arguments)]
     async fn create_stream(
         &self,
         room_id: i64,
@@ -690,6 +694,7 @@ pub trait Database: Send + Sync + 'static {
         media_type: &str,
         sfu_room_id: Option<&str>,
         min_tier_level: Option<i32>,
+        media_path: &str,
     ) -> Result<Stream, MMError>;
 
     /// Persist the STARTED `com.matrixmedia.stream` state-event id on a

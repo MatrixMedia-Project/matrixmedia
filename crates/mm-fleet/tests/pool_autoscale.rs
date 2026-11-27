@@ -1,6 +1,7 @@
 //! PG-gated coverage for the pool tick: how many relays the media path orders, which leases it
 //! keeps rolling and which idle ones it lets go.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Duration, SubsecRound, Utc};
@@ -37,9 +38,8 @@ fn db_now() -> DateTime<Utc> {
     Utc::now().trunc_subsecs(6)
 }
 
-fn inputs(path: MediaPath, mode: FleetMode, ceiling: u32, stream_viewers: Vec<u32>) -> PoolInputs {
+fn inputs(mode: FleetMode, ceiling: u32, stream_viewers: Vec<u32>) -> PoolInputs {
     PoolInputs {
-        path,
         mode,
         threshold: 50,
         ceiling,
@@ -93,6 +93,8 @@ async fn one_pool_lease(pool: &PgPool, now: DateTime<Utc>) -> NodeId {
     ids.into_iter().next().expect("one id")
 }
 
+/// With no live stream in a relay state the demand is empty (`relay_stream_viewers` leaves
+/// out every `core` stream, however large), so nothing is wanted and no row is written.
 #[tokio::test]
 async fn the_core_state_orders_nothing() {
     let Some((pool, _g)) = setup().await else {
@@ -102,7 +104,7 @@ async fn the_core_state_orders_nothing() {
 
     let report = pool_autoscale::tick(
         &pool,
-        &inputs(MediaPath::Core, FleetMode::On, 3, vec![400]),
+        &inputs(FleetMode::On, 3, vec![]),
         db_now(),
     )
     .await
@@ -115,8 +117,54 @@ async fn the_core_state_orders_nothing() {
     assert_eq!(
         desired_count(&pool).await,
         0,
-        "the core state writes no row"
+        "no stream in a relay state writes no row"
     );
+}
+
+/// The pool follows the streams, not the current setting: a stream keeps the state it started
+/// in, so one stored as `relay_after_threshold` still orders a relay after the operator moved
+/// `fleet.media_path` to `core`, and one stored as `core` orders nothing under a
+/// `relay_after_threshold` setting. The tick does not read the setting at all; only the stored
+/// states (through `relay_stream_viewers`) decide.
+#[tokio::test]
+async fn the_pool_follows_the_stored_states_not_the_current_setting() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping the_pool_follows_the_stored_states_not_the_current_setting"
+        );
+        return;
+    };
+    let live = [mm_fleet::runner::LiveBroadcast {
+        broadcast_id: "s1".into(),
+        viewers: 400,
+    }];
+
+    // Started as relay_after_threshold; the setting is core now.
+    let stored = HashMap::from([("s1".to_string(), MediaPath::RelayAfterThreshold)]);
+    let demand = pool_autoscale::relay_stream_viewers(&live, &stored);
+    let report = pool_autoscale::tick(&pool, &inputs(FleetMode::On, 3, demand), db_now())
+        .await
+        .expect("tick");
+    assert_eq!(
+        report.wanted, 2,
+        "350 viewers past the threshold, 250 per node"
+    );
+    assert_eq!(report.created.len(), 2);
+
+    sqlx::query("DELETE FROM mm_fleet_desired")
+        .execute(&pool)
+        .await
+        .expect("wipe");
+
+    // Started as core; the setting is relay_after_threshold now.
+    let stored = HashMap::from([("s1".to_string(), MediaPath::Core)]);
+    let demand = pool_autoscale::relay_stream_viewers(&live, &stored);
+    let report = pool_autoscale::tick(&pool, &inputs(FleetMode::On, 3, demand), db_now())
+        .await
+        .expect("tick");
+    assert_eq!(report.wanted, 0);
+    assert!(report.created.is_empty());
+    assert_eq!(desired_count(&pool).await, 0);
 }
 
 #[tokio::test]
@@ -128,7 +176,6 @@ async fn the_threshold_state_orders_up_to_the_ceiling_and_no_more() {
         return;
     };
     let ins = inputs(
-        MediaPath::RelayAfterThreshold,
         FleetMode::On,
         1,
         vec![400, 400],
@@ -178,7 +225,6 @@ async fn a_frozen_fleet_orders_nothing_and_stops_extending() {
     let report = pool_autoscale::tick(
         &pool,
         &inputs(
-            MediaPath::RelayAfterThreshold,
             FleetMode::Frozen,
             3,
             vec![400, 400],
@@ -220,7 +266,7 @@ async fn a_frozen_fleet_still_extends_a_relay_with_viewers() {
 
     let report = pool_autoscale::tick(
         &pool,
-        &inputs(MediaPath::RelayAfterThreshold, FleetMode::Frozen, 3, vec![]),
+        &inputs(FleetMode::Frozen, 3, vec![]),
         now,
     )
     .await
@@ -250,7 +296,7 @@ async fn the_core_state_retires_an_idle_lease_near_its_deadline() {
 
     let report = pool_autoscale::tick(
         &pool,
-        &inputs(MediaPath::Core, FleetMode::On, 3, vec![400]),
+        &inputs(FleetMode::On, 3, vec![]),
         now,
     )
     .await
@@ -279,7 +325,6 @@ async fn two_concurrent_ticks_order_what_one_tick_would() {
     };
     // 350 + 350 viewers past the threshold, 250 per node: 3 nodes, the ceiling.
     let ins = inputs(
-        MediaPath::RelayAfterThreshold,
         FleetMode::On,
         3,
         vec![400, 400],

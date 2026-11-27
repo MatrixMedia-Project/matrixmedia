@@ -160,7 +160,15 @@ impl Fixture {
 
     async fn stream(&self, min_tier_level: Option<i32>) -> Stream {
         self.db
-            .create_stream(self.room_row, &self.host, Some("broadcast"), "video", None, min_tier_level)
+            .create_stream(
+                self.room_row,
+                &self.host,
+                Some("broadcast"),
+                "video",
+                None,
+                min_tier_level,
+                "core",
+            )
             .await
             .expect("create stream")
     }

@@ -406,6 +406,7 @@ async fn seed_active_stream(pool: &sqlx::PgPool) -> String {
         "video",
         None,
         None,
+        "core",
     )
     .await
     .expect("create stream")

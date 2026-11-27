@@ -186,13 +186,14 @@ impl Database for SqliteDatabase {
         media_type: &str,
         sfu_room_id: Option<&str>,
         min_tier_level: Option<i32>,
+        media_path: &str,
     ) -> Result<Stream, MMError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
-            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, started_at, sfu_room_id, min_tier_level)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 0, ?6, ?7, ?8)",
+            "INSERT INTO mm_streams (id, room_id, host_user_id, media_type, title, status, participant_count, started_at, sfu_room_id, min_tier_level, media_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 0, ?6, ?7, ?8, ?9)",
         )
         .bind(&id)
         .bind(room_id)
@@ -202,6 +203,7 @@ impl Database for SqliteDatabase {
         .bind(&now)
         .bind(sfu_room_id)
         .bind(min_tier_level)
+        .bind(media_path)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -1675,6 +1677,7 @@ mod tests {
                 "audio",
                 Some("mm-test-room"),
                 None,
+                "core",
             )
             .await
             .unwrap();
@@ -1819,6 +1822,7 @@ mod tests {
                 "video",
                 Some("mm-e2ee-room"),
                 None,
+                "core",
             )
             .await
             .unwrap();
@@ -1874,7 +1878,15 @@ mod tests {
 
         // Gated stream: min_tier_level = 2 persists and reads back.
         let gated = db
-            .create_stream(room.id, &host, Some("Insiders"), "video", None, Some(2))
+            .create_stream(
+                room.id,
+                &host,
+                Some("Insiders"),
+                "video",
+                None,
+                Some(2),
+                "core",
+            )
             .await
             .unwrap();
         assert_eq!(gated.min_tier_level, Some(2));
@@ -1897,7 +1909,7 @@ mod tests {
 
         // No gate → NULL = free, backwards compatible.
         let free = db
-            .create_stream(room.id, &host, Some("Open"), "audio", None, None)
+            .create_stream(room.id, &host, Some("Open"), "audio", None, None, "core")
             .await
             .unwrap();
         assert_eq!(free.min_tier_level, None);
@@ -1918,7 +1930,7 @@ mod tests {
             .unwrap();
         let host = UserId("@host:example.com".to_string());
         let stream = db
-            .create_stream(room.id, &host, Some("S"), "video", None, Some(3))
+            .create_stream(room.id, &host, Some("S"), "video", None, Some(3), "core")
             .await
             .unwrap();
 
@@ -1966,7 +1978,7 @@ mod tests {
                     .get_or_create_room(&RoomId(matrix_room_id.to_string()))
                     .await
                     .unwrap();
-                db.create_stream(room.id, &UserId(host.to_string()), None, "video", None, None)
+                db.create_stream(room.id, &UserId(host.to_string()), None, "video", None, None, "core")
                     .await
                     .unwrap()
             }

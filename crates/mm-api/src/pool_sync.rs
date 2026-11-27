@@ -1,27 +1,35 @@
 //! Pool-sync loop (relay fleet, Task 3): keeps [`SwitchPool`] in step with
-//! `mm_fleet_nodes`, and seeds a cascade source on every relay for every live
-//! broadcast.
+//! `mm_fleet_nodes`, and keeps the relay tree: which relay carries which stream,
+//! and which node feeds it.
 //!
-//! Two jobs, kept apart on purpose:
+//! The pure decisions, kept apart from the I/O on purpose:
 //!
-//! * [`sync_actions`] is the pure diff between what the database says exists and
-//!   what the pool already holds. It is the only part of this module worth
-//!   table-testing, because it is the only part with no I/O to mock.
-//! * [`run_pool_sync`] is the impure shell: it reads `mm_fleet_nodes`, calls
-//!   `sync_actions`, applies the result to the pool, and — for every relay the
-//!   diff just confirmed healthy — seeds one cascade source per live broadcast
-//!   so that relay's viewers can cascade from it (R2).
-use std::collections::{HashMap, HashSet};
+//! * [`sync_actions`] is the diff between what the database says exists and
+//!   what the pool already holds.
+//! * [`plan_feeds`] is the relay tree's diff: which feed rows
+//!   (`mm_fleet_relay_feeds`) to drop and which to add, each new relay fed by
+//!   the closest relay already carrying the stream (`feeder_for`) or by the
+//!   stream's entry.
+//!
+//! [`run_pool_sync`] is the impure shell: it reads `mm_fleet_nodes`, applies
+//! `sync_actions` to the pool, takes the census, and applies `plan_feeds` to
+//! the relays: an add seeds the cascade source pointing at its feeder (R2), a
+//! replacement re-points only the row, a removal (sent only where nobody can be
+//! watching) removes the source, and every row is seeded again on every tick.
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 
+use mm_core::config::{FleetMode, MediaPath};
+use mm_core::config_handle::ConfigHandle;
+use mm_core::fleet::media_path::{Carrier, Feeder, feeder_for, relay_wanted};
 use mm_core::fleet::{FleetNode, NodeFlavor, NodeId, NodeState};
 use mm_core::switch_client::{CascadeSeedOutcome, SwitchClient, mint_cascade_token, switch_source_id};
 use sqlx::PgPool;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::fleet_census::SwitchCensus;
+use crate::fleet_census::{CensusPass, SwitchCensus};
 use crate::switch_pool::SwitchPool;
 use mm_fleet::nodes_db;
 
@@ -95,9 +103,16 @@ pub fn sync_actions(db_nodes: &[FleetNode], pool_nodes: &[NodeId]) -> SyncAction
 /// One row of `mm_fleet_nodes`, as this loop needs it: `sync_actions`'s input
 /// plus the address that `load_nodes` (`mm_fleet::desired::DesiredStore`)
 /// deliberately omits — that method serves the sweepers, which never need to
-/// dial a node, so it was never taught to read `public_ip`. This loop is the
-/// first caller that does.
-async fn load_fanout_rows(db: &PgPool) -> Result<Vec<(FleetNode, Option<String>)>, String> {
+/// dial a node, so it was never taught to read `public_ip` — and the node's
+/// zone and region, which choose its feeder in the relay tree.
+struct FanoutRow {
+    node: FleetNode,
+    public_ip: Option<String>,
+    zone: Option<String>,
+    region: Option<String>,
+}
+
+async fn load_fanout_rows(db: &PgPool) -> Result<Vec<FanoutRow>, String> {
     type Row = (
         String,         // mm_node_id
         String,         // flavor
@@ -107,12 +122,16 @@ async fn load_fanout_rows(db: &PgPool) -> Result<Vec<(FleetNode, Option<String>)
         Option<i32>,    // viewer_capacity
         i32,            // viewers_current
         String,         // funding
+        Option<String>, // provider zone
+        Option<String>, // that zone's region
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT mm_node_id, flavor, ownership, state, host(public_ip)::text,
-                viewer_capacity, viewers_current, funding
-           FROM mm_fleet_nodes
-          ORDER BY mm_node_id",
+        "SELECT n.mm_node_id, n.flavor, n.ownership, n.state, host(n.public_ip)::text,
+                n.viewer_capacity, n.viewers_current, n.funding, n.provider_zone, z.region
+           FROM mm_fleet_nodes n
+           LEFT JOIN mm_fleet_provider_zones z
+                  ON z.provider_id = n.provider_ref AND z.zone = n.provider_zone
+          ORDER BY n.mm_node_id",
     )
     .fetch_all(db)
     .await
@@ -121,9 +140,9 @@ async fn load_fanout_rows(db: &PgPool) -> Result<Vec<(FleetNode, Option<String>)
     Ok(rows
         .into_iter()
         .filter_map(
-            |(id, flavor, ownership, state, public_ip, cap, cur, funding)| {
-                Some((
-                    FleetNode {
+            |(id, flavor, ownership, state, public_ip, cap, cur, funding, zone, region)| {
+                Some(FanoutRow {
+                    node: FleetNode {
                         id: NodeId::new(id),
                         flavor: NodeFlavor::parse(&flavor)?,
                         ownership: mm_core::fleet::Ownership::parse(&ownership)?,
@@ -133,10 +152,250 @@ async fn load_fanout_rows(db: &PgPool) -> Result<Vec<(FleetNode, Option<String>)
                         funding: mm_core::fleet::funding::Funding::parse(&funding)?,
                     },
                     public_ip,
-                ))
+                    zone,
+                    region,
+                })
             },
         )
         .collect())
+}
+
+/// A relay in the pool this tick, as the relay tree sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPlace {
+    pub id: NodeId,
+    /// The relay's switch: where it is seeded, and what a relay it feeds dials.
+    pub base_url: String,
+    pub zone: Option<String>,
+    pub region: Option<String>,
+    /// Connected sessions on the node right now, relay links included.
+    pub viewers: u32,
+}
+
+/// One row of `mm_fleet_relay_feeds`: `node_id` carries `stream_id`, pulled from
+/// `feeder` (`None` = the stream's entry), `depth` hops from the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedRow {
+    pub stream_id: String,
+    pub node_id: NodeId,
+    pub feeder: Option<NodeId>,
+    pub depth: u8,
+}
+
+/// What one tick does to the relay tree.
+///
+/// A removal of a cascade source ends the programme for everyone on that relay
+/// (mm-switch treats every `stream-…` id as a programme), so only `remove` ever calls
+/// the switch's removal, and only for a row nobody can be watching through.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeedPlan {
+    /// New rows: seeded first, written once the seed succeeded.
+    pub add: Vec<FeedRow>,
+    /// Kept rows whose feeder left: the row is rewritten to name the new feeder and
+    /// depth, and the relay's source is left alone. It goes on pulling from its old
+    /// feeder while that lives, and moves to the new one only when the dead-source rule
+    /// replaces it.
+    pub replace: Vec<FeedRow>,
+    /// (stream id, node id) dropped for good on a relay: the stream is not live, or it
+    /// is not wanted and nothing is connected to it there. The source is removed, then
+    /// the row. Deepest rows of each stream first.
+    pub remove: Vec<(String, NodeId)>,
+    /// (stream id, node id) whose node is no longer a relay: only the row goes. There is
+    /// nothing to call, and a draining node serves whoever is still on it.
+    pub forget: Vec<(String, NodeId)>,
+}
+
+/// The relay tree's diff for one tick. Pure.
+///
+/// * `relays`: the pool's relays this tick.
+/// * `wanted_streams`: streams new relays may join (live, stored state not `core`,
+///   fleet `on`, [`relay_wanted`]).
+/// * `held`: (stream, node) pairs where people may be watching the stream through the
+///   node (see [`held_pairs`]).
+/// * `existing`: the stored rows.
+///
+/// Wanted only decides who JOINS; it never cuts anyone off. An existing row stays while
+/// its node is still a relay and its stream is wanted or the pair is held. It stays as
+/// it is when its feeder is the entry or a row that stays as it is; otherwise its feeder
+/// left and the row is replaced with a new feeder. Relays without a row join a stream
+/// only when it is wanted. A row on a node that is no longer a relay is forgotten; any
+/// other row is removed. Relays are visited in id order and each one needing a feeder
+/// gets [`feeder_for`] over the rows kept or placed so far for that stream (depth = the
+/// feeder's + 1, or 1 for the entry). A relay being re-fed is never given a feeder that
+/// the stored rows show pulling (directly or further down) from it: its old source
+/// stays, so that would close a loop once one end's source is replaced. A feeder
+/// outlives its downstream with no extra rule: the downstream's relay link is a
+/// connected session on the feeder, so that pair is held.
+pub fn plan_feeds(
+    relays: &[RelayPlace],
+    wanted_streams: &[String],
+    held: &HashSet<(String, NodeId)>,
+    existing: &[FeedRow],
+) -> FeedPlan {
+    let mut relays_in_order: Vec<&RelayPlace> = relays.iter().collect();
+    relays_in_order.sort_by(|a, b| a.id.cmp(&b.id));
+    let relay_by_id: HashMap<&NodeId, &RelayPlace> = relays.iter().map(|r| (&r.id, r)).collect();
+    let wanted: HashSet<&str> = wanted_streams.iter().map(String::as_str).collect();
+    let streams: BTreeSet<&str> = wanted
+        .iter()
+        .copied()
+        .chain(existing.iter().map(|r| r.stream_id.as_str()))
+        .collect();
+
+    let mut plan = FeedPlan::default();
+    for stream in streams {
+        let is_wanted = wanted.contains(stream);
+        let mut rows: Vec<&FeedRow> = existing.iter().filter(|r| r.stream_id == stream).collect();
+        rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        let row_of: HashMap<&NodeId, &FeedRow> = rows.iter().map(|r| (&r.node_id, *r)).collect();
+
+        let may_stay = |row: &FeedRow| {
+            relay_by_id.contains_key(&row.node_id)
+                && (is_wanted || held.contains(&(stream.to_string(), row.node_id.clone())))
+        };
+        // The stored chain above a row, nearest first. Stops at the entry, at a feeder
+        // with no row, or on a cycle.
+        let ancestors = |row: &FeedRow| {
+            let mut out: Vec<NodeId> = Vec::new();
+            let mut cur = row;
+            while let Some(up) = &cur.feeder {
+                if out.contains(up) || out.len() > rows.len() {
+                    break;
+                }
+                out.push(up.clone());
+                match row_of.get(up) {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+            out
+        };
+        // Unchanged: every row from this one up to the entry may stay. A broken chain (a
+        // feeder with no row) or a cycle never reaches the entry.
+        let reaches_entry = |row: &FeedRow| {
+            let mut cur = row;
+            for _ in 0..=rows.len() {
+                if !may_stay(cur) {
+                    return false;
+                }
+                match &cur.feeder {
+                    None => return true,
+                    Some(up) => match row_of.get(up) {
+                        Some(next) => cur = next,
+                        None => return false,
+                    },
+                }
+            }
+            false
+        };
+
+        let mut carriers: Vec<Carrier> = Vec::new();
+        let mut placed: HashSet<&NodeId> = HashSet::new();
+        let mut refeed: HashSet<&NodeId> = HashSet::new();
+        let mut remove: Vec<&FeedRow> = Vec::new();
+        for row in &rows {
+            if reaches_entry(row) {
+                carriers.push(carrier(relay_by_id[&row.node_id], row.depth));
+                placed.insert(&row.node_id);
+            } else if may_stay(row) {
+                refeed.insert(&row.node_id);
+            } else if relay_by_id.contains_key(&row.node_id) {
+                remove.push(row);
+            } else {
+                plan.forget.push((stream.to_string(), row.node_id.clone()));
+            }
+        }
+        remove.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.node_id.cmp(&b.node_id)));
+        plan.remove
+            .extend(remove.into_iter().map(|r| (stream.to_string(), r.node_id.clone())));
+
+        for place in &relays_in_order {
+            let refed = refeed.contains(&place.id);
+            if placed.contains(&place.id) || !(is_wanted || refed) {
+                continue;
+            }
+            // Relays the stored rows show pulling from this one, directly or further down.
+            let below: HashSet<&NodeId> = if refed {
+                rows.iter()
+                    .filter(|r| ancestors(r).contains(&place.id))
+                    .map(|r| &r.node_id)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let candidates: Vec<Carrier> = carriers
+                .iter()
+                .filter(|c| !below.contains(&c.id))
+                .cloned()
+                .collect();
+            let (feeder, depth) =
+                match feeder_for(place.zone.as_deref(), place.region.as_deref(), &candidates) {
+                    Feeder::Entry => (None, 1),
+                    Feeder::Relay(id) => {
+                        let up = candidates
+                            .iter()
+                            .find(|c| c.id == id)
+                            .map_or(0, |c| c.depth);
+                        (Some(id), up + 1)
+                    }
+                };
+            carriers.push(carrier(place, depth));
+            placed.insert(&place.id);
+            let row = FeedRow {
+                stream_id: stream.to_string(),
+                node_id: place.id.clone(),
+                feeder,
+                depth,
+            };
+            if refed {
+                plan.replace.push(row);
+            } else {
+                plan.add.push(row);
+            }
+        }
+    }
+    plan
+}
+
+/// The (stream, node) pairs where people may be watching a live stream through a node:
+/// the node serves at least one connected session of it (relay links included); or the
+/// node did not answer the census; or someone on it is on an ad break, which names no
+/// programme. The last two hold every live stream the node has a row for, because what
+/// they serve is unknown, and guessing low would remove a source people are on.
+/// The (stream, node) pairs where people may be watching a live stream through a node:
+/// the node serves at least one connected session of it (relay links included); or the
+/// node did not answer the census; or someone on it is on an ad break, which names no
+/// programme. The last two hold every live stream the node has a row for, because what
+/// they serve is unknown, and guessing low would remove a source people are on.
+fn held_pairs(pass: &CensusPass, existing: &[FeedRow]) -> HashSet<(String, NodeId)> {
+    let live: HashSet<&str> = pass.live.iter().map(|b| b.broadcast_id.as_str()).collect();
+    let mut held: HashSet<(String, NodeId)> = pass
+        .per_node_per_broadcast
+        .iter()
+        .filter(|((_, broadcast), sessions)| **sessions > 0 && live.contains(broadcast.as_str()))
+        .map(|((node, broadcast), _)| (broadcast.clone(), node.clone()))
+        .collect();
+    held.extend(
+        existing
+            .iter()
+            .filter(|r| {
+                live.contains(r.stream_id.as_str())
+                    && (pass.unanswered.contains(&r.node_id)
+                        || pass.ad_break_nodes.contains(&r.node_id))
+            })
+            .map(|r| (r.stream_id.clone(), r.node_id.clone())),
+    );
+    held
+}
+
+fn carrier(place: &RelayPlace, depth: u8) -> Carrier {
+    Carrier {
+        id: place.id.clone(),
+        zone: place.zone.clone(),
+        region: place.region.clone(),
+        viewers: place.viewers,
+        depth,
+    }
 }
 
 /// Per-(relay, broadcast) bookkeeping for M2's liveness grace period: when a cascade
@@ -168,6 +427,8 @@ type InactiveTracker = AsyncMutex<HashMap<(NodeId, String), Instant>>;
 ///     paused relay is not impossible) — a fresh one is pushed via `UpdateToken` every
 ///     time, win or lose, so the NEXT reconnect (ICE drop, 401) always has a current
 ///     token instead of the one pinned at seed time.
+///
+/// Returns whether the relay holds the source now (created, or already there).
 #[allow(clippy::too_many_arguments)]
 async fn seed_cascade_source(
     dialer: &SwitchClient,
@@ -177,7 +438,7 @@ async fn seed_cascade_source(
     secret: &str,
     broadcast_id: &str,
     inactive: &InactiveTracker,
-) {
+) -> bool {
     // B1: the claim's "broadcast id" field must be the EXACT string the origin derives
     // from the offer it receives after stripping "cascade-" and "-{relay_node_id}" —
     // that is switch_source_id(broadcast_id) ("stream-{broadcast_id}"), not the raw
@@ -201,7 +462,7 @@ async fn seed_cascade_source(
         {
             Ok(CascadeSeedOutcome::Created) => {
                 inactive.lock().await.remove(&key);
-                return;
+                return true;
             }
             Ok(CascadeSeedOutcome::AlreadyExists) => {
                 reconcile_existing_cascade_source(
@@ -214,7 +475,7 @@ async fn seed_cascade_source(
                     inactive,
                 )
                 .await;
-                return;
+                return true;
             }
             Ok(CascadeSeedOutcome::Unauthorized) => {
                 tracing::warn!(
@@ -232,7 +493,7 @@ async fn seed_cascade_source(
                     error = %e,
                     "cascade seed failed"
                 );
-                return;
+                return false;
             }
         }
     }
@@ -242,6 +503,7 @@ async fn seed_cascade_source(
         "cascade seed: relay rejected the server bearer twice in a row — giving up this \
          tick; check MM_SWITCH_AUTH_SECRET on this relay, not the cascade token"
     );
+    false
 }
 
 /// M2 + M3: called once `add_cascade_source` has confirmed the relay already has this
@@ -362,14 +624,46 @@ fn inactive_tracker() -> &'static InactiveTracker {
     TRACKER.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
-/// One pass: diff, apply to the pool, then seed every healthy relay with every
-/// live broadcast that has viewers.
-async fn sync_once(
-    pool: &Arc<SwitchPool>,
-    db: &PgPool,
-    switch_secret: Option<&str>,
-    public_switch_base_url: Option<&str>,
-) {
+/// What the pool-sync loop needs besides the pool and the database.
+#[derive(Clone)]
+pub struct PoolSyncContext {
+    /// The live configuration: `fleet.mode` and `fleet.relay_viewer_threshold` are read
+    /// from it on every tick, never from a value captured at boot.
+    pub live: ConfigHandle,
+    /// `MM_SWITCH_AUTH_SECRET`. Without it cascade tokens cannot be minted, so membership
+    /// is still synced but the relay tree is left alone.
+    pub switch_secret: Option<String>,
+    /// The origin's public switch base, which relays fed by the entry dial.
+    pub public_switch_base_url: Option<String>,
+    /// A relay's switch base URL from its `public_ip`.
+    relay_base_url: Arc<dyn Fn(&str) -> String + Send + Sync>,
+}
+
+impl PoolSyncContext {
+    pub fn new(
+        live: ConfigHandle,
+        switch_secret: Option<String>,
+        public_switch_base_url: Option<String>,
+    ) -> Self {
+        Self {
+            live,
+            switch_secret,
+            public_switch_base_url,
+            relay_base_url: Arc::new(|ip| format!("http://{ip}:{SWITCH_PORT}")),
+        }
+    }
+
+    /// Replace how a relay's address becomes its switch URL. For tests, whose stand-in
+    /// switches cannot all listen on the one port real relays use.
+    pub fn with_relay_base_url(mut self, f: impl Fn(&str) -> String + Send + Sync + 'static) -> Self {
+        self.relay_base_url = Arc::new(f);
+        self
+    }
+}
+
+/// One pass: diff and apply to the pool, take the census, then bring the relay tree
+/// in line with it.
+pub async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, ctx: &PoolSyncContext) {
     let rows = match load_fanout_rows(db).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -377,7 +671,7 @@ async fn sync_once(
             return;
         }
     };
-    let db_nodes: Vec<FleetNode> = rows.iter().map(|(n, _)| n.clone()).collect();
+    let db_nodes: Vec<FleetNode> = rows.iter().map(|r| r.node.clone()).collect();
     let pool_node_ids: Vec<NodeId> = pool.nodes().await.into_iter().map(|n| n.id).collect();
 
     let actions = sync_actions(&db_nodes, &pool_node_ids);
@@ -387,105 +681,361 @@ async fn sync_once(
         tracing::info!(node = %id, "pool sync: evicted");
     }
 
+    // The relays upserted this tick, with their switch URL and place.
+    let mut upserted: Vec<(&FanoutRow, String)> = Vec::new();
     for node in &actions.upserts {
-        let Some(ip) = rows
-            .iter()
-            .find(|(n, _)| &n.id == &node.id)
-            .and_then(|(_, ip)| ip.clone())
-        else {
+        let Some(row) = rows.iter().find(|r| r.node.id == node.id) else {
+            continue;
+        };
+        let Some(ip) = row.public_ip.as_deref() else {
             // A healthy row with no recorded address cannot be dialed; skip it
             // this tick rather than register a client nobody can reach.
             tracing::warn!(node = %node.id, "pool sync: healthy relay has no public_ip yet, skipping");
             continue;
         };
-        let base_url = format!("http://{ip}:{SWITCH_PORT}");
+        let base_url = (ctx.relay_base_url)(ip);
         // B2: every server-role route on a relay (cascade seeding, token renewal,
         // switch_viewer, remove_source, …) is `wrapAuth(authSecret, serverOnly, …)` — it
         // demands mm-core's own bearer. A client built via `SwitchClient::new` never sends
         // one and 401s on all of them; `with_auth` is the client every relay call in this
         // loop must use whenever a secret is configured.
-        let client: Arc<SwitchClient> = match switch_secret {
+        let client: Arc<SwitchClient> = match ctx.switch_secret.as_deref() {
             Some(secret) => Arc::new(SwitchClient::with_auth(&base_url, secret.to_string())),
             None => Arc::new(SwitchClient::new(&base_url)),
         };
         pool.upsert(node, client).await;
+        upserted.push((row, base_url));
     }
 
     // Census (§8.2 R6 + m4): ONE gather of every node — origin and fan-out alike — feeds
-    // both the capacity gauges' `viewers_current` write-back AND cascade seeding's live-
-    // broadcast list below. Before this they were two separate full gathers in the same
-    // tick, each polling every node for the same underlying `list_viewers` data. Gathered
-    // from the pool we just synced above (so a node just evicted is not polled, and a node
-    // just upserted already is).
+    // both the capacity gauges' `viewers_current` write-back AND the relay tree below.
+    // Gathered from the pool we just synced above (so a node just evicted is not polled,
+    // and a node just upserted already is).
     let census = SwitchCensus::new(pool.clone(), db.clone());
-    let (viewer_counts_by_node, live) = match census.viewers_per_node_and_live_broadcasts().await
-    {
-        Ok(pair) => pair,
+    let pass = match census.viewers_per_node_and_live_broadcasts().await {
+        Ok(pass) => pass,
         Err(e) => {
             tracing::error!("pool sync: census failed: {e}");
             return;
         }
     };
-    let viewer_counts: Vec<(NodeId, i64)> = viewer_counts_by_node.into_iter().collect();
+    let viewer_counts: Vec<(NodeId, i64)> =
+        pass.per_node.iter().map(|(n, c)| (n.clone(), *c)).collect();
     if let Err(e) = nodes_db::update_viewers_current(db, &viewer_counts).await {
         tracing::warn!("pool sync: writing back viewers_current failed: {e}");
     }
 
-    // Seed cascade sources: the origin is always reachable even with no fleet, so
-    // viewer-counting for seeding reuses the census gathered above.
-    let Some(secret) = switch_secret else {
+    let Some(secret) = ctx.switch_secret.as_deref() else {
         return;
     };
-    let live_with_viewers: Vec<&str> = live
-        .iter()
-        .filter(|b| b.viewers > 0)
-        .map(|b| b.broadcast_id.as_str())
+    let relays: Vec<RelayPlace> = upserted
+        .into_iter()
+        .map(|(row, base_url)| RelayPlace {
+            id: row.node.id.clone(),
+            base_url,
+            zone: row.zone.clone(),
+            region: row.region.clone(),
+            viewers: pass
+                .per_node
+                .get(&row.node.id)
+                .copied()
+                .unwrap_or(0)
+                .clamp(0, i64::from(u32::MAX)) as u32,
+        })
         .collect();
-    if live_with_viewers.is_empty() {
-        return;
+    let entry_url = cascade_origin_url(ctx.public_switch_base_url.as_deref(), pool);
+    feed_relays(pool, db, ctx, secret, &relays, &pass, &entry_url).await;
+}
+
+/// The relay tree's step of a tick: read the stored rows and the streams' states, plan,
+/// and apply the plan to the relays. Any read failing skips the step for this tick, so
+/// nothing is dropped on a guess.
+async fn feed_relays(
+    pool: &Arc<SwitchPool>,
+    db: &PgPool,
+    ctx: &PoolSyncContext,
+    secret: &str,
+    relays: &[RelayPlace],
+    pass: &CensusPass,
+    entry_url: &str,
+) {
+    let existing = match load_feed_rows(db).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("pool sync: {e}");
+            return;
+        }
+    };
+    let paths = match load_live_media_paths(db).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::error!("pool sync: {e}");
+            return;
+        }
+    };
+
+    let cfg = ctx.live.load();
+    let wanted: Vec<String> = if cfg.fleet.mode == FleetMode::On {
+        pass.live
+            .iter()
+            .filter(|b| {
+                paths.get(&b.broadcast_id).copied().unwrap_or(MediaPath::Core) != MediaPath::Core
+                    && relay_wanted(b.viewers, cfg.fleet.relay_viewer_threshold)
+            })
+            .map(|b| b.broadcast_id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let held = held_pairs(pass, &existing);
+    let plan = plan_feeds(relays, &wanted, &held, &existing);
+
+    let place_of: HashMap<&NodeId, &RelayPlace> = relays.iter().map(|r| (&r.id, r)).collect();
+    let origin_of = |feeder: &Option<NodeId>| match feeder {
+        None => Some(entry_url.to_string()),
+        Some(id) => place_of.get(id).map(|p| p.base_url.clone()),
+    };
+
+    for (stream, node) in &plan.forget {
+        delete_feed_row(db, stream, node).await;
     }
-
-    let origin_url = cascade_origin_url(public_switch_base_url, pool);
-    let broadcasts: Vec<String> = live_with_viewers.iter().map(|s| s.to_string()).collect();
-
-    let mut relays = Vec::new();
-    for node in &actions.upserts {
-        // The relay's own client: its connection pool already points at the
-        // relay. (The origin's client would also work — `add_cascade_source`
-        // takes the target URL explicitly — but would open a second pool of
-        // connections to every relay for no reason.)
-        let Some(client) = pool.client_for_node(Some(&node.id)).await else {
+    let mut work: HashMap<NodeId, NodeFeedWork> = HashMap::new();
+    for (stream, node) in &plan.remove {
+        work.entry(node.clone()).or_default().remove.push(stream.clone());
+    }
+    for row in &plan.add {
+        let Some(origin_url) = origin_of(&row.feeder) else {
             continue;
         };
-        let relay_id = node.id.clone();
-        let origin_url = origin_url.clone();
-        let secret = secret.to_string();
-        let broadcasts = broadcasts.clone();
-        let fut = async move {
-            let relay_base_url = client.base_url().to_string();
-            // Within one relay the broadcasts stay sequential: they share a
-            // connection, and a relay slow for one broadcast is slow for all.
-            for broadcast_id in &broadcasts {
-                seed_cascade_source(
-                    &client,
-                    &relay_base_url,
-                    &relay_id,
-                    &origin_url,
-                    &secret,
-                    broadcast_id,
-                    inactive_tracker(),
-                )
-                .await;
-            }
-        };
-        relays.push((node.id.clone(), fut));
+        work.entry(row.node_id.clone())
+            .or_default()
+            .add
+            .push((row.clone(), origin_url));
     }
-    for relay_id in seed_relays_within_budget(relays, SEED_BUDGET_PER_RELAY).await {
+    for row in &plan.replace {
+        let Some(origin_url) = origin_of(&row.feeder) else {
+            continue;
+        };
+        work.entry(row.node_id.clone())
+            .or_default()
+            .replace
+            .push((row.clone(), origin_url));
+    }
+    let changed: HashSet<(&str, &NodeId)> = plan
+        .replace
+        .iter()
+        .map(|r| (r.stream_id.as_str(), &r.node_id))
+        .chain(plan.remove.iter().chain(&plan.forget).map(|(s, n)| (s.as_str(), n)))
+        .collect();
+    for row in &existing {
+        if changed.contains(&(row.stream_id.as_str(), &row.node_id))
+            || !place_of.contains_key(&row.node_id)
+        {
+            continue;
+        }
+        let Some(origin_url) = origin_of(&row.feeder) else {
+            continue;
+        };
+        work.entry(row.node_id.clone())
+            .or_default()
+            .keep
+            .push((row.stream_id.clone(), origin_url));
+    }
+
+    let mut relay_jobs = Vec::new();
+    for (node_id, job) in work {
+        let Some(client) = pool.client_for_node(Some(&node_id)).await else {
+            continue;
+        };
+        let db = db.clone();
+        let secret = secret.to_string();
+        let relay_id = node_id.clone();
+        let fut = async move { job.run(&client, &db, &relay_id, &secret).await };
+        relay_jobs.push((node_id, fut));
+    }
+    for relay_id in seed_relays_within_budget(relay_jobs, SEED_BUDGET_PER_RELAY).await {
         tracing::warn!(
             relay = %relay_id,
             budget_secs = SEED_BUDGET_PER_RELAY.as_secs(),
-            "cascade seeding ran out of its per-relay budget — skipping the rest of \
-             this relay's broadcasts; seeding is idempotent and the next tick retries"
+            "relay feeding ran out of its per-relay budget — skipping the rest of this \
+             relay's work; every step is idempotent and the next tick retries"
+        );
+    }
+}
+
+/// One relay's share of a tick's [`FeedPlan`], run in this order: removals, new rows,
+/// replaced rows, unchanged rows.
+///
+/// Every row that stays (new, replaced or unchanged) is seeded on every tick against its
+/// CURRENT feeder's URL, or the entry's: a live source answers 409 and is left as it is
+/// (its token renewed); a source that has read inactive past `INACTIVE_GRACE` is replaced
+/// from that URL (`reconcile_existing_cascade_source`); a relay that lost the source is
+/// seeded afresh.
+#[derive(Default)]
+struct NodeFeedWork {
+    /// Streams whose cascade source is removed, and their rows with it.
+    remove: Vec<String>,
+    /// New rows, with the URL their source pulls from.
+    add: Vec<(FeedRow, String)>,
+    /// Rows rewritten to name a new feeder, with that feeder's URL.
+    replace: Vec<(FeedRow, String)>,
+    /// Unchanged rows (stream, the URL their source pulls from).
+    keep: Vec<(String, String)>,
+}
+
+impl NodeFeedWork {
+    async fn run(self, client: &SwitchClient, db: &PgPool, relay_id: &NodeId, secret: &str) {
+        let relay_base_url = client.base_url().to_string();
+        let ensure = |stream: String, origin_url: String| {
+            let relay_base_url = relay_base_url.clone();
+            async move {
+                seed_cascade_source(
+                    client,
+                    &relay_base_url,
+                    relay_id,
+                    &origin_url,
+                    secret,
+                    &stream,
+                    inactive_tracker(),
+                )
+                .await
+            }
+        };
+
+        // Only rows nobody can be watching through reach this list (see `FeedPlan`).
+        for stream in self.remove {
+            let source_id = switch_source_id(&stream);
+            match client.remove_source(&source_id).await {
+                Ok(()) => {
+                    inactive_tracker()
+                        .lock()
+                        .await
+                        .remove(&(relay_id.clone(), source_id));
+                    delete_feed_row(db, &stream, relay_id).await;
+                }
+                // The row stays, so the next tick tries again.
+                Err(e) => tracing::warn!(
+                    relay = %relay_id,
+                    broadcast = %stream,
+                    error = %e,
+                    "relay feeding: removing a cascade source failed, keeping its row"
+                ),
+            }
+        }
+        // Within one relay the streams stay sequential: they share a connection, and a
+        // relay slow for one stream is slow for all.
+        for (row, origin_url) in self.add {
+            // A NEW row is written only once the relay holds the source; a failed seed
+            // leaves no row and the next tick tries again.
+            if ensure(row.stream_id.clone(), origin_url).await {
+                insert_feed_row(db, &row).await;
+            }
+        }
+        for (row, origin_url) in self.replace {
+            // The row names the new feeder whatever the seed says: the relay keeps the
+            // source it has, and a failed seed is tried again next tick like any other.
+            replace_feed_row(db, &row).await;
+            ensure(row.stream_id, origin_url).await;
+        }
+        for (stream, origin_url) in self.keep {
+            ensure(stream, origin_url).await;
+        }
+    }
+}
+
+async fn load_feed_rows(db: &PgPool) -> Result<Vec<FeedRow>, String> {
+    let rows: Vec<(String, String, Option<String>, i16)> = sqlx::query_as(
+        "SELECT stream_id, node_id, feeder_node_id, depth FROM mm_fleet_relay_feeds",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("loading mm_fleet_relay_feeds failed: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(stream_id, node_id, feeder, depth)| FeedRow {
+            stream_id,
+            node_id: NodeId::new(node_id),
+            feeder: feeder.map(NodeId::new),
+            depth: u8::try_from(depth).unwrap_or(u8::MAX),
+        })
+        .collect())
+}
+
+/// The stored state of every active stream. An unreadable value reads as `core`.
+async fn load_live_media_paths(db: &PgPool) -> Result<HashMap<String, MediaPath>, String> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, media_path FROM mm_streams WHERE status = 'active'")
+            .fetch_all(db)
+            .await
+            .map_err(|e| format!("reading the streams' media paths failed: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, path)| (id, MediaPath::parse(&path).unwrap_or(MediaPath::Core)))
+        .collect())
+}
+
+/// Record a seeded feed. A row already there (another server instance seeded the same
+/// relay this tick) is left as it is.
+async fn insert_feed_row(db: &PgPool, row: &FeedRow) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO mm_fleet_relay_feeds (stream_id, node_id, feeder_node_id, depth)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (stream_id, node_id) DO NOTHING",
+    )
+    .bind(&row.stream_id)
+    .bind(row.node_id.as_str())
+    .bind(row.feeder.as_ref().map(NodeId::as_str))
+    .bind(i16::from(row.depth))
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            relay = %row.node_id,
+            broadcast = %row.stream_id,
+            error = %e,
+            "relay feeding: recording a feed failed"
+        );
+    }
+}
+
+/// Point an existing feed at its new feeder and depth.
+async fn replace_feed_row(db: &PgPool, row: &FeedRow) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO mm_fleet_relay_feeds (stream_id, node_id, feeder_node_id, depth)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (stream_id, node_id)
+         DO UPDATE SET feeder_node_id = EXCLUDED.feeder_node_id, depth = EXCLUDED.depth",
+    )
+    .bind(&row.stream_id)
+    .bind(row.node_id.as_str())
+    .bind(row.feeder.as_ref().map(NodeId::as_str))
+    .bind(i16::from(row.depth))
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            relay = %row.node_id,
+            broadcast = %row.stream_id,
+            error = %e,
+            "relay feeding: re-pointing a feed failed"
+        );
+    }
+}
+
+async fn delete_feed_row(db: &PgPool, stream_id: &str, node_id: &NodeId) {
+    if let Err(e) =
+        sqlx::query("DELETE FROM mm_fleet_relay_feeds WHERE stream_id = $1 AND node_id = $2")
+            .bind(stream_id)
+            .bind(node_id.as_str())
+            .execute(db)
+            .await
+    {
+        tracing::warn!(
+            relay = %node_id,
+            broadcast = %stream_id,
+            error = %e,
+            "relay feeding: deleting a feed row failed"
         );
     }
 }
@@ -533,18 +1083,17 @@ where
 }
 
 /// The pool-sync loop (relay fleet Task 3). Runs every `interval`, keeping
-/// `SwitchPool` in step with `mm_fleet_nodes` and seeding cascade sources on
-/// every healthy relay for every live, watched broadcast.
+/// `SwitchPool` in step with `mm_fleet_nodes` and the relay tree in step with
+/// the census.
 ///
-/// `switch_secret` is `None` when `MM_SWITCH_AUTH_SECRET` is unset; cascade
+/// `ctx.switch_secret` is `None` when `MM_SWITCH_AUTH_SECRET` is unset; cascade
 /// tokens cannot be minted without it, so this loop still syncs node
-/// membership but skips seeding — same posture as the rest of the switch
-/// integration when the secret is absent.
+/// membership but leaves the relay tree alone — same posture as the rest of the
+/// switch integration when the secret is absent.
 pub async fn run_pool_sync(
     pool: Arc<SwitchPool>,
     db: PgPool,
-    switch_secret: Option<String>,
-    public_switch_base_url: Option<String>,
+    ctx: PoolSyncContext,
     interval: StdDuration,
     cancel: CancellationToken,
 ) {
@@ -554,7 +1103,7 @@ pub async fn run_pool_sync(
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {
-                sync_once(&pool, &db, switch_secret.as_deref(), public_switch_base_url.as_deref()).await;
+                sync_once(&pool, &db, &ctx).await;
                 mm_core::metrics_global::heartbeat("pool_sync");
             }
         }
@@ -578,6 +1127,7 @@ fn cascade_origin_url(public_switch_base_url: Option<&str>, pool: &SwitchPool) -
 mod tests {
     use super::*;
     use mm_core::fleet::Ownership;
+    use mm_core::fleet::media_path::MAX_RELAY_DEPTH;
 
     fn node(id: &str, flavor: NodeFlavor, state: NodeState) -> FleetNode {
         FleetNode {
@@ -768,6 +1318,263 @@ mod tests {
             "two 6 s relays must overlap, not stack (elapsed {:?})",
             started.elapsed()
         );
+    }
+
+    // ── The relay tree (plan_feeds) ─────────────────────────────────────────
+
+    const S: &str = "s1";
+
+    fn relay(id: &str, zone: &str, viewers: u32) -> RelayPlace {
+        RelayPlace {
+            id: NodeId::new(id),
+            base_url: format!("http://{id}:7890"),
+            zone: Some(zone.to_string()),
+            region: Some("eu".to_string()),
+            viewers,
+        }
+    }
+
+    fn feed(node: &str, feeder: Option<&str>, depth: u8) -> FeedRow {
+        FeedRow {
+            stream_id: S.to_string(),
+            node_id: NodeId::new(node),
+            feeder: feeder.map(NodeId::new),
+            depth,
+        }
+    }
+
+    fn wanted() -> Vec<String> {
+        vec![S.to_string()]
+    }
+
+    fn held(nodes: &[&str]) -> HashSet<(String, NodeId)> {
+        nodes
+            .iter()
+            .map(|n| (S.to_string(), NodeId::new(*n)))
+            .collect()
+    }
+
+    fn nodes(pairs: &[(String, NodeId)]) -> Vec<&str> {
+        let mut out: Vec<&str> = pairs.iter().map(|(_, n)| n.as_str()).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_first_relay_is_fed_by_the_entry() {
+        let plan = plan_feeds(&[relay("r1", "ams", 0)], &wanted(), &held(&[]), &[]);
+        assert_eq!(
+            plan,
+            FeedPlan {
+                add: vec![feed("r1", None, 1)],
+                ..FeedPlan::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_second_relay_is_fed_by_the_closest_relay_not_the_entry() {
+        let relays = [relay("r1", "ams", 0), relay("r2", "ams", 0)];
+        let existing = [feed("r1", None, 1)];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        assert_eq!(
+            plan,
+            FeedPlan {
+                add: vec![feed("r2", Some("r1"), 2)],
+                ..FeedPlan::default()
+            },
+            "r1's row stays as it is"
+        );
+    }
+
+    #[test]
+    fn a_lost_feeder_reattaches_its_relays() {
+        // r1 is gone from the relays; r2 hung off it and r3 off r2.
+        let relays = [relay("r2", "ams", 0), relay("r3", "ams", 0)];
+        let existing = [
+            feed("r1", None, 1),
+            feed("r2", Some("r1"), 2),
+            feed("r3", Some("r2"), 3),
+        ];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        assert_eq!(
+            plan.replace,
+            vec![feed("r2", None, 1), feed("r3", Some("r2"), 2)],
+            "r2 and r3 get rows naming their new feeders and depths"
+        );
+        assert!(plan.remove.is_empty(), "a re-attach removes no source: {:?}", plan.remove);
+        assert_eq!(nodes(&plan.forget), vec!["r1"], "r1 is no relay: only its row goes");
+        assert!(plan.add.is_empty());
+    }
+
+    #[test]
+    fn a_reattached_relay_is_never_fed_by_one_still_pulling_from_it() {
+        // x is gone. b hung off x, and a off b: a's source still pulls from b. Visited
+        // first, a is fed by the entry; b must not then be fed by a, or b's replacement
+        // source (once its own dies) would pull from a relay pulling from b.
+        let relays = [relay("a", "ams", 0), relay("b", "ams", 0)];
+        let existing = [
+            feed("x", None, 1),
+            feed("b", Some("x"), 2),
+            feed("a", Some("b"), 3),
+        ];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        assert_eq!(plan.replace, vec![feed("a", None, 1), feed("b", None, 1)]);
+        assert!(plan.remove.is_empty());
+    }
+
+    #[test]
+    fn depth_never_exceeds_three() {
+        // Five relays in one zone. The busier a relay, the less it is chosen, so each new
+        // relay prefers the deepest carrier it may use: that walks the tree to its limit.
+        let relays = [
+            relay("r1", "ams", 50),
+            relay("r2", "ams", 40),
+            relay("r3", "ams", 30),
+            relay("r4", "ams", 20),
+            relay("r5", "ams", 10),
+        ];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &[]);
+        assert_eq!(
+            plan.add,
+            vec![
+                feed("r1", None, 1),
+                feed("r2", Some("r1"), 2),
+                // A carrier at depth 2 may feed a new relay: the new one is at depth 3.
+                feed("r3", Some("r2"), 3),
+                // r3 is the least busy carrier but sits at depth 3, so it feeds nobody.
+                feed("r4", Some("r2"), 3),
+                feed("r5", Some("r2"), 3),
+            ]
+        );
+        assert!(plan.replace.is_empty() && plan.remove.is_empty() && plan.forget.is_empty());
+
+        let rows: HashMap<&NodeId, &FeedRow> =
+            plan.add.iter().map(|r| (&r.node_id, r)).collect();
+        for row in &plan.add {
+            assert!(row.depth >= 1 && row.depth <= MAX_RELAY_DEPTH, "{row:?}");
+            // Walk up to the entry: never meets the row itself, and the hops match the depth.
+            let mut hops = 1;
+            let mut up = row.feeder.clone();
+            while let Some(f) = up {
+                assert_ne!(f, row.node_id, "{} is its own ancestor", row.node_id);
+                hops += 1;
+                up = rows[&f].feeder.clone();
+            }
+            assert_eq!(hops, row.depth, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_stream_no_longer_wanted_loses_all_its_feeds() {
+        let relays = [relay("r1", "ams", 0), relay("r2", "ams", 0)];
+        let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
+        let plan = plan_feeds(&relays, &[], &held(&[]), &existing);
+        assert_eq!(nodes(&plan.remove), vec!["r1", "r2"], "nobody is connected: removed");
+        assert_eq!(plan.remove[0].1.as_str(), "r2", "the deepest goes first");
+        assert!(plan.add.is_empty() && plan.replace.is_empty() && plan.forget.is_empty());
+    }
+
+    #[test]
+    fn a_stream_under_the_line_keeps_the_relays_people_are_on() {
+        let relays = [relay("r1", "ams", 3), relay("r2", "ams", 0)];
+        let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
+        let plan = plan_feeds(&relays, &[], &held(&["r1"]), &existing);
+        assert_eq!(nodes(&plan.remove), vec!["r2"]);
+        assert!(plan.add.is_empty() && plan.replace.is_empty() && plan.forget.is_empty());
+    }
+
+    #[test]
+    fn a_feeder_is_kept_while_its_downstream_is_held() {
+        let relays = [relay("r1", "ams", 1), relay("r2", "ams", 4)];
+        let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
+        let plan = plan_feeds(&relays, &[], &held(&["r1", "r2"]), &existing);
+        assert_eq!(plan, FeedPlan::default());
+    }
+
+    #[test]
+    fn no_relay_joins_a_stream_that_is_not_wanted() {
+        let relays = [relay("r1", "ams", 2), relay("r2", "ams", 0)];
+        let existing = [feed("r1", None, 1)];
+        let plan = plan_feeds(&relays, &[], &held(&["r1"]), &existing);
+        assert_eq!(plan, FeedPlan::default());
+    }
+
+    #[test]
+    fn a_held_relay_that_lost_its_feeder_is_fed_again() {
+        let relays = [relay("r2", "ams", 5)];
+        let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
+        let plan = plan_feeds(&relays, &[], &held(&["r2"]), &existing);
+        assert_eq!(plan.replace, vec![feed("r2", None, 1)]);
+        assert!(plan.remove.is_empty(), "people are on r2: no removal");
+        assert_eq!(nodes(&plan.forget), vec!["r1"]);
+        assert!(plan.add.is_empty());
+    }
+
+    // ── Who holds a relay (held_pairs) ──────────────────────────────────────
+
+    fn live(ids: &[&str]) -> Vec<mm_fleet::runner::LiveBroadcast> {
+        ids.iter()
+            .map(|id| mm_fleet::runner::LiveBroadcast {
+                broadcast_id: id.to_string(),
+                viewers: 0,
+            })
+            .collect()
+    }
+
+    fn row_on(stream: &str, node: &str) -> FeedRow {
+        FeedRow {
+            stream_id: stream.to_string(),
+            node_id: NodeId::new(node),
+            feeder: None,
+            depth: 1,
+        }
+    }
+
+    fn pairs(held: &HashSet<(String, NodeId)>) -> Vec<(&str, &str)> {
+        let mut out: Vec<(&str, &str)> =
+            held.iter().map(|(s, n)| (s.as_str(), n.as_str())).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_connected_session_of_a_live_stream_holds_its_node() {
+        let pass = CensusPass {
+            live: live(&["s1"]),
+            per_node_per_broadcast: HashMap::from([
+                ((NodeId::new("r1"), "s1".to_string()), 2),
+                ((NodeId::new("r2"), "ended".to_string()), 4),
+            ]),
+            ..CensusPass::default()
+        };
+        assert_eq!(pairs(&held_pairs(&pass, &[])), vec![("s1", "r1")]);
+    }
+
+    #[test]
+    fn an_ad_break_holds_every_live_stream_its_node_carries() {
+        let pass = CensusPass {
+            live: live(&["s1", "s2"]),
+            ad_break_nodes: HashSet::from([NodeId::new("r1")]),
+            ..CensusPass::default()
+        };
+        let rows = [row_on("s1", "r1"), row_on("s2", "r1"), row_on("ended", "r1"), row_on("s1", "r2")];
+        assert_eq!(
+            pairs(&held_pairs(&pass, &rows)),
+            vec![("s1", "r1"), ("s2", "r1")],
+            "r1's live rows, not an ended stream's, not another node's"
+        );
+    }
+
+    #[test]
+    fn a_node_that_did_not_answer_holds_every_live_stream_it_carries() {
+        let pass = CensusPass {
+            live: live(&["s1"]),
+            unanswered: HashSet::from([NodeId::new("r2")]),
+            ..CensusPass::default()
+        };
+        let rows = [row_on("s1", "r2"), row_on("ended", "r2"), row_on("s1", "r1")];
+        assert_eq!(pairs(&held_pairs(&pass, &rows)), vec![("s1", "r2")]);
     }
 
     #[test]

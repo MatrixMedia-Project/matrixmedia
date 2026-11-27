@@ -17,7 +17,7 @@
 //!   costs quality; over-counting costs money, and `plan()` never shrinks on a low
 //!   count, so the safe direction is down.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +70,10 @@ struct Tally {
     /// included, for the relay-hour meter's samples (Task 9, §8.2 R4): a relay link costs
     /// the node one stream's egress, like a person. The origin is never a key.
     per_node_per_broadcast: HashMap<(mm_core::fleet::NodeId, String), i64>,
+    /// Fan-out nodes with at least one person on an `ad-…` source. An ad source names
+    /// the user, not the programme the break interrupted, so such a person cannot be
+    /// counted toward a broadcast; the node is marked instead. Counts nothing.
+    ad_break_nodes: HashSet<mm_core::fleet::NodeId>,
 }
 
 fn tally(gathered: &[(CensusTarget, Vec<SwitchViewer>)]) -> Tally {
@@ -84,6 +88,9 @@ fn tally(gathered: &[(CensusTarget, Vec<SwitchViewer>)]) -> Tally {
                 *t.by_source.entry(v.current_source.clone()).or_insert(0) += 1;
             }
             if let Some(node_id) = target {
+                if is_audience(v) && v.current_source.starts_with("ad-") {
+                    t.ad_break_nodes.insert(node_id.clone());
+                }
                 if let Some(broadcast_id) = v.current_source.strip_prefix("stream-") {
                     *t.per_node_per_broadcast
                         .entry((node_id.clone(), broadcast_id.to_string()))
@@ -93,6 +100,25 @@ fn tally(gathered: &[(CensusTarget, Vec<SwitchViewer>)]) -> Tally {
         }
     }
     t
+}
+
+/// One census pass, as the pool-sync tick needs it: everything below comes off the same
+/// `list_viewers` responses.
+#[derive(Debug, Default)]
+pub struct CensusPass {
+    /// Connected sessions per fan-out node, relay links included (see [`Tally::per_node`]).
+    pub per_node: HashMap<mm_core::fleet::NodeId, i64>,
+    /// Every active stream with its audience: people only, never relay links.
+    pub live: Vec<LiveBroadcast>,
+    /// Connected sessions per (node, broadcast), relay links included: the relay-hour
+    /// meter's samples (see [`Tally::per_node_per_broadcast`]).
+    pub per_node_per_broadcast: HashMap<(mm_core::fleet::NodeId, String), i64>,
+    /// Fan-out nodes that did not answer (an error or their time budget ran out). Their
+    /// counts above read zero, but nobody knows what they serve.
+    pub unanswered: HashSet<mm_core::fleet::NodeId>,
+    /// Fan-out nodes with at least one person on an ad break (an `ad-…` source, which
+    /// names no programme): whichever stream they will return to, it is on that node.
+    pub ad_break_nodes: HashSet<mm_core::fleet::NodeId>,
 }
 
 pub struct SwitchCensus {
@@ -110,8 +136,15 @@ impl SwitchCensus {
     /// [`Self::viewers_by_source`] and [`Self::viewers_per_node`] used to each do on their
     /// own, polling every node a SECOND time for the exact same data within the same
     /// `sync_once` tick. A node that times out or errors reports an empty viewer list
-    /// (under-counting is the safe direction — see both callers' doc comments).
-    async fn gather(&self) -> Vec<(CensusTarget, Vec<SwitchViewer>)> {
+    /// (under-counting is the safe direction — see both callers' doc comments); such a
+    /// fan-out node is also named in the returned set, for a caller to which "zero" and
+    /// "unknown" are not the same thing.
+    async fn gather(
+        &self,
+    ) -> (
+        Vec<(CensusTarget, Vec<SwitchViewer>)>,
+        HashSet<mm_core::fleet::NodeId>,
+    ) {
         let mut targets: Vec<(CensusTarget, Arc<mm_core::switch_client::SwitchClient>)> =
             vec![(None, self.pool.origin())];
         for node in self.pool.nodes().await {
@@ -130,7 +163,7 @@ impl SwitchCensus {
                 )
                 .await
                 {
-                    Ok(Ok(v)) => v,
+                    Ok(Ok(v)) => Some(v),
                     Ok(Err(e)) => {
                         tracing::warn!(
                             node = base_url,
@@ -139,7 +172,7 @@ impl SwitchCensus {
                              the planner will see less demand and grow less, which is the \
                              safe direction to be wrong in"
                         );
-                        Vec::new()
+                        None
                     }
                     Err(_) => {
                         tracing::warn!(
@@ -148,7 +181,7 @@ impl SwitchCensus {
                             "viewer census: a node ran out of its per-node budget, counting \
                              it as zero"
                         );
-                        Vec::new()
+                        None
                     }
                 };
                 (target, viewers)
@@ -156,9 +189,16 @@ impl SwitchCensus {
         }
 
         let mut out = Vec::new();
+        let mut unanswered = HashSet::new();
         while let Some(res) = tasks.join_next().await {
             match res {
-                Ok(pair) => out.push(pair),
+                Ok((target, Some(viewers))) => out.push((target, viewers)),
+                Ok((target, None)) => {
+                    if let Some(node_id) = &target {
+                        unanswered.insert(node_id.clone());
+                    }
+                    out.push((target, Vec::new()));
+                }
                 // m5: contained (one node's gather, not the tick), but previously silent.
                 Err(e) => tracing::error!(
                     error = %e,
@@ -166,7 +206,7 @@ impl SwitchCensus {
                 ),
             }
         }
-        out
+        (out, unanswered)
     }
 
     /// Viewer counts per programme source, gathered across the origin and every
@@ -179,7 +219,7 @@ impl SwitchCensus {
     /// and the client disagree about the audience during every break.
     async fn viewers_by_source(&self) -> HashMap<String, u32> {
         let mut counts: HashMap<String, u32> = HashMap::new();
-        for (_, viewers) in self.gather().await {
+        for (_, viewers) in self.gather().await.0 {
             for v in viewers.iter().filter(|v| is_audience(v)) {
                 // An ad viewer is attributed to nothing here; the caller
                 // adds them per broadcast, because only it knows which
@@ -198,32 +238,34 @@ impl SwitchCensus {
     /// [`Self::viewers_by_source`]: the planner (and now the capacity gauge) would
     /// rather see a node emptier than it is than fuller.
     pub async fn viewers_per_node(&self) -> HashMap<mm_core::fleet::NodeId, i64> {
-        tally(&self.gather().await).per_node
+        tally(&self.gather().await.0).per_node
     }
 
     /// m4: `pool_sync.rs`'s `sync_once` used to call [`Self::viewers_per_node`] and (via
     /// `live_broadcasts`) [`Self::viewers_by_source`] separately — two full gathers of
     /// every node, back to back, in the SAME tick, for data that comes off the exact same
     /// `list_viewers` responses. This does one [`Self::gather`] and derives both answers
-    /// from it, for the one caller (`sync_once`) that needs both.
+    /// from it, for the one caller (`sync_once`) that needs both. It also hands that caller
+    /// the per-(node, broadcast) counts and the nodes that did not answer, which the relay
+    /// tree needs to know where people are still watching.
     ///
     /// `live_broadcasts` on the [`BroadcastCensus`] trait is left untouched (and still
     /// does its own gather) for its OTHER callers, who do not also want `viewers_per_node`
     /// in the same breath.
-    pub async fn viewers_per_node_and_live_broadcasts(
-        &self,
-    ) -> Result<(HashMap<mm_core::fleet::NodeId, i64>, Vec<LiveBroadcast>), String> {
+    pub async fn viewers_per_node_and_live_broadcasts(&self) -> Result<CensusPass, String> {
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT id FROM mm_streams WHERE status = 'active'")
                 .fetch_all(&self.db)
                 .await
                 .map_err(|e| format!("listing active streams failed: {e}"))?;
 
+        let (gathered, unanswered) = self.gather().await;
         let Tally {
             per_node,
             by_source,
             per_node_per_broadcast,
-        } = tally(&self.gather().await);
+            ad_break_nodes,
+        } = tally(&gathered);
         self.insert_relay_usage_samples(&per_node_per_broadcast, Utc::now())
             .await;
 
@@ -251,7 +293,13 @@ impl SwitchCensus {
             })
             .collect();
 
-        Ok((per_node, live))
+        Ok(CensusPass {
+            per_node,
+            live,
+            per_node_per_broadcast,
+            unanswered,
+            ad_break_nodes,
+        })
     }
 
     /// Write this tick's per-(relay, broadcast) viewer counts into
@@ -414,6 +462,32 @@ mod tests {
         assert_eq!(t.per_node.get(&NodeId::new("relay-a")).copied(), Some(0));
         assert_eq!(sample(&t, "relay-a", "b1"), None);
         assert!(t.by_source.is_empty());
+    }
+
+    /// A person on an ad break watches an `ad-…` source that names no programme, so the
+    /// node they are on is marked instead. A relay link or a disconnected session on an ad
+    /// source marks nothing, and the origin is never a node.
+    #[test]
+    fn a_person_on_an_ad_break_marks_their_node() {
+        let t = tally(&[
+            (
+                Some(NodeId::new("relay-a")),
+                vec![session("viewer-b1--alice-example.org", "ad-alice-1", true)],
+            ),
+            (
+                Some(NodeId::new("relay-b")),
+                vec![session("viewer-b1--bob-example.org", "ad-bob-1", false)],
+            ),
+            (
+                None,
+                vec![session("viewer-b1--carol-example.org", "ad-carol-1", true)],
+            ),
+        ]);
+        assert_eq!(
+            t.ad_break_nodes,
+            std::collections::HashSet::from([NodeId::new("relay-a")])
+        );
+        assert_eq!(sample(&t, "relay-a", "b1"), None, "the counts are unchanged");
     }
 
     /// The origin is billed to nobody and written back nowhere.

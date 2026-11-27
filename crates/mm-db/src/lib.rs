@@ -355,6 +355,10 @@ async fn run_pg_migrations_locked(
             "V065_follow_rooms",
             include_str!("../migrations/V065__follow_rooms.sql"),
         ),
+        (
+            "V066_media_path",
+            include_str!("../migrations/V066__media_path.sql"),
+        ),
     ];
 
     // ── Apply-once bookkeeping ───────────────────────────────────────────────
@@ -407,16 +411,16 @@ async fn run_pg_migrations_locked(
         // DDL), each is recorded as it goes, and the database heals itself — which is what
         // the old always-rerun runner did well and this must not lose.
         //
-        // UPDATE THIS PROBE when adding a migration past V065. (V065 creates
-        // the mm_follow_rooms_migrated marker table in its LAST statement;
-        // the table did not exist before V065, so its presence alone proves
-        // the migration ran to completion.)
+        // UPDATE THIS PROBE when adding a migration past V066. (V066's LAST
+        // statement creates the mm_fleet_relay_feeds table; the table did not
+        // exist before V066, so its presence alone proves the migration ran to
+        // completion.)
         //
         let fully_migrated: Option<String> = sqlx::query_scalar(
             "SELECT tablename::text
                FROM pg_tables
               WHERE schemaname = 'public'
-                AND tablename  = 'mm_follow_rooms_migrated'",
+                AND tablename  = 'mm_fleet_relay_feeds'",
         )
         .fetch_optional(pool)
         .await

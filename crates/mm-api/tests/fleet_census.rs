@@ -305,10 +305,11 @@ async fn a_relay_pulling_a_stream_is_not_counted_as_a_viewer() {
     );
 
     // pool_sync's tick takes the same count through the combined gather.
-    let (per_node, live) = census
+    let pass = census
         .viewers_per_node_and_live_broadcasts()
         .await
         .expect("census");
+    let (per_node, live) = (pass.per_node, pass.live);
     let viewers = live
         .iter()
         .find(|b| b.broadcast_id == b1)

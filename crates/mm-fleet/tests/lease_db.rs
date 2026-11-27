@@ -513,11 +513,12 @@ async fn the_live_pool_counts_a_lease_with_no_node_yet_as_idle_and_skips_release
     );
 }
 
-/// Three leases with viewers 0, 0, 5. The lowest-id one has no node row yet (it counts 0).
+/// Three healthy leases with viewers 0, 0, 5.
 async fn three_pool_leases(pool: &PgPool, now: DateTime<Utc>) -> Vec<NodeId> {
     let ids = lease_db::create_autoscale(pool, "eu", 3, Duration::hours(1), now)
         .await
         .expect("create_autoscale");
+    seed_node(pool, ids[0].as_str(), "healthy").await;
     seed_node(pool, ids[1].as_str(), "healthy").await;
     seed_node(pool, ids[2].as_str(), "healthy").await;
     set_viewers(pool, &ids[2], 5).await;
@@ -734,8 +735,9 @@ async fn a_drain_released_autoscale_lease_without_viewers_is_not_extended() {
     .expect("extend_autoscale");
     assert_eq!(
         extended,
-        vec![ids[1].clone(), ids[2].clone()],
-        "an empty drained lease is not extended, however large keep is"
+        vec![ids[1].clone()],
+        "an empty drained lease is not extended, however large keep is (and a lease with no \
+         node row is not eligible)"
     );
     assert_eq!(
         desired_deadline(&pool, &ids[0]).await,
@@ -761,6 +763,7 @@ async fn a_lease_whose_node_is_destroying_or_gone_is_not_extended() {
     set_viewers(&pool, &ids[0], 5).await;
     seed_node(&pool, ids[1].as_str(), "gone").await;
     set_viewers(&pool, &ids[1], 5).await;
+    seed_node(&pool, ids[2].as_str(), "healthy").await;
 
     let now = created + Duration::minutes(30);
     let extended = lease_db::extend_autoscale(&pool, 1, Duration::hours(1), now)
@@ -776,6 +779,311 @@ async fn a_lease_whose_node_is_destroying_or_gone_is_not_extended() {
             desired_deadline(&pool, going).await,
             created + Duration::hours(1)
         );
+    }
+}
+
+// ── fix round 1: eligibility (finding 1) ──────────────────────────────────────
+
+/// A node stuck in boot runs on its first deadline like a manual one, and takes no keep slot.
+#[tokio::test]
+async fn a_booting_lease_in_keep_is_not_extended_and_takes_no_slot() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_booting_lease_in_keep_is_not_extended_and_takes_no_slot"
+        );
+        return;
+    };
+    let created = db_now();
+    let ids = lease_db::create_autoscale(&pool, "eu", 2, Duration::hours(1), created)
+        .await
+        .expect("create_autoscale");
+    seed_node(&pool, ids[0].as_str(), "booting").await;
+    seed_node(&pool, ids[1].as_str(), "healthy").await;
+
+    let now = created + Duration::minutes(30);
+    let extended = lease_db::extend_autoscale(&pool, 1, Duration::hours(1), now)
+        .await
+        .expect("extend_autoscale");
+    assert_eq!(extended, vec![ids[1].clone()]);
+    assert_eq!(
+        desired_deadline(&pool, &ids[0]).await,
+        created + Duration::hours(1),
+        "the booting lease keeps the deadline it was created with"
+    );
+}
+
+#[tokio::test]
+async fn a_lease_with_no_node_row_is_not_extended() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping a_lease_with_no_node_row_is_not_extended");
+        return;
+    };
+    let created = db_now();
+    let ids = lease_db::create_autoscale(&pool, "eu", 1, Duration::hours(1), created)
+        .await
+        .expect("create_autoscale");
+
+    let extended = lease_db::extend_autoscale(
+        &pool,
+        1,
+        Duration::hours(1),
+        created + Duration::minutes(30),
+    )
+    .await
+    .expect("extend_autoscale");
+    assert!(extended.is_empty(), "{extended:?}");
+    assert_eq!(
+        desired_deadline(&pool, &ids[0]).await,
+        created + Duration::hours(1)
+    );
+}
+
+#[tokio::test]
+async fn equal_busy_leases_are_all_extended_and_equal_idle_ones_go_by_id() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping equal_busy_leases_are_all_extended_and_equal_idle_ones_go_by_id"
+        );
+        return;
+    };
+    let created = db_now();
+    let ids = lease_db::create_autoscale(&pool, "eu", 2, Duration::hours(1), created)
+        .await
+        .expect("create_autoscale");
+    for id in &ids {
+        seed_node(&pool, id.as_str(), "healthy").await;
+        set_viewers(&pool, id, 3).await;
+    }
+    let now = created + Duration::minutes(30);
+    let extended = lease_db::extend_autoscale(&pool, 1, Duration::hours(1), now)
+        .await
+        .expect("extend_autoscale");
+    assert_eq!(
+        extended, ids,
+        "both are busy: keep does not limit busy leases"
+    );
+
+    for id in &ids {
+        set_viewers(&pool, id, 0).await;
+    }
+    let extended = lease_db::extend_autoscale(&pool, 1, Duration::hours(1), now)
+        .await
+        .expect("extend_autoscale");
+    assert_eq!(
+        extended,
+        vec![ids[0].clone()],
+        "a tie at zero goes to the lower id"
+    );
+}
+
+// ── fix round 1: sizing the pool (finding 2) ──────────────────────────────────
+
+async fn autoscale_ids(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT mm_node_id FROM mm_fleet_desired WHERE lease_source = 'autoscale' ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn concurrent_top_ups_create_the_shortfall_once() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping concurrent_top_ups_create_the_shortfall_once"
+        );
+        return;
+    };
+    let now = db_now();
+    let (a, b) = tokio::join!(
+        lease_db::top_up_autoscale(&pool, "eu", 2, Duration::hours(1), now),
+        lease_db::top_up_autoscale(&pool, "eu", 2, Duration::hours(1), now),
+    );
+    let mut created: Vec<String> = a
+        .expect("first top-up")
+        .into_iter()
+        .chain(b.expect("second top-up"))
+        .map(|id| id.as_str().to_string())
+        .collect();
+    created.sort();
+    let rows = autoscale_ids(&pool).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "two concurrent calls must not both fill the gap: {rows:?}"
+    );
+    assert_eq!(
+        created, rows,
+        "together the calls name exactly the rows that exist"
+    );
+
+    let again = lease_db::top_up_autoscale(&pool, "eu", 2, Duration::hours(1), now)
+        .await
+        .expect("third top-up");
+    assert!(again.is_empty(), "a full pool creates nothing: {again:?}");
+    assert_eq!(autoscale_ids(&pool).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_top_up_creates_only_the_shortfall_and_ignores_gone_leases() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_top_up_creates_only_the_shortfall_and_ignores_gone_leases"
+        );
+        return;
+    };
+    let now = db_now();
+    lease_db::create_autoscale(&pool, "eu", 1, Duration::hours(1), now)
+        .await
+        .expect("one live lease");
+    let created = lease_db::top_up_autoscale(&pool, "eu", 3, Duration::hours(1), now)
+        .await
+        .expect("top up to 3");
+    assert_eq!(created.len(), 2);
+    assert_eq!(autoscale_ids(&pool).await.len(), 3);
+
+    sqlx::query("DELETE FROM mm_fleet_desired")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let gone = lease_db::create_autoscale(&pool, "eu", 1, Duration::hours(1), now)
+        .await
+        .expect("a lease");
+    seed_node(&pool, gone[0].as_str(), "gone").await;
+    assert!(
+        lease_db::autoscale_live(&pool)
+            .await
+            .expect("live")
+            .is_empty(),
+        "a lease whose node is gone is not live"
+    );
+    let created = lease_db::top_up_autoscale(&pool, "eu", 1, Duration::hours(1), now)
+        .await
+        .expect("top up to 1");
+    assert_eq!(created.len(), 1, "the gone lease is not counted");
+}
+
+#[tokio::test]
+async fn a_top_up_writes_at_most_a_hundred_rows_per_call() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping a_top_up_writes_at_most_a_hundred_rows_per_call"
+        );
+        return;
+    };
+    let created = lease_db::top_up_autoscale(&pool, "eu", 250, Duration::hours(1), db_now())
+        .await
+        .expect("top up to 250");
+    assert_eq!(created.len(), 100);
+    assert_eq!(autoscale_ids(&pool).await.len(), 100);
+}
+
+// ── fix round 1: retiring idle leases (finding 3) ─────────────────────────────
+
+fn deadline_kills() -> u64 {
+    mm_core::metrics_global::FLEET_REAPER_DEADLINE_KILLS
+        .with_label_values(&["fanout"])
+        .get()
+}
+
+async fn set_deadlines(pool: &PgPool, id: &NodeId, deadline: DateTime<Utc>) {
+    for t in ["mm_fleet_desired", "mm_fleet_nodes"] {
+        sqlx::query(&format!(
+            "UPDATE {t} SET destroy_deadline = $2 WHERE mm_node_id = $1"
+        ))
+        .bind(id.as_str())
+        .bind(deadline)
+        .execute(pool)
+        .await
+        .expect("set deadline");
+    }
+}
+
+/// One rented autoscale lease in `state`, both deadlines `until` after `now`.
+async fn pool_lease_due_in(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    state: &str,
+    until: Duration,
+) -> NodeId {
+    let ids = lease_db::create_autoscale(pool, "eu", 1, Duration::hours(1), now)
+        .await
+        .expect("create_autoscale");
+    seed_node(pool, ids[0].as_str(), state).await;
+    set_deadlines(pool, &ids[0], now + until).await;
+    ids[0].clone()
+}
+
+async fn desired_exists(pool: &PgPool, id: &NodeId) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM mm_fleet_desired WHERE mm_node_id = $1)")
+        .bind(id.as_str())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_idle_lease_about_to_lapse_is_retired_without_a_deadline_kill() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping an_idle_lease_about_to_lapse_is_retired_without_a_deadline_kill"
+        );
+        return;
+    };
+    let now = db_now();
+    let id = pool_lease_due_in(&pool, now, "healthy", Duration::minutes(2)).await;
+    let kills = deadline_kills();
+
+    let retired = lease_db::retire_idle_autoscale(&pool, Duration::minutes(3), now)
+        .await
+        .expect("retire");
+    assert_eq!(retired, vec![id.clone()]);
+    assert!(
+        !desired_exists(&pool, &id).await,
+        "the desired row is withdrawn"
+    );
+    assert_eq!(node_state(&pool, id.as_str()).await, "destroying");
+    assert_eq!(
+        deadline_kills(),
+        kills,
+        "an ordered teardown is not a deadline kill"
+    );
+}
+
+#[tokio::test]
+async fn busy_distant_booting_forced_and_manual_leases_are_not_retired() {
+    let Some((pool, _g)) = setup().await else {
+        eprintln!(
+            "MM_DATABASE_URL not set — skipping busy_distant_booting_forced_and_manual_leases_are_not_retired"
+        );
+        return;
+    };
+    let now = db_now();
+    let busy = pool_lease_due_in(&pool, now, "healthy", Duration::minutes(2)).await;
+    set_viewers(&pool, &busy, 1).await;
+    let distant = pool_lease_due_in(&pool, now, "healthy", Duration::minutes(10)).await;
+    let booting = pool_lease_due_in(&pool, now, "booting", Duration::minutes(2)).await;
+    let forced = pool_lease_due_in(&pool, now, "healthy", Duration::minutes(2)).await;
+    lease_db::release(&pool, &forced, true)
+        .await
+        .expect("force release");
+    let mut manual_req = req(Uuid::new_v4(), 1);
+    manual_req.duration_hint = Some(Duration::minutes(15));
+    let manual = lease_db::create(&pool, &manual_req).await.expect("manual")[0].clone();
+    seed_node(&pool, manual.as_str(), "healthy").await;
+    set_deadlines(&pool, &manual, now + Duration::minutes(2)).await;
+
+    let retired = lease_db::retire_idle_autoscale(&pool, Duration::minutes(3), now)
+        .await
+        .expect("retire");
+    assert!(retired.is_empty(), "{retired:?}");
+    for id in [&busy, &distant, &booting, &forced, &manual] {
+        assert!(
+            desired_exists(&pool, id).await,
+            "{id} must keep its desired row"
+        );
+        assert_ne!(node_state(&pool, id.as_str()).await, "destroying", "{id}");
     }
 }
 

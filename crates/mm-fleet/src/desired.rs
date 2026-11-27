@@ -185,11 +185,43 @@ pub struct TeardownTarget {
 pub const DESIRED_WRITE_LOCK: i64 = 0x6d6d_666c_6565_74;
 
 async fn lock_desired(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), StoreError> {
+    take_desired_write_lock(tx).await?;
+    Ok(())
+}
+
+/// Takes [`DESIRED_WRITE_LOCK`] for the rest of `tx`. For a writer in this crate outside the
+/// store (the autoscale pool in `lease_db`) that must hold it across its own reads.
+pub(crate) async fn take_desired_write_lock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> sqlx::Result<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(DESIRED_WRITE_LOCK)
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// The two statements of [`DesiredStore::order_teardown`], inside the caller's transaction,
+/// which must already hold [`DESIRED_WRITE_LOCK`] and must only name a rented node (the
+/// reapable check is the caller's). Returns whether the node moved into `destroying`.
+pub(crate) async fn order_teardown_statements(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    node: &NodeId,
+) -> sqlx::Result<bool> {
+    sqlx::query("DELETE FROM mm_fleet_desired WHERE mm_node_id = $1")
+        .bind(node.as_str())
+        .execute(&mut **tx)
+        .await?;
+    let moved = sqlx::query(
+        "UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1 AND state NOT IN ($2, $3)",
+    )
+    .bind(node.as_str())
+    .bind(NodeState::Destroying.as_str())
+    .bind(NodeState::Gone.as_str())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(moved > 0)
 }
 
 pub struct DesiredStore {
@@ -536,21 +568,9 @@ impl DesiredStore {
         // last desired row.
         let mut tx = self.pool.begin().await?;
         lock_desired(&mut tx).await?;
-        sqlx::query("DELETE FROM mm_fleet_desired WHERE mm_node_id = $1")
-            .bind(target.mm_node_id.as_str())
-            .execute(&mut *tx)
-            .await?;
-        let moved = sqlx::query(
-            "UPDATE mm_fleet_nodes SET state = $2 WHERE mm_node_id = $1 AND state NOT IN ($2, $3)",
-        )
-        .bind(target.mm_node_id.as_str())
-        .bind(NodeState::Destroying.as_str())
-        .bind(NodeState::Gone.as_str())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let moved = order_teardown_statements(&mut tx, &target.mm_node_id).await?;
         tx.commit().await?;
-        Ok(moved > 0)
+        Ok(moved)
     }
 
     /// Steps 3–4: destroy at the provider, then mark `gone`. The fleet runner's destroy path,

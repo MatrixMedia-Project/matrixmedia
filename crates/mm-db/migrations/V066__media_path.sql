@@ -2,9 +2,11 @@
 --
 -- `mm_streams.media_path` is the state a stream was fixed in when it started
 -- ('core' until the stream-start code writes it). `mm_fleet_relay_feeds` is the
--- relay tree: per stream, which relay is fed by which. A NULL feeder means the
--- relay pulls the stream from the stream's entry; `depth` is hops from the
--- entry (the relay chain is at most 3 long).
+-- relay tree: per stream, which relay pulls from which, as last confirmed by the
+-- relay's switch. `depth` is an upper bound on hops from the stream's entry (the
+-- relay chain is at most 3 long). A NULL feeder at depth 1 pulls from the entry;
+-- a NULL feeder at depth 3 is an adopted leaf: it carries the stream, where it
+-- pulls from is unknown, and it never feeds another relay.
 --
 -- Re-runnable like every migration here: IF NOT EXISTS throughout.
 --

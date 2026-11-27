@@ -173,8 +173,11 @@ pub struct RelayPlace {
     pub viewers: u32,
 }
 
-/// One row of `mm_fleet_relay_feeds`: `node_id` carries `stream_id`, pulled from
-/// `feeder` (`None` = the stream's entry), `depth` hops from the entry.
+/// One row of `mm_fleet_relay_feeds`: `node_id` carries `stream_id`, pulling from
+/// `feeder`. `depth` is an upper bound on its hops from the stream's entry. A `None`
+/// feeder at depth 1 pulls from the entry; a `None` feeder at depth `MAX_RELAY_DEPTH` is
+/// an adopted leaf: it carries the stream, where it pulls from is unknown, and it never
+/// feeds anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedRow {
     pub stream_id: String,
@@ -200,8 +203,9 @@ pub struct FeedPlan {
     /// Stored rows that stay as they are and are seeded against their own feeder: those
     /// whose chain reaches the entry, and those below an orphan.
     pub keep: Vec<FeedRow>,
-    /// For each ORPHAN (a row that stays, but whose feeder left the relays or has no row
-    /// that stays): the row it gets if its source has to be created again. The stored
+    /// For each ORPHAN (a row that stays, but whose feeder is no longer a relay or has no
+    /// stored row, or whose hop to its feeder is not trusted by the depth rule, or whose
+    /// chain loops): the row it gets if its source has to be created again. The stored
     /// row is left as it is; the orphan is seeded against this row's feeder, and this
     /// row is written only if that seed created or re-created the source.
     pub fallback: Vec<FeedRow>,
@@ -219,7 +223,8 @@ pub struct FeedPlan {
 enum Standing {
     /// Its chain of rows reaches the entry.
     Rooted,
-    /// Its feeder left the relays or has no row that stays (or its chain loops).
+    /// Its feeder is no longer a relay or has no stored row; or its recorded depth is not
+    /// above its feeder's, so the hop is not trusted (see `standing`); or its chain loops.
     Orphan,
     /// Its chain reaches an orphan.
     BelowOrphan,
@@ -235,16 +240,20 @@ enum Standing {
 /// * `existing`: the stored rows.
 ///
 /// Wanted only decides who JOINS; it never cuts anyone off. A stored row stays while its
-/// node is still a relay and its stream is wanted or the pair is held; a row on a node
-/// that is no longer a relay is forgotten, any other row is removed. Rows that stay are
-/// never changed here (see [`FeedPlan`]).
+/// node is still a relay and its stream is wanted or the pair is held, or while a row
+/// that stays pulls from it; a row on a node that is no longer a relay is forgotten, any
+/// other row is removed. Rows that stay are never changed here (see [`FeedPlan`]).
 ///
-/// Carriers (what [`feeder_for`] may choose from) are only relays whose chain of rows
-/// reaches the entry: rooted rows and rows added this tick. An orphan and everything
-/// below it carry nothing, so nobody joins under a branch whose top lost its feeder.
-/// Relays are visited in id order:
+/// Carriers (what [`feeder_for`] may choose from) are only STORED rows that stay, are
+/// rooted (their chain reaches the entry through hops the depth rule trusts) and sit
+/// below the depth limit. A relay added in this plan carries nothing until its row is
+/// written; an orphan and everything below it carry nothing, so nobody joins under a
+/// branch whose top lost its feeder. Relays are visited in id order:
 /// * a relay with no row joins a wanted stream, fed by [`feeder_for`] over the carriers
-///   so far (depth = the feeder's + 1, or 1 for the entry);
+///   (depth = the feeder's + 1, or 1 for the entry). At most one such add per stream per
+///   plan takes the entry, chosen by `turn` among those whose only choice is the entry
+///   (in id order, `turn % count`); the others wait a tick. A relay
+///   that rows still pull from is bounded to sit above the shallowest of them.
 /// * an orphan gets a fallback: [`feeder_for`] over the carriers that are not below it
 ///   and sit above its recorded depth, else the entry. So its depth never grows, and the
 ///   recorded depths below it stay upper bounds of where those relays really are.
@@ -253,6 +262,7 @@ pub fn plan_feeds(
     wanted_streams: &[String],
     held: &HashSet<(String, NodeId)>,
     existing: &[FeedRow],
+    turn: u64,
 ) -> FeedPlan {
     let mut relays_in_order: Vec<&RelayPlace> = relays.iter().collect();
     relays_in_order.sort_by(|a, b| a.id.cmp(&b.id));
@@ -374,6 +384,26 @@ pub fn plan_feeds(
         plan.remove
             .extend(remove.into_iter().map(|r| (stream.to_string(), r.node_id.clone())));
 
+        // Only stored rows are carriers: a row is a confirmed fact (a seed reported it
+        // created the source, pulling from that feeder), a planned row is not, and a
+        // relay feeding others from an unconfirmed place can put them deeper than
+        // recorded. So a relay added below feeds nobody in this plan; it becomes a
+        // carrier on the next tick, once its row is written. To keep relays that join
+        // together from each taking a copy from the entry, at most one ORDINARY add per
+        // stream per plan may be fed by the entry; any other whose only choice is the
+        // entry waits for the next tick, when it can pull from the one that went first.
+        // The tree thus grows by one confirmed level per tick. The bounded add (a relay
+        // that rows still pull from) and orphan fallbacks are repairs, not limited.
+        //
+        // Which relay takes the entry ROTATES with `turn`: a relay that is in the pool
+        // but cannot be seeded would otherwise take the slot on every tick, and every
+        // other relay of the stream would wait behind it for good. `turn` comes from the
+        // wall clock (see `sync_once`), not a per-process counter, because two server
+        // instances that picked different relays would each send one a copy from the
+        // entry. With a stored carrier present nobody needs the entry, so the rotation
+        // changes nothing.
+        let mut adds: Vec<FeedRow> = Vec::new();
+        let mut entry_only: Vec<FeedRow> = Vec::new();
         for place in &relays_in_order {
             if let Some(orphan) = orphans.get(&place.id) {
                 let under = below(&place.id);
@@ -407,15 +437,26 @@ pub fn plan_feeds(
                     None => carriers.clone(),
                 };
                 let (feeder, depth) = feed_from(place, &candidates);
-                carriers.push(carrier(place, depth));
-                plan.add.push(FeedRow {
+                let row = FeedRow {
                     stream_id: stream.to_string(),
                     node_id: place.id.clone(),
                     feeder,
                     depth,
-                });
+                };
+                if row.feeder.is_none() && children.is_none() {
+                    entry_only.push(row);
+                } else {
+                    adds.push(row);
+                }
             }
         }
+        if !entry_only.is_empty() {
+            // Usize fits any count of relays; the remainder is below it.
+            let pick = (turn % entry_only.len() as u64) as usize;
+            adds.push(entry_only.swap_remove(pick));
+            adds.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        }
+        plan.add.extend(adds);
     }
     plan
 }
@@ -775,6 +816,8 @@ pub struct PoolSyncContext {
     pub public_switch_base_url: Option<String>,
     /// A relay's switch base URL from its `public_ip`.
     relay_base_url: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    /// The sync interval, which numbers the turns of the relay tree's entry slot.
+    tick: StdDuration,
 }
 
 impl PoolSyncContext {
@@ -788,7 +831,25 @@ impl PoolSyncContext {
             switch_secret,
             public_switch_base_url,
             relay_base_url: Arc::new(|ip| format!("http://{ip}:{SWITCH_PORT}")),
+            tick: StdDuration::from_secs(10),
         }
+    }
+
+    /// Set the sync interval the entry slot's turn counts. `run_pool_sync` sets it from
+    /// its own interval. Tests set a very long one to keep the turn at 0, so the lowest id
+    /// among the relays needing the entry takes it.
+    pub fn with_tick(mut self, tick: StdDuration) -> Self {
+        self.tick = tick;
+        self
+    }
+
+    /// The relay tree's turn at `now`: the wall clock divided by the sync interval, so it
+    /// advances by one each tick and two server instances agree on it (see
+    /// [`plan_feeds`]).
+    fn turn(&self, now: SystemTime) -> u64 {
+        let since_epoch = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        let tick_ms = self.tick.as_millis().max(1);
+        u64::try_from(since_epoch.as_millis() / tick_ms).unwrap_or(u64::MAX)
     }
 
     /// Replace how a relay's address becomes its switch URL. For tests, whose stand-in
@@ -927,7 +988,7 @@ async fn feed_relays(
     };
 
     let held = held_pairs(pass, &existing);
-    let plan = plan_feeds(relays, &wanted, &held, &existing);
+    let plan = plan_feeds(relays, &wanted, &held, &existing, ctx.turn(SystemTime::now()));
 
     let place_of: HashMap<&NodeId, &RelayPlace> = relays.iter().map(|r| (&r.id, r)).collect();
     let origin_of = |feeder: &Option<NodeId>| match feeder {
@@ -1172,6 +1233,8 @@ pub async fn run_pool_sync(
     interval: StdDuration,
     cancel: CancellationToken,
 ) {
+    // The turn counts ticks of THIS interval.
+    let ctx = PoolSyncContext { tick: interval, ..ctx };
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1486,7 +1549,7 @@ mod tests {
 
     #[test]
     fn the_first_relay_is_fed_by_the_entry() {
-        let plan = plan_feeds(&[relay("r1", "ams", 0)], &wanted(), &held(&[]), &[]);
+        let plan = plan_feeds(&[relay("r1", "ams", 0)], &wanted(), &held(&[]), &[], 0);
         assert_eq!(
             plan,
             FeedPlan {
@@ -1500,7 +1563,7 @@ mod tests {
     fn a_second_relay_is_fed_by_the_closest_relay_not_the_entry() {
         let relays = [relay("r1", "ams", 0), relay("r2", "ams", 0)];
         let existing = [feed("r1", None, 1)];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert_eq!(
             plan,
             FeedPlan {
@@ -1516,7 +1579,7 @@ mod tests {
     fn a_relay_whose_feeder_left_keeps_its_row() {
         let relays = [relay("r2", "ams", 0)];
         let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert!(plan.keep.is_empty(), "r2 is not kept as a normal row: {:?}", plan.keep);
         assert_eq!(
             plan.fallback,
@@ -1543,7 +1606,7 @@ mod tests {
             feed("r2", Some("r1"), 2),
             feed("r3", Some("r2"), 3),
         ];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert_eq!(plan.fallback, vec![feed("r2", None, 1)]);
         assert_eq!(plan.keep, vec![feed("r3", Some("r2"), 3)]);
         assert!(plan.remove.is_empty() && plan.add.is_empty());
@@ -1553,7 +1616,7 @@ mod tests {
         // depth (3) stays an upper bound of where it really is (2).
         let after = apply(&existing, &plan, &["r2"]);
         assert_eq!(after, vec![feed("r2", None, 1), feed("r3", Some("r2"), 3)]);
-        let next = plan_feeds(&relays, &wanted(), &held(&[]), &after);
+        let next = plan_feeds(&relays, &wanted(), &held(&[]), &after, 0);
         assert!(next.fallback.is_empty() && next.remove.is_empty() && next.forget.is_empty());
         assert_eq!(kept(&next), vec!["r2", "r3"]);
     }
@@ -1567,7 +1630,7 @@ mod tests {
             feed("a", Some("x"), 2),
             feed("b", Some("a"), 3),
         ];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert_eq!(plan.fallback, vec![feed("a", None, 1)], "never b: b pulls from a");
         assert_eq!(plan.keep, vec![feed("b", Some("a"), 3)]);
         assert!(plan.remove.is_empty() && plan.add.is_empty());
@@ -1588,7 +1651,7 @@ mod tests {
             feed("x", None, 1),
             feed("o", Some("x"), 2),
         ];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert_eq!(plan.fallback, vec![feed("o", Some("c1"), 2)]);
         assert!(plan.fallback.iter().all(|f| f.depth <= 2));
     }
@@ -1605,7 +1668,7 @@ mod tests {
             feed("a", Some("x"), 2),
             feed("b", Some("a"), 3),
         ];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert_eq!(plan.add, vec![feed("n", None, 1)], "neither a nor b may feed n");
     }
 
@@ -1626,7 +1689,7 @@ mod tests {
 
         // 1. X starts draining: A has lost its feeder, but its source still pulls from X.
         let relays = all(&["A", "B", "C", "Y"]);
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 0);
         assert_eq!(plan.fallback.len(), 1, "{plan:?}");
         assert_eq!(plan.fallback[0].node_id, NodeId::new("A"));
         assert_ne!(plan.fallback[0].feeder, Some(NodeId::new("B")));
@@ -1636,20 +1699,20 @@ mod tests {
 
         // 2. Y leaves too. Nothing has been re-created: rows only lose Y.
         let relays = all(&["A", "B", "C"]);
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 0);
         assert_ne!(plan.fallback[0].feeder, Some(NodeId::new("B")));
         rows = apply(&rows, &plan, &[]);
         assert_tree(&rows, "Y leaves");
 
         // 3. X is destroyed: A's source dies and is re-created from its fallback.
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 0);
         let fallback = plan.fallback[0].clone();
         assert_ne!(fallback.feeder, Some(NodeId::new("B")), "B pulls from A");
         rows = apply(&rows, &plan, &["A"]);
         assert_tree(&rows, "A re-created");
 
         // 4. The tree is whole again, with every recorded depth an upper bound.
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 0);
         assert!(plan.fallback.is_empty() && plan.remove.is_empty(), "{plan:?}");
         rows = apply(&rows, &plan, &[]);
         assert_tree(&rows, "settled");
@@ -1658,52 +1721,160 @@ mod tests {
 
     #[test]
     fn depth_never_exceeds_three() {
-        // Five relays in one zone. The busier a relay, the less it is chosen, so each new
-        // relay prefers the deepest carrier it may use: that walks the tree to its limit.
-        let relays = [
+        // Relays join one per tick, the busier the less chosen, so each new relay prefers
+        // the deepest stored carrier it may use: that walks the tree to its limit.
+        let all = [
             relay("r1", "ams", 50),
             relay("r2", "ams", 40),
             relay("r3", "ams", 30),
             relay("r4", "ams", 20),
             relay("r5", "ams", 10),
         ];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &[]);
+        let mut rows: Vec<FeedRow> = Vec::new();
+        let mut added = Vec::new();
+        for n in 1..=all.len() {
+            let plan = plan_feeds(&all[..n], &wanted(), &held(&[]), &rows, 0);
+            assert!(plan.fallback.is_empty() && plan.remove.is_empty() && plan.forget.is_empty());
+            added.extend(plan.add.iter().cloned());
+            rows = apply(&rows, &plan, &[]);
+        }
         assert_eq!(
-            plan.add,
+            added,
             vec![
                 feed("r1", None, 1),
                 feed("r2", Some("r1"), 2),
-                // A carrier at depth 2 may feed a new relay: the new one is at depth 3.
+                // A stored carrier at depth 2 may feed a new relay: the new one is at 3.
                 feed("r3", Some("r2"), 3),
                 // r3 is the least busy carrier but sits at depth 3, so it feeds nobody.
                 feed("r4", Some("r2"), 3),
                 feed("r5", Some("r2"), 3),
             ]
         );
-        assert!(plan.keep.is_empty() && plan.fallback.is_empty());
-        assert!(plan.remove.is_empty() && plan.forget.is_empty());
-
-        let rows: HashMap<&NodeId, &FeedRow> =
-            plan.add.iter().map(|r| (&r.node_id, r)).collect();
-        for row in &plan.add {
-            assert!(row.depth >= 1 && row.depth <= MAX_RELAY_DEPTH, "{row:?}");
-            // Walk up to the entry: never meets the row itself, and the hops match the depth.
+        assert_tree(&rows, "grown");
+        let row_of: HashMap<&NodeId, &FeedRow> = rows.iter().map(|r| (&r.node_id, r)).collect();
+        for row in &rows {
+            // Walk up to the entry: the hops match the recorded depth.
             let mut hops = 1;
             let mut up = row.feeder.clone();
             while let Some(f) = up {
-                assert_ne!(f, row.node_id, "{} is its own ancestor", row.node_id);
                 hops += 1;
-                up = rows[&f].feeder.clone();
+                up = row_of[&f].feeder.clone();
             }
             assert_eq!(hops, row.depth, "{row:?}");
         }
     }
 
     #[test]
+    fn relays_that_join_together_take_one_copy_from_the_entry() {
+        let relays = [relay("a", "ams", 0), relay("b", "ams", 0), relay("c", "ams", 0)];
+        let first = plan_feeds(&relays, &wanted(), &held(&[]), &[], 0);
+        assert_eq!(first.add, vec![feed("a", None, 1)], "only the lowest id, from the entry");
+        let rows = apply(&[], &first, &[]);
+        let second = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 0);
+        assert_eq!(second.add, vec![feed("b", Some("a"), 2), feed("c", Some("a"), 2)]);
+        let from_entry = first
+            .add
+            .iter()
+            .chain(&second.add)
+            .filter(|r| r.feeder.is_none())
+            .count();
+        assert_eq!(from_entry, 1, "the main server sends one copy, not one per relay");
+    }
+
+    #[test]
+    fn the_entry_slot_rotates_with_the_turn() {
+        // Three new relays, no stored carrier: one of them takes the entry per plan, and
+        // which one moves with the turn.
+        let relays = [relay("a", "ams", 0), relay("b", "ams", 0), relay("c", "ams", 0)];
+        for (turn, first) in [(0, "a"), (1, "b"), (2, "c"), (3, "a")] {
+            let plan = plan_feeds(&relays, &wanted(), &held(&[]), &[], turn);
+            assert_eq!(plan.add, vec![feed(first, None, 1)], "turn {turn}");
+        }
+    }
+
+    /// The turn is the wall clock in sync intervals: one step per tick, the same in any
+    /// server instance looking at the same clock.
+    #[test]
+    fn the_turn_advances_once_per_tick_from_the_wall_clock() {
+        let ctx = || {
+            PoolSyncContext::new(ConfigHandle::new(mm_core::config::Config::default()), None, None)
+                .with_tick(StdDuration::from_secs(10))
+        };
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + StdDuration::from_secs(secs);
+        assert_eq!(ctx().turn(at(1_000)), 100);
+        assert_eq!(ctx().turn(at(1_009)), 100);
+        assert_eq!(ctx().turn(at(1_010)), 101);
+        assert_eq!(ctx().turn(at(1_010)), ctx().turn(at(1_010)), "two instances agree");
+    }
+
+    /// The stall rotation fixes: a is in the pool, but its seed fails on every tick.
+    #[test]
+    fn a_relay_that_cannot_be_seeded_does_not_hold_the_entry() {
+        let relays = [relay("a", "ams", 0), relay("b", "ams", 0), relay("c", "ams", 0)];
+        // Tick 0: a takes the entry; its seed fails, so no row is written.
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &[], 0);
+        assert_eq!(plan.add, vec![feed("a", None, 1)]);
+        let rows: Vec<FeedRow> = Vec::new();
+        // Tick 1: the slot has moved on: b takes the entry, is seeded, and is stored.
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 1);
+        assert_eq!(plan.add, vec![feed("b", None, 1)], "exactly one relay, and not a");
+        let rows = apply(&rows, &plan, &[]);
+        // Tick 2: a stored carrier exists: the rest pull from b, whatever the turn.
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 2);
+        assert_eq!(plan.add, vec![feed("a", Some("b"), 2), feed("c", Some("b"), 2)]);
+    }
+
+    #[test]
+    fn a_relay_added_in_this_plan_feeds_nobody_in_this_plan() {
+        // c is stored and busy. a joins under c; b would prefer the idle a, but a's source
+        // is not confirmed yet.
+        let relays = [relay("a", "ams", 0), relay("b", "ams", 0), relay("c", "ams", 50)];
+        let existing = [feed("c", None, 1)];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
+        assert_eq!(plan.add, vec![feed("a", Some("c"), 2), feed("b", Some("c"), 2)]);
+    }
+
+    /// Re-review finding: X was added as X←Q (3) and its seed created the source, but the
+    /// row write was lost. On the next tick X is planned again and a new relay Y arrives.
+    #[test]
+    fn the_lost_row_sequence_cannot_reach_depth_four() {
+        // P2 is the least busy stored carrier, so X is re-planned under it; X itself (idle)
+        // would be the most attractive feeder for Y, were it offered.
+        let relays = [
+            relay("P1", "ams", 50),
+            relay("P2", "ams", 5),
+            relay("Q", "ams", 50),
+            relay("X", "ams", 0),
+            relay("Y", "ams", 0),
+        ];
+        let stored = vec![feed("P1", None, 1), feed("P2", None, 1), feed("Q", Some("P1"), 2)];
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &stored, 0);
+        let x = NodeId::new("X");
+        assert!(
+            plan.add.iter().all(|r| r.feeder.as_ref() != Some(&x)),
+            "Y is never planned under X in the tick X is re-planned: {:?}",
+            plan.add
+        );
+        let y = plan.add.iter().find(|r| r.node_id.as_str() == "Y").expect("Y added").clone();
+        assert!(y.depth <= 2, "Y hangs off a stored carrier at depth 1: {y:?}");
+
+        // X's seed finds its source (pulling from Q, depth 3): adopted. Y's seed creates.
+        let mut rows = stored.clone();
+        rows.push(feed("X", None, MAX_RELAY_DEPTH));
+        rows.push(y);
+        assert_tree(&rows, "after the tick");
+        // From now on X feeds nobody.
+        let more = [&relays[..], &[relay("Z", "ams", 0)]].concat();
+        let plan = plan_feeds(&more, &wanted(), &held(&[]), &rows, 0);
+        assert!(plan.add.iter().all(|r| r.feeder.as_ref() != Some(&x)), "{:?}", plan.add);
+        assert!(plan.fallback.iter().all(|r| r.feeder.as_ref() != Some(&x)));
+    }
+
+    #[test]
     fn a_stream_no_longer_wanted_loses_all_its_feeds() {
         let relays = [relay("r1", "ams", 0), relay("r2", "ams", 0)];
         let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
-        let plan = plan_feeds(&relays, &[], &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &[], &held(&[]), &existing, 0);
         assert_eq!(nodes(&plan.remove), vec!["r1", "r2"], "nobody is connected: removed");
         assert_eq!(plan.remove[0].1.as_str(), "r2", "the deepest goes first");
         assert!(plan.add.is_empty() && plan.keep.is_empty() && plan.fallback.is_empty());
@@ -1714,7 +1885,7 @@ mod tests {
     fn a_stream_under_the_line_keeps_the_relays_people_are_on() {
         let relays = [relay("r1", "ams", 3), relay("r2", "ams", 0)];
         let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
-        let plan = plan_feeds(&relays, &[], &held(&["r1"]), &existing);
+        let plan = plan_feeds(&relays, &[], &held(&["r1"]), &existing, 0);
         assert_eq!(nodes(&plan.remove), vec!["r2"]);
         assert_eq!(kept(&plan), vec!["r1"]);
         assert!(plan.add.is_empty() && plan.fallback.is_empty() && plan.forget.is_empty());
@@ -1724,7 +1895,7 @@ mod tests {
     fn a_feeder_is_kept_while_its_downstream_is_held() {
         let relays = [relay("r1", "ams", 1), relay("r2", "ams", 4)];
         let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
-        let plan = plan_feeds(&relays, &[], &held(&["r1", "r2"]), &existing);
+        let plan = plan_feeds(&relays, &[], &held(&["r1", "r2"]), &existing, 0);
         assert_eq!(
             plan,
             FeedPlan {
@@ -1738,7 +1909,7 @@ mod tests {
     fn no_relay_joins_a_stream_that_is_not_wanted() {
         let relays = [relay("r1", "ams", 2), relay("r2", "ams", 0)];
         let existing = [feed("r1", None, 1)];
-        let plan = plan_feeds(&relays, &[], &held(&["r1"]), &existing);
+        let plan = plan_feeds(&relays, &[], &held(&["r1"]), &existing, 0);
         assert_eq!(
             plan,
             FeedPlan {
@@ -1752,7 +1923,7 @@ mod tests {
     fn a_held_relay_that_lost_its_feeder_is_fed_again() {
         let relays = [relay("r2", "ams", 5)];
         let existing = [feed("r1", None, 1), feed("r2", Some("r1"), 2)];
-        let plan = plan_feeds(&relays, &[], &held(&["r2"]), &existing);
+        let plan = plan_feeds(&relays, &[], &held(&["r2"]), &existing, 0);
         assert_eq!(plan.fallback, vec![feed("r2", None, 1)]);
         assert!(plan.remove.is_empty(), "people are on r2: no removal");
         assert_eq!(nodes(&plan.forget), vec!["r1"]);
@@ -1766,7 +1937,7 @@ mod tests {
         // A's list at this census. A is still held by B's row.
         let relays = [relay("a", "ams", 0), relay("b", "ams", 2)];
         let existing = [feed("a", None, 1), feed("b", Some("a"), 2)];
-        let plan = plan_feeds(&relays, &[], &held(&["b"]), &existing);
+        let plan = plan_feeds(&relays, &[], &held(&["b"]), &existing, 0);
         assert!(plan.remove.is_empty(), "{:?}", plan.remove);
         assert_eq!(kept(&plan), vec!["a", "b"]);
         assert!(plan.fallback.is_empty() && plan.add.is_empty() && plan.forget.is_empty());
@@ -1776,7 +1947,7 @@ mod tests {
     fn when_the_last_row_below_a_feeder_goes_the_feeder_is_judged_on_its_own() {
         let relays = [relay("a", "ams", 0), relay("b", "ams", 0)];
         let existing = [feed("a", None, 1), feed("b", Some("a"), 2)];
-        let plan = plan_feeds(&relays, &[], &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &[], &held(&[]), &existing, 0);
         assert_eq!(nodes(&plan.remove), vec!["a", "b"]);
         assert!(plan.keep.is_empty() && plan.fallback.is_empty());
     }
@@ -1793,7 +1964,7 @@ mod tests {
         ];
 
         // 1. Under the line, only B held: A is not removed while B's row pulls from it.
-        let plan = plan_feeds(&relays, &[], &held(&["B"]), &rows);
+        let plan = plan_feeds(&relays, &[], &held(&["B"]), &rows, 0);
         assert!(
             !plan.remove.iter().any(|(_, n)| n.as_str() == "A"),
             "A feeds a kept row: {:?}",
@@ -1811,7 +1982,7 @@ mod tests {
             relay("C1", "ams", 0),
             relay("N", "ams", 0),
         ];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 0);
         let add_a = plan.add.iter().find(|r| r.node_id.as_str() == "A").expect("A added");
         assert!(add_a.depth <= 1, "B (recorded 2) pulls from A: {add_a:?}");
         rows = apply(&rows, &plan, &[]);
@@ -1820,7 +1991,7 @@ mod tests {
         // 3. Settle: physical depth is the recorded one here (every seed created its
         // source), and nothing sits deeper than 3, N included.
         for _ in 0..3 {
-            let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows);
+            let plan = plan_feeds(&relays, &wanted(), &held(&[]), &rows, 0);
             rows = apply(&rows, &plan, &[]);
             assert_tree(&rows, "settle");
         }
@@ -1843,7 +2014,7 @@ mod tests {
         // A at depth 2 and B at 3 behind a recorded 2.
         let relays = [relay("a", "ams", 0), relay("b", "ams", 0), relay("c", "ams", 0)];
         let existing = [feed("b", Some("a"), 2), feed("c", None, 1)];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert_eq!(plan.add, vec![feed("a", None, 1)], "the entry, not c");
     }
 
@@ -1874,7 +2045,7 @@ mod tests {
         // a new relay n.
         let relays = [relay("m", "ams", 0), relay("n", "ams", 0), relay("x", "ams", 0)];
         let existing = [leaf.clone(), feed("m", Some("y"), 3)];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert_eq!(plan.fallback, vec![feed("m", None, 1)]);
         assert_eq!(plan.add, vec![feed("n", None, 1)]);
         assert_eq!(plan.keep, vec![leaf.clone()]);
@@ -1891,7 +2062,7 @@ mod tests {
         // an upper bound, so c is treated as an orphan, and nothing joins under it.
         let relays = [relay("c", "ams", 0), relay("n", "ams", 0), relay("x", "ams", 0)];
         let existing = [feed("c", Some("x"), 2), feed("x", None, MAX_RELAY_DEPTH)];
-        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing);
+        let plan = plan_feeds(&relays, &wanted(), &held(&[]), &existing, 0);
         assert_eq!(plan.fallback, vec![feed("c", None, 1)]);
         assert_eq!(plan.add, vec![feed("n", None, 1)], "neither c nor x feeds n");
         assert!(plan.remove.is_empty());

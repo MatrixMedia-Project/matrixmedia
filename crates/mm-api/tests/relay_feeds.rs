@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -35,6 +36,10 @@ struct Calls {
 }
 
 type Recorder = Arc<Mutex<Calls>>;
+
+/// The tests here share one database, and a sync plans every healthy relay in it: two
+/// tests running at once would plan each other's relays for their streams. One at a time.
+static SERIAL: Mutex<()> = Mutex::const_new(());
 
 /// A stand-in origin: fixed source and viewer lists. Returns its base URL.
 async fn fake_origin(sources: Value, viewers: Value) -> String {
@@ -142,6 +147,9 @@ fn context(addresses: HashMap<String, String>) -> mm_api::pool_sync::PoolSyncCon
             // Nodes other tests left behind: refused at once, never one of ours.
             .unwrap_or_else(|| "http://127.0.0.1:1".to_string())
     })
+    // Turn 0 on every pass: the entry slot goes to the lowest id, and these tests' relay
+    // ids sort before anything other tests may have left in the database.
+    .with_tick(Duration::from_secs(1 << 40))
 }
 
 /// The origins (`origin_url`) of the seeds `calls` received for `source`, in order.
@@ -178,13 +186,14 @@ async fn feeds(db: &sqlx::PgPool, stream_id: &str) -> Vec<(String, Option<String
     rows
 }
 
-/// One stream through the life of its relay tree: the first relay is fed by the entry
-/// and the second by the first; every row is seeded again on every pass; a feeder that
+/// One stream through the life of its relay tree: the first relay is fed by the entry,
+/// and the second, a pass later, by the first; every row is seeded again on every pass; a feeder that
 /// leaves the relay list removes nothing downstream and changes no row until the
 /// downstream source is re-created from its fallback; a stream that ended has its
 /// sources removed, and a failed removal keeps its row.
 #[tokio::test]
 async fn a_relay_is_seeded_with_its_feeders_address() {
+    let _serial = SERIAL.lock().await;
     let Some(db) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
@@ -229,12 +238,27 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
         SwitchClient::new(&origin_url),
     )));
 
-    // Pass 1: a is fed by the entry, b by a.
-    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    // The relays seeded with the entry as their origin: the main server's copies.
+    let from_entry = |to_a: &[Value], to_b: &[Value]| -> usize {
+        usize::from(to_a.contains(&json!(origin_url))) + usize::from(to_b.contains(&json!(origin_url)))
+    };
 
+    // Pass 1: only a (the lowest id, at turn 0) joins, from the entry. b's only choice
+    // would be the entry too, so it waits for a's row: a relay feeds others only once its
+    // seed is confirmed.
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
     let to_a = seeded_from(&calls_a, &source).await;
     let to_b = seeded_from(&calls_b, &source).await;
     assert_eq!(to_a, vec![json!(origin_url)], "the first relay pulls from the entry");
+    assert!(to_b.is_empty(), "b waits a tick: {to_b:?}");
+    assert_eq!(from_entry(&to_a, &to_b), 1, "the origin feeds exactly one relay");
+    assert_eq!(feeds(&db, &b1).await, vec![(node_a.clone(), None, 1)]);
+
+    // Pass 2: b joins under the stored a; a is seeded again with the same origin (409).
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+    let to_a = seeded_from(&calls_a, &source).await;
+    let to_b = seeded_from(&calls_b, &source).await;
+    assert_eq!(to_a, vec![json!(origin_url), json!(origin_url)], "a kept row is seeded again");
     assert_eq!(
         to_b,
         vec![json!(url_a)],
@@ -242,11 +266,7 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
     );
     let seed_b = calls_b.lock().await.seeds[0].clone();
     assert_eq!(seed_b["relay_node_id"], json!(node_b));
-    assert_eq!(
-        to_a.iter().chain(&to_b).filter(|o| **o == json!(origin_url)).count(),
-        1,
-        "exactly one relay pulls the stream from the entry"
-    );
+    assert_eq!(from_entry(&to_a, &to_b), 1, "still exactly one relay pulls from the entry");
     assert_eq!(
         feeds(&db, &b1).await,
         vec![
@@ -255,14 +275,10 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
         ]
     );
 
-    // Pass 2, nothing changed: every row is seeded again with the same origin (the
+    // Pass 2b, nothing changed: both rows are seeded again with the same origin (the
     // relays answer 409 and keep their source), and nothing is removed.
     mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
-    assert_eq!(
-        seeded_from(&calls_a, &source).await,
-        vec![json!(origin_url), json!(origin_url)],
-        "a kept row is seeded again on every pass"
-    );
+    assert_eq!(seeded_from(&calls_a, &source).await.len(), 3);
     assert_eq!(
         seeded_from(&calls_b, &source).await,
         vec![json!(url_a), json!(url_a)]
@@ -339,6 +355,7 @@ async fn a_relay_is_seeded_with_its_feeders_address() {
 /// such a session holds every live stream it carries, even one that is no longer wanted.
 #[tokio::test]
 async fn an_ad_break_holds_the_relay_it_is_on() {
+    let _serial = SERIAL.lock().await;
     let Some(db) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;
@@ -394,6 +411,7 @@ async fn an_ad_break_holds_the_relay_it_is_on() {
 /// can then be removed like any row when the stream ends.
 #[tokio::test]
 async fn a_source_found_with_no_row_is_adopted_as_a_leaf() {
+    let _serial = SERIAL.lock().await;
     let Some(db) = try_pool().await else {
         eprintln!("MM_DATABASE_URL not set — skipping");
         return;

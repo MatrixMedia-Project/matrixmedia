@@ -46,13 +46,54 @@ const CENSUS_BUDGET_PER_NODE: Duration = Duration::from_secs(8);
 
 /// Whether a listed session is a person watching: connected, and not a relay node
 /// pulling a stream through a cascade session ([`is_cascade_session`]). The switch lists
-/// both the same way; only people are audience, for the planner and for node fill alike.
+/// both the same way. Only people count toward a STREAM's audience (counting relays would
+/// inflate it and order more relays); a NODE's load counts every connected session it
+/// serves, relay links included (see [`Tally`]).
 fn is_audience(v: &SwitchViewer) -> bool {
     v.connected && !is_cascade_session(&v.id)
 }
 
 /// None (identifies the origin, which has no `mm_fleet_nodes` row) or a fan-out node's id.
 type CensusTarget = Option<mm_core::fleet::NodeId>;
+
+/// One census pass's counts, from the switches' viewer lists.
+#[derive(Debug, Default)]
+struct Tally {
+    /// Every connected session each fan-out node serves, relay links included: a feeder
+    /// whose only sessions are downstream relays is serving their viewers one hop down,
+    /// and must not look empty to drain, lease extension or remaining capacity. The
+    /// origin is never a key: it has no `mm_fleet_nodes` row to write back to.
+    per_node: HashMap<mm_core::fleet::NodeId, i64>,
+    /// People per source ([`is_audience`]), across the origin and every node.
+    by_source: HashMap<String, u32>,
+    /// (node, broadcast) connected sessions on `stream-<broadcast>` sources, relay links
+    /// included, for the relay-hour meter's samples (Task 9, §8.2 R4): a relay link costs
+    /// the node one stream's egress, like a person. The origin is never a key.
+    per_node_per_broadcast: HashMap<(mm_core::fleet::NodeId, String), i64>,
+}
+
+fn tally(gathered: &[(CensusTarget, Vec<SwitchViewer>)]) -> Tally {
+    let mut t = Tally::default();
+    for (target, viewers) in gathered {
+        let connected: Vec<_> = viewers.iter().filter(|v| v.connected).collect();
+        if let Some(node_id) = target {
+            t.per_node.insert(node_id.clone(), connected.len() as i64);
+        }
+        for v in connected {
+            if is_audience(v) {
+                *t.by_source.entry(v.current_source.clone()).or_insert(0) += 1;
+            }
+            if let Some(node_id) = target {
+                if let Some(broadcast_id) = v.current_source.strip_prefix("stream-") {
+                    *t.per_node_per_broadcast
+                        .entry((node_id.clone(), broadcast_id.to_string()))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    t
+}
 
 pub struct SwitchCensus {
     pool: Arc<SwitchPool>,
@@ -149,23 +190,15 @@ impl SwitchCensus {
         counts
     }
 
-    /// Live viewers per fan-out node, right now (§8.2 R6): one total per relay,
-    /// across every source it carries, not attributed to a broadcast. The
-    /// origin is never included — it has no `mm_fleet_nodes` row to write back
-    /// to. A relay that does not answer is counted as zero, the same
-    /// under-count-is-safe posture as [`Self::viewers_by_source`]: the planner
-    /// (and now the capacity gauge) would rather see a node emptier than it is
-    /// than fuller.
+    /// Connected sessions per fan-out node, right now (§8.2 R6): one total per relay,
+    /// across every source it carries, not attributed to a broadcast, and including
+    /// relays pulling from it (see [`Tally::per_node`]). The origin is never
+    /// included — it has no `mm_fleet_nodes` row to write back to. A relay that does
+    /// not answer is counted as zero, the same under-count-is-safe posture as
+    /// [`Self::viewers_by_source`]: the planner (and now the capacity gauge) would
+    /// rather see a node emptier than it is than fuller.
     pub async fn viewers_per_node(&self) -> HashMap<mm_core::fleet::NodeId, i64> {
-        self.gather()
-            .await
-            .into_iter()
-            .filter_map(|(target, viewers)| {
-                let node_id = target?;
-                let n = viewers.iter().filter(|v| is_audience(v)).count() as i64;
-                Some((node_id, n))
-            })
-            .collect()
+        tally(&self.gather().await).per_node
     }
 
     /// m4: `pool_sync.rs`'s `sync_once` used to call [`Self::viewers_per_node`] and (via
@@ -186,31 +219,11 @@ impl SwitchCensus {
                 .await
                 .map_err(|e| format!("listing active streams failed: {e}"))?;
 
-        let gathered = self.gather().await;
-
-        let mut per_node = HashMap::new();
-        let mut by_source: HashMap<String, u32> = HashMap::new();
-        // (node, broadcast) viewer counts, for the relay-hour meter's samples
-        // (Task 9, §8.2 R4): the origin has no `mm_fleet_nodes` row to bill, so it
-        // is never a key here, same exclusion as `per_node` above.
-        let mut per_node_per_broadcast: HashMap<(mm_core::fleet::NodeId, String), i64> =
-            HashMap::new();
-        for (target, viewers) in &gathered {
-            let audience: Vec<_> = viewers.iter().filter(|v| is_audience(v)).collect();
-            if let Some(node_id) = target {
-                per_node.insert(node_id.clone(), audience.len() as i64);
-            }
-            for v in &audience {
-                *by_source.entry(v.current_source.clone()).or_insert(0) += 1;
-                if let Some(node_id) = target {
-                    if let Some(broadcast_id) = v.current_source.strip_prefix("stream-") {
-                        *per_node_per_broadcast
-                            .entry((node_id.clone(), broadcast_id.to_string()))
-                            .or_insert(0) += 1;
-                    }
-                }
-            }
-        }
+        let Tally {
+            per_node,
+            by_source,
+            per_node_per_broadcast,
+        } = tally(&self.gather().await);
         self.insert_relay_usage_samples(&per_node_per_broadcast, Utc::now())
             .await;
 
@@ -329,6 +342,7 @@ impl BroadcastCensus for SwitchCensus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mm_core::fleet::NodeId;
 
     #[test]
     fn the_programme_source_id_matches_what_clients_are_given() {
@@ -337,5 +351,83 @@ mod tests {
         // `programme_is_live` answers false for every live broadcast and the fleet
         // silently never grows.
         assert_eq!(programme_source_id("abc123"), "stream-abc123");
+    }
+
+    fn session(id: &str, source: &str, connected: bool) -> SwitchViewer {
+        SwitchViewer {
+            id: id.to_string(),
+            current_source: source.to_string(),
+            connected,
+        }
+    }
+
+    fn sample(t: &Tally, node: &str, broadcast: &str) -> Option<i64> {
+        t.per_node_per_broadcast
+            .get(&(NodeId::new(node), broadcast.to_string()))
+            .copied()
+    }
+
+    /// A relay pulling a stream through a cascade session costs the node it pulls from
+    /// one stream's egress, exactly like a person, so the node's load and its relay-hour
+    /// samples count it. The stream's audience does not: the relay is not a viewer.
+    #[test]
+    fn a_relay_link_counts_toward_the_node_and_the_meter_but_not_the_stream() {
+        let t = tally(&[(
+            Some(NodeId::new("relay-a")),
+            vec![
+                session("viewer-b1--alice-example.org", "stream-b1", true),
+                session("cascade-stream-b1-lease-1-0", "stream-b1", true),
+                session("viewer-b1--carol-example.org", "stream-b1", false),
+            ],
+        )]);
+        assert_eq!(t.per_node.get(&NodeId::new("relay-a")).copied(), Some(2));
+        assert_eq!(sample(&t, "relay-a", "b1"), Some(2));
+        assert_eq!(t.by_source.get("stream-b1").copied(), Some(1));
+    }
+
+    /// The case that keeps a feeder alive: its only session is a downstream relay that
+    /// serves people one hop down. It must not read as empty to the drain and
+    /// lease-extension check, and it still carries a share of its own hour.
+    #[test]
+    fn a_node_that_only_feeds_relays_is_not_empty() {
+        let t = tally(&[(
+            Some(NodeId::new("relay-a")),
+            vec![session("cascade-stream-b1-lease-1-0", "stream-b1", true)],
+        )]);
+        assert_eq!(t.per_node.get(&NodeId::new("relay-a")).copied(), Some(1));
+        assert_eq!(sample(&t, "relay-a", "b1"), Some(1));
+        assert_eq!(t.by_source.get("stream-b1").copied(), None);
+    }
+
+    #[test]
+    fn a_disconnected_session_counts_nowhere() {
+        let t = tally(&[
+            (
+                None,
+                vec![session("viewer-b1--bob-example.org", "stream-b1", false)],
+            ),
+            (
+                Some(NodeId::new("relay-a")),
+                vec![session("cascade-stream-b1-lease-1-0", "stream-b1", false)],
+            ),
+        ]);
+        assert_eq!(t.per_node.get(&NodeId::new("relay-a")).copied(), Some(0));
+        assert_eq!(sample(&t, "relay-a", "b1"), None);
+        assert!(t.by_source.is_empty());
+    }
+
+    /// The origin is billed to nobody and written back nowhere.
+    #[test]
+    fn the_origin_is_never_a_node_or_a_meter_key() {
+        let t = tally(&[(
+            None,
+            vec![
+                session("viewer-b1--alice-example.org", "stream-b1", true),
+                session("cascade-stream-b1-lease-1-0", "stream-b1", true),
+            ],
+        )]);
+        assert!(t.per_node.is_empty());
+        assert!(t.per_node_per_broadcast.is_empty());
+        assert_eq!(t.by_source.get("stream-b1").copied(), Some(1));
     }
 }

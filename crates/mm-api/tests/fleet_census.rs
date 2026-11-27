@@ -186,11 +186,12 @@ async fn a_node_that_does_not_answer_does_not_fail_the_census() {
 
 /// A relay node pulls a stream from the switch it feeds off through a cascade session
 /// (`cascade-{source id}-{relay node id}`), which that switch lists exactly like a viewer.
-/// It is a connection between relays, not a person: counting it would grow the fleet and
-/// fill nodes on demand that does not exist. Here a relay sits on node `relay-a` with one
-/// real viewer, and a second relay pulls the same stream from it.
+/// It is not a person, but it costs the node one stream's egress, so the node's count
+/// (`viewers_current`: drain, lease extension, remaining capacity) includes it. Here node
+/// `relay-a` serves one real viewer and a second relay pulling the same stream from it;
+/// a disconnected session counts for nothing.
 #[tokio::test]
-async fn a_relay_pulling_from_a_node_is_not_counted_among_that_nodes_viewers() {
+async fn a_relay_pulling_from_a_node_counts_toward_that_nodes_load() {
     let origin = fake_switch(
         json!([{ "id": "stream-b1", "type": "webrtc", "active": true }]),
         json!(null),
@@ -200,7 +201,8 @@ async fn a_relay_pulling_from_a_node_is_not_counted_among_that_nodes_viewers() {
         json!(null),
         json!([
             { "id": "viewer-b1--alice-example.org", "current_source": "stream-b1", "connected": true },
-            { "id": "cascade-stream-b1-lease-1-0",   "current_source": "stream-b1", "connected": true }
+            { "id": "cascade-stream-b1-lease-1-0",   "current_source": "stream-b1", "connected": true },
+            { "id": "viewer-b1--carol-example.org", "current_source": "stream-b1", "connected": false }
         ]),
     )
     .await;
@@ -216,15 +218,48 @@ async fn a_relay_pulling_from_a_node_is_not_counted_among_that_nodes_viewers() {
     let per_node = census.viewers_per_node().await;
     assert_eq!(
         per_node.get(&NodeId::new("relay-a")).copied(),
-        Some(1),
-        "alice is the node's one viewer; the relay pulling from it is not a second"
+        Some(2),
+        "alice and the relay pulling from the node are both served by it"
     );
 }
 
-/// The same fact for the per-stream count the planner grows the fleet on: the origin
-/// carries one real viewer of the stream and one relay pulling it, so the live
-/// broadcast has one viewer, not two. Needs a real `mm_streams` row, because the live
-/// list is read from the database.
+/// A feeder whose only session is a downstream relay is serving that relay's viewers one
+/// hop down. If it read 0 it could lapse or finish draining and be destroyed under them.
+#[tokio::test]
+async fn a_node_that_only_feeds_relays_is_not_empty() {
+    let origin = fake_switch(
+        json!([{ "id": "stream-b1", "type": "webrtc", "active": true }]),
+        json!(null),
+    )
+    .await;
+    let relay = fake_switch(
+        json!(null),
+        json!([
+            { "id": "cascade-stream-b1-lease-1-0", "current_source": "stream-b1", "connected": true }
+        ]),
+    )
+    .await;
+
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin),
+    )));
+    pool.upsert(&node("relay-a"), Arc::new(SwitchClient::new(&relay)))
+        .await;
+    let census = mm_api::fleet_census::SwitchCensus::new(pool, dummy_pool());
+
+    let per_node = census.viewers_per_node().await;
+    assert_eq!(
+        per_node.get(&NodeId::new("relay-a")).copied(),
+        Some(1),
+        "a node feeding one relay serves one session, not none"
+    );
+}
+
+/// The per-stream count the planner grows the fleet on is people only: the origin carries
+/// one real viewer of the stream and one relay pulling it, so the live broadcast has one
+/// viewer, not two. A fan-out node that only feeds a downstream relay adds no viewer to
+/// the stream, yet its own count and its relay-hour sample include that link. Needs a real
+/// `mm_streams` row, because the live list is read from the database.
 #[tokio::test]
 async fn a_relay_pulling_a_stream_is_not_counted_as_a_viewer() {
     let Some(db) = try_pool().await else {
@@ -233,6 +268,8 @@ async fn a_relay_pulling_a_stream_is_not_counted_as_a_viewer() {
     };
     ensure_migrations(&db).await;
     let b1 = seed_active_stream(&db).await;
+    // Unique, so this test's meter samples never mix with another run's.
+    let feeder = format!("relay-{}", uuid::Uuid::new_v4());
 
     let origin = fake_switch(
         json!([{ "id": switch_source_id(&b1), "type": "webrtc", "active": true }]),
@@ -242,9 +279,18 @@ async fn a_relay_pulling_a_stream_is_not_counted_as_a_viewer() {
         ]),
     )
     .await;
+    let relay = fake_switch(
+        json!(null),
+        json!([
+            { "id": format!("cascade-{}-lease-2-0", switch_source_id(&b1)), "current_source": switch_source_id(&b1), "connected": true }
+        ]),
+    )
+    .await;
     let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
         SwitchClient::new(&origin),
     )));
+    pool.upsert(&node(&feeder), Arc::new(SwitchClient::new(&relay)))
+        .await;
     let census = mm_api::fleet_census::SwitchCensus::new(pool, db.clone());
 
     let live = census.live_broadcasts().await.expect("census");
@@ -259,7 +305,7 @@ async fn a_relay_pulling_a_stream_is_not_counted_as_a_viewer() {
     );
 
     // pool_sync's tick takes the same count through the combined gather.
-    let (_, live) = census
+    let (per_node, live) = census
         .viewers_per_node_and_live_broadcasts()
         .await
         .expect("census");
@@ -272,7 +318,29 @@ async fn a_relay_pulling_a_stream_is_not_counted_as_a_viewer() {
         Some(1),
         "the combined gather must count the same way"
     );
+    assert_eq!(
+        per_node.get(&NodeId::new(feeder.as_str())).copied(),
+        Some(1),
+        "the feeder serves the relay pulling from it"
+    );
 
+    // The relay-hour meter splits the feeder's hour by these samples: the stream it
+    // carries only for a downstream relay still gets its share.
+    let samples: Vec<i32> = sqlx::query_scalar(
+        "SELECT viewers FROM mm_relay_usage_samples WHERE mm_node_id = $1 AND broadcast_id = $2",
+    )
+    .bind(&feeder)
+    .bind(&b1)
+    .fetch_all(&db)
+    .await
+    .expect("read samples");
+    assert_eq!(samples, vec![1], "one sample, counting the relay link");
+
+    sqlx::query("DELETE FROM mm_relay_usage_samples WHERE mm_node_id = $1")
+        .bind(&feeder)
+        .execute(&db)
+        .await
+        .expect("clean samples");
     end_stream(&db, &b1).await;
 }
 

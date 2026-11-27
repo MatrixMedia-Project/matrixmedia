@@ -777,6 +777,74 @@ async fn one_orphan_per_stream_and_tick_is_re_created_from_the_entry() {
         .expect("delete provider");
 }
 
+/// A relay that does not answer the census keeps the session count it had: writing 0 would
+/// make a relay people may be on look empty, to the lease extension and to its headroom.
+#[tokio::test]
+async fn a_relay_that_does_not_answer_the_census_keeps_its_count() {
+    let _serial = SERIAL.lock().await;
+    let Some(db) = try_pool().await else {
+        eprintln!("MM_DATABASE_URL not set — skipping");
+        return;
+    };
+    mm_db::run_pg_migrations(&db)
+        .await
+        .expect("migrations should apply cleanly");
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let (silent, answering) = (
+        format!("0-feeds-{tag}-silent"),
+        format!("0-feeds-{tag}-answering"),
+    );
+    let provider = format!("feeds-{tag}");
+    let b1 = seed_active_stream(&db).await;
+    let origin_url = fake_origin(json!(null), json!(null)).await;
+    let (url, _) = fake_relay(json!([
+        { "id": switch_viewer_id(&b1, "@bob:example.org"), "current_source": switch_source_id(&b1), "connected": true }
+    ]))
+    .await;
+
+    seed_provider_zone(&db, &provider, "ams-1").await;
+    // The silent relay's address maps to nothing that answers.
+    seed_relay(&db, &silent, "192.0.2.20", &provider, "ams-1").await;
+    seed_relay(&db, &answering, "192.0.2.21", &provider, "ams-1").await;
+    sqlx::query("UPDATE mm_fleet_nodes SET viewers_current = 5 WHERE mm_node_id = ANY($1)")
+        .bind(vec![silent.clone(), answering.clone()])
+        .execute(&db)
+        .await
+        .expect("set counts");
+
+    let ctx = context(HashMap::from([("192.0.2.21".to_string(), url)]));
+    let pool = Arc::new(mm_api::switch_pool::SwitchPool::new(Arc::new(
+        SwitchClient::new(&origin_url),
+    )));
+    mm_api::pool_sync::sync_once(&pool, &db, &ctx).await;
+
+    let count = |id: String| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT viewers_current FROM mm_fleet_nodes WHERE mm_node_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .expect("read count")
+        }
+    };
+    assert_eq!(
+        count(silent.clone()).await,
+        5,
+        "no answer: the stored count stays"
+    );
+    assert_eq!(
+        count(answering.clone()).await,
+        1,
+        "an answer is written back"
+    );
+
+    cleanup(&db, &b1, &[&silent, &answering], &provider).await;
+}
+
 async fn seed_provider_zone(db: &sqlx::PgPool, provider: &str, zone: &str) {
     // A priority no other live provider holds (the column is unique among them).
     let priority = 1_000_000 + (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as i32;

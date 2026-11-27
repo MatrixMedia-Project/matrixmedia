@@ -1021,8 +1021,14 @@ pub async fn sync_once(pool: &Arc<SwitchPool>, db: &PgPool, ctx: &PoolSyncContex
             return;
         }
     };
-    let viewer_counts: Vec<(NodeId, i64)> =
-        pass.per_node.iter().map(|(n, c)| (n.clone(), *c)).collect();
+    // A relay that did not answer keeps the count it had: its zero means "unknown", and
+    // writing it would make a relay people may be on look empty.
+    let viewer_counts: Vec<(NodeId, i64)> = pass
+        .per_node
+        .iter()
+        .filter(|(n, _)| !pass.unanswered.contains(*n))
+        .map(|(n, c)| (n.clone(), *c))
+        .collect();
     if let Err(e) = nodes_db::update_viewers_current(db, &viewer_counts).await {
         tracing::warn!("pool sync: writing back viewers_current failed: {e}");
     }

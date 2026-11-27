@@ -177,6 +177,8 @@ func main() {
 	log.Printf("[mm-switch] recorder isolation: %s (%s)",
 		recorderIsolationMode(), recorderIsolationEnv)
 	log.Printf("[mm-switch] node flavor: %s", nodeFlavor)
+	log.Printf("[mm-switch] resend limit: %d per packet, %d%% of programme (MM_SWITCH_RESEND_BUDGET_PERCENT)",
+		resendMaxPerPacket, int(resendShare*100))
 	if authSecret != "" {
 		log.Printf("[mm-switch] HMAC auth: enabled")
 	} else {
@@ -1020,12 +1022,9 @@ func handleListRelays(w http.ResponseWriter, r *http.Request) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func createPeerConnection() (*webrtc.PeerConnection, error) {
-	m := &webrtc.MediaEngine{}
-	if err := m.RegisterDefaultCodecs(); err != nil {
-		return nil, err
-	}
-
+// newInterceptorRegistry builds the interceptor chain every mm-switch PeerConnection
+// gets. It is its own function so tests can drive the exact chain production uses.
+func newInterceptorRegistry(m *webrtc.MediaEngine) (*interceptor.Registry, error) {
 	i := &interceptor.Registry{}
 	intervalPliFactory, err := intervalpli.NewReceiverInterceptor()
 	if err != nil {
@@ -1033,7 +1032,23 @@ func createPeerConnection() (*webrtc.PeerConnection, error) {
 	}
 	i.Add(intervalPliFactory)
 
+	// Before the defaults, which include pion's NACK responder: see resend_limit.go.
+	i.Add(resendLimitFactory{share: resendShare})
+
 	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+		return nil, err
+	}
+	return i, nil
+}
+
+func createPeerConnection() (*webrtc.PeerConnection, error) {
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterDefaultCodecs(); err != nil {
+		return nil, err
+	}
+
+	i, err := newInterceptorRegistry(m)
+	if err != nil {
 		return nil, err
 	}
 
